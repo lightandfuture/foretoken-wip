@@ -29,8 +29,8 @@ fn generate_input() -> GenerateInput {
     }
 }
 
-/// Builds a mock SGLang server that streams two token chunks then a terminal.
-async fn spawn_mock_server() -> (String, Arc<Mutex<Value>>) {
+/// Builds a mock SGLang server that streams the given NDJSON response body.
+async fn spawn_mock_server(response_body: String) -> (String, Arc<Mutex<Value>>) {
     let last_request: Arc<Mutex<Value>> = Arc::new(Mutex::new(Value::Null));
 
     let seen = last_request.clone();
@@ -38,17 +38,13 @@ async fn spawn_mock_server() -> (String, Arc<Mutex<Value>>) {
         "/generate",
         post(move |Json(body): Json<Value>| {
             let seen = seen.clone();
+            let response_body = response_body.clone();
             async move {
                 *seen.lock().unwrap() = body;
-                // Two streamed NDJSON chunks: a token then a terminal.
                 (
                     axum::http::StatusCode::OK,
                     [("content-type", "application/json")],
-                    format!(
-                        "{}\n{}\n",
-                        json!({"output_ids": [42]}),
-                        json!({"output_ids": [], "meta_info": {"finish_reason": "stop"}})
-                    ),
+                    response_body,
                 )
             }
         }),
@@ -62,9 +58,19 @@ async fn spawn_mock_server() -> (String, Arc<Mutex<Value>>) {
     (format!("http://{addr}"), last_request)
 }
 
+/// Real SGLang streams cumulative `output_ids` (each chunk repeats the
+/// prefix) and reports object-shaped finish reasons (`{"type": "stop", ...}`).
+fn real_sglang_body() -> String {
+    format!(
+        "{}\n{}\n",
+        json!({"output_ids": [42]}),
+        json!({"output_ids": [42, 43], "meta_info": {"finish_reason": {"type": "stop"}}})
+    )
+}
+
 #[tokio::test]
 async fn generate_streams_tokens_and_terminal() {
-    let (endpoint, seen) = spawn_mock_server().await;
+    let (endpoint, seen) = spawn_mock_server(real_sglang_body()).await;
     let backend = SglangBackend::new(endpoint);
 
     let mut stream = backend.generate(generate_input()).await.unwrap();
@@ -76,6 +82,8 @@ async fn generate_streams_tokens_and_terminal() {
     assert_eq!(events.len(), 2);
     match &events[0] {
         TokenEvent::Token(output) => {
+            // The first output carries the prompt ids for the frontend decoder.
+            assert_eq!(output.prompt_token_ids.as_deref(), Some(&[1, 2][..]));
             assert_eq!(output.token_ids, vec![42]);
             assert_eq!(output.finish_reason, None);
         }
@@ -83,6 +91,11 @@ async fn generate_streams_tokens_and_terminal() {
     }
     match &events[1] {
         TokenEvent::Token(output) => {
+            assert_eq!(
+                output.token_ids,
+                vec![43],
+                "cumulative ids must become deltas"
+            );
             assert_eq!(output.finish_reason, Some(FinishReason::Stop(None)));
         }
         TokenEvent::Error { .. } => panic!("unexpected error"),
@@ -92,6 +105,29 @@ async fn generate_streams_tokens_and_terminal() {
     let body = seen.lock().unwrap();
     assert_eq!(body["input_ids"], json!([1, 2]));
     assert_eq!(body["stream"], json!(true));
+}
+
+#[tokio::test]
+async fn generate_maps_object_length_finish_reason() {
+    // A single chunk carrying an object-shaped `length` finish reason, as the
+    // real server reports when max_new_tokens is exhausted.
+    let body = format!(
+        "{}\n",
+        json!({"output_ids": [42], "meta_info": {"finish_reason": {"type": "length", "length": 1}}})
+    );
+    let (endpoint, _seen) = spawn_mock_server(body).await;
+    let backend = SglangBackend::new(endpoint);
+
+    let mut stream = backend.generate(generate_input()).await.unwrap();
+    let event = stream.next().await.unwrap().unwrap();
+    match event {
+        TokenEvent::Token(output) => {
+            assert_eq!(output.token_ids, vec![42]);
+            assert_eq!(output.finish_reason, Some(FinishReason::Length));
+        }
+        TokenEvent::Error { .. } => panic!("unexpected error"),
+    }
+    assert!(stream.next().await.is_none());
 }
 
 #[tokio::test]
