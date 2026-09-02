@@ -8,6 +8,7 @@
 //! The engine-neutral core only sees the [`crate::engine::Engine`] trait.
 
 mod backend;
+mod conversion;
 mod launch_plan;
 mod process;
 

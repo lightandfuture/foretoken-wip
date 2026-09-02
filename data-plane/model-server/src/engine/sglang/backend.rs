@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::{Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream};
-use foretoken_model_protocol::{
-    FinishReason, GenerateInput, SamplingParams, TokenEvent, TokenOutput,
-};
+use foretoken_model_protocol::{FinishReason, GenerateInput, TokenEvent, TokenOutput};
+
+use super::conversion::to_sglang_sampling;
 
 /// SGLang adapter failures, translated into the engine-neutral [`EngineError`].
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -184,45 +184,6 @@ impl SglangBackend {
         };
         Box::pin(stream)
     }
-
-    /// Builds SGLang's native sampling params from the neutral typed fields
-    /// only. Engine-specific keys carried by [`SamplingParams::extra_args`]
-    /// are never forwarded: the current frontend fills that map with vLLM
-    /// field names, and SGLang rejects them (see ADR-0001). SGLang's own
-    /// native extension channel (`custom_params`) will be wired up when the
-    /// neutral protocol stops being vLLM-centric.
-    fn sampling_json(params: &SamplingParams) -> serde_json::Value {
-        // Value domains follow sglang v0.5.18 `SamplingParams`
-        // (__post_init__ + verify()): neutral defaults are legal there
-        // (temperature >= 0 with [0, 1e-6) forcing greedy in post_init,
-        // top_p in (0, 1], penalties in [-2, 2]), so these keys are forwarded
-        // unconditionally; only `top_k` and `seed` need translation (see below).
-        let mut json = serde_json::json!({
-            "temperature": params.temperature,
-            "top_p": params.top_p,
-            "max_new_tokens": params.max_tokens,
-            "frequency_penalty": params.frequency_penalty,
-            "presence_penalty": params.presence_penalty,
-        });
-        // Neutral `top_k: u32` uses 0 as the vLLM-style "consider all tokens"
-        // sentinel (see foretoken-model-protocol SamplingParams). SGLang maps
-        // -1 to the whole vocabulary in `__post_init__` and `verify()` rejects
-        // anything < 1 (including 0; verified against sglang v0.5.18), so the
-        // sentinel is translated by omitting the key: SGLang then applies its
-        // whole-vocabulary default. Explicit values >= 1 are forwarded as-is.
-        if params.top_k > 0 {
-            json["top_k"] = serde_json::json!(params.top_k);
-        }
-        if let Some(seed) = params.seed {
-            // SGLang names this field `sampling_seed` (not `seed`); the neutral
-            // protocol name would raise TypeError inside SamplingParams.
-            json["sampling_seed"] = serde_json::json!(seed);
-        }
-        if !params.stop_token_ids.is_empty() {
-            json["stop_token_ids"] = serde_json::json!(params.stop_token_ids);
-        }
-        json
-    }
 }
 
 #[async_trait]
@@ -230,7 +191,7 @@ impl Engine for SglangBackend {
     async fn generate(&self, request: GenerateInput) -> Result<TokenStream, EngineError> {
         let request_id = request.request_id.clone();
         let prompt_token_ids = request.prompt_token_ids.clone();
-        let sampling = Self::sampling_json(&request.sampling_params);
+        let sampling = to_sglang_sampling(&request.sampling_params);
         let body = GenerateRequest {
             input_ids: prompt_token_ids.clone(),
             sampling_params: sampling,
@@ -304,89 +265,6 @@ impl Drop for RunningGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn sampling_json_drops_vllm_specific_extra_args() {
-        let mut extra = BTreeMap::new();
-        extra.insert(
-            "all_stop_token_ids".into(),
-            serde_json::json!([151643, 151645]),
-        );
-        extra.insert("structured_outputs".into(), serde_json::json!({}));
-        extra.insert("logit_bias".into(), serde_json::json!({}));
-        let params = SamplingParams {
-            temperature: 0.5,
-            max_tokens: 32,
-            stop_token_ids: vec![7],
-            extra_args: extra,
-            ..Default::default()
-        };
-        let json = SglangBackend::sampling_json(&params);
-        assert!(json.get("all_stop_token_ids").is_none());
-        assert!(json.get("structured_outputs").is_none());
-        assert!(json.get("logit_bias").is_none());
-    }
-
-    #[test]
-    fn sampling_json_keeps_neutral_fields() {
-        let params = SamplingParams {
-            temperature: 0.7,
-            top_p: 0.9,
-            top_k: 40,
-            seed: Some(42),
-            max_tokens: 128,
-            stop_token_ids: vec![151643],
-            ..Default::default()
-        };
-        let json = SglangBackend::sampling_json(&params);
-        assert_eq!(json["temperature"].as_f64().unwrap() as f32, 0.7);
-        assert_eq!(json["top_p"].as_f64().unwrap() as f32, 0.9);
-        assert_eq!(json["top_k"], 40);
-        assert!(
-            json.get("seed").is_none(),
-            "vLLM-style `seed` key must not reach SGLang"
-        );
-        assert_eq!(json["sampling_seed"], 42);
-        assert_eq!(json["max_new_tokens"], 128);
-        assert_eq!(json["stop_token_ids"], serde_json::json!([151643]));
-    }
-
-    #[test]
-    fn sampling_json_omits_top_k_zero_sentinel() {
-        // Guards the top_k=0 sentinel translation (see sampling_json).
-        let params = SamplingParams {
-            top_k: 0, // also the SamplingParams::default() value
-            ..Default::default()
-        };
-        let json = SglangBackend::sampling_json(&params);
-        assert!(
-            json.get("top_k").is_none(),
-            "top_k=0 sentinel must not reach SGLang: {json}"
-        );
-    }
-
-    #[test]
-    fn sampling_json_forwards_explicit_top_k() {
-        let params = SamplingParams {
-            top_k: 5,
-            ..Default::default()
-        };
-        let json = SglangBackend::sampling_json(&params);
-        assert_eq!(json["top_k"], 5);
-    }
-
-    #[test]
-    fn sampling_json_uses_sglang_seed_key_name() {
-        // Guards the seed -> sampling_seed key translation (see sampling_json).
-        let params = SamplingParams {
-            seed: Some(42),
-            ..Default::default()
-        };
-        let json = SglangBackend::sampling_json(&params);
-        assert!(json.get("seed").is_none());
-        assert_eq!(json["sampling_seed"], 42);
-    }
 
     #[test]
     fn parse_sse_chunk_strips_data_prefix() {
