@@ -16,8 +16,10 @@ PLATFORM_NAMESPACE=${PLATFORM_NAMESPACE:-foretoken-platform}
 WORKLOAD_NAMESPACE=${WORKLOAD_NAMESPACE:-foretoken-demo}
 FRONTEND_MODE=${FRONTEND_MODE:-local}
 DEV_TIMEOUT=${DEV_TIMEOUT:-15m}
+# Engine base image; keep the SGLang default in sync with SGLANG_PIN in
+# data-plane/scripts/sglang-param-matrix.sh.
 VLLM_ENGINE_IMAGE=${VLLM_ENGINE_IMAGE:-ghcr.io/shiweijiezero/foretoken/model-server:0.0.1}
-SGLANG_ENGINE_IMAGE=${SGLANG_ENGINE_IMAGE:-lmsysorg/sglang:latest}
+SGLANG_ENGINE_IMAGE=${SGLANG_ENGINE_IMAGE:-lmsysorg/sglang:v0.5.18}
 IMAGE_PULL_SECRET=${IMAGE_PULL_SECRET:-}
 LOCAL_IMAGE_PREFIX=${LOCAL_IMAGE_PREFIX:-foretoken-dev}
 K3D_CONFIG=${K3D_CONFIG:-$ROOT/deploy/k3d/config.yaml}

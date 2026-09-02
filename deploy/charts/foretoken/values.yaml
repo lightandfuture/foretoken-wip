@@ -74,6 +74,8 @@ runtime:
       pythonHashSeed: ""
   # SGLang aggregate Groups reuse the model-server image built with the
   # backend-sglang feature. SGLang currently supports aggregate Groups only.
+  # Build base (validated engine version): lmsysorg/sglang:v0.5.18 — bump only
+  # after re-running data-plane/scripts/sglang-param-matrix.sh.
   sglang:
     image: ghcr.io/shiweijiezero/foretoken/model-server-sglang:0.0.1
     profileRevision: default

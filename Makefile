@@ -80,6 +80,11 @@ image-model-server-vllm:
 # SGLang builds still depend on vllm-source: the data-plane workspace resolves
 # the vllm submodule path dependencies when Cargo parses, even though
 # backend-sglang compiles no vLLM FFI.
+#
+# Currently validated engine version: lmsysorg/sglang:v0.5.18. After upgrading
+# the engine base image, re-run the parameter matrix first:
+#   data-plane/scripts/sglang-param-matrix.sh
+# (see docs/design/engine-neutral-multibackend-s1-plan.md).
 image-model-server-sglang:
 	@test -n "$(SGLANG_ENGINE_IMAGE)" || \
 		(printf '%s\n' 'Set SGLANG_ENGINE_IMAGE to an SGLang base image (e.g. lmsysorg/sglang:<version>).' >&2; exit 1)

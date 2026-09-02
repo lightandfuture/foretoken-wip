@@ -8,8 +8,10 @@ cd "$ROOT"
 
 TAG=${TAG:-latest}
 LOCAL_IMAGE_PREFIX=${LOCAL_IMAGE_PREFIX:-foretoken-dev}
+# Engine base image; keep the SGLang default in sync with SGLANG_PIN in
+# data-plane/scripts/sglang-param-matrix.sh.
 VLLM_ENGINE_IMAGE=${VLLM_ENGINE_IMAGE:-ghcr.io/shiweijiezero/foretoken/model-server:0.0.1}
-SGLANG_ENGINE_IMAGE=${SGLANG_ENGINE_IMAGE:-lmsysorg/sglang:latest}
+SGLANG_ENGINE_IMAGE=${SGLANG_ENGINE_IMAGE:-lmsysorg/sglang:v0.5.18}
 
 CONTROL_PLANE_IMAGE="$LOCAL_IMAGE_PREFIX-control-plane:$TAG"
 FRONTEND_IMAGE="$LOCAL_IMAGE_PREFIX-frontend:$TAG"
