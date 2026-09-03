@@ -1,0 +1,44 @@
+diff --git a/rust/src/llm/src/output.rs b/rust/src/llm/src/output.rs
+index c8f01b9..40fa2c2 100644
+--- a/rust/src/llm/src/output.rs
++++ b/rust/src/llm/src/output.rs
+@@ -48,7 +48,7 @@ pub struct CollectedGenerateOutput {
+ 
+ /// Prompt-scoped metadata emitted only once on the first [`GenerateOutput`] for
+ /// one request.
+-#[derive(Debug, Clone, PartialEq)]
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct GeneratePromptInfo {
+     /// Original prompt token IDs for this request.
+     pub prompt_token_ids: Arc<[u32]>,
+@@ -135,7 +135,7 @@ fn finish_reason_from_engine(
+ ///
+ /// Original Python output reference:
+ /// <https://github.com/vllm-project/vllm/blob/bc2c0c86efb28e77677a3cfb8687e976914a313a/vllm/outputs.py#L85-L143>
+-#[derive(Debug, Clone, PartialEq)]
++#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+ pub struct GenerateOutput {
+     /// Unique ID of the request that produced this output.
+     pub request_id: String,
+diff --git a/rust/src/llm/src/request.rs b/rust/src/llm/src/request.rs
+index c647f54..c444239 100644
+--- a/rust/src/llm/src/request.rs
++++ b/rust/src/llm/src/request.rs
+@@ -3,6 +3,7 @@
+ 
+ use std::collections::BTreeMap;
+ 
++use serde::{Deserialize, Serialize};
+ use uuid::Uuid;
+ use vllm_engine_core_client::protocol::lora::LoraRequest;
+ use vllm_engine_core_client::protocol::multimodal::MmFeatures;
+@@ -21,7 +22,8 @@ use crate::request_metrics::current_unix_timestamp_secs;
+ ///
+ /// Original Python API reference:
+ /// <https://github.com/vllm-project/vllm/blob/bc2c0c86efb28e77677a3cfb8687e976914a313a/vllm/engine/protocol.py#L67-L84>
+-#[derive(Debug, Clone, PartialEq)]
++#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
++#[serde(default, deny_unknown_fields)]
+ pub struct GenerateRequest {
+     /// Unique ID of the request.
+     pub request_id: String,

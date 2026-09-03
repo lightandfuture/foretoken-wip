@@ -43,6 +43,13 @@ vllm-source:
 		git -C data-plane/third_party/vllm apply \
 			../../patches/vllm-chat-request-processor.patch; \
 	fi
+	@if git -C data-plane/third_party/vllm apply --reverse --check \
+		../../patches/vllm-llm-serde.patch >/dev/null 2>&1; then \
+		:; \
+	else \
+		git -C data-plane/third_party/vllm apply \
+			../../patches/vllm-llm-serde.patch; \
+	fi
 
 build-data-plane: vllm-source
 	cargo build --manifest-path data-plane/Cargo.toml --workspace --locked
