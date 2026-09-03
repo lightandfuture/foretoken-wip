@@ -712,9 +712,9 @@ pub(crate) fn openai_error(error: GenerationError) -> Response {
             "unavailable",
         ),
         GenerationError::BackendRejected => (
-            StatusCode::BAD_GATEWAY,
+            StatusCode::BAD_REQUEST,
             "model server rejected the request",
-            "server_error",
+            "invalid_request_error",
             "backend_rejected",
         ),
         GenerationError::BackendProtocol => (
@@ -1155,4 +1155,19 @@ fn openai_message(message: &OpenAiMessage) -> Result<ChatMessage, GenerationErro
         ),
         _ => return Err(GenerationError::InvalidRequest),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GenerationError, openai_error};
+    use axum::http::StatusCode;
+
+    #[test]
+    fn backend_rejected_is_a_client_error() {
+        // A 4xx from the model server means the request itself was invalid
+        // (e.g. an out-of-contract sampling field), so the user sees a 400,
+        // not a 502.
+        let response = openai_error(GenerationError::BackendRejected);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }
