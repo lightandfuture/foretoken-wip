@@ -8,11 +8,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-#[cfg(feature = "backend-vllm")]
-use foretoken_model_protocol::EngineExtensions;
 use foretoken_model_protocol::{
-    CumulativeHistogram, CumulativeHistogramBucket, FinishReason, GenerateInput, ModelDtype,
-    RuntimeMetadataResponse, RuntimeModelIdentity, SamplingParams, TokenEvent, TokenOutput,
+    CumulativeHistogram, CumulativeHistogramBucket, ModelDtype, RuntimeMetadataResponse,
+    RuntimeModelIdentity,
 };
 use foretoken_model_server::core::api::{AppState, RuntimeHealth, router};
 use foretoken_model_server::engine::{
@@ -27,9 +25,10 @@ use vllm_engine_core_client::protocol::multimodal::{
 };
 #[cfg(feature = "backend-vllm")]
 use vllm_engine_core_client::protocol::tensor::WireNdArray;
+use vllm_llm::{FinishReason, GenerateOutput, GenerateRequest};
 
 struct RecordingBackend {
-    requests: Mutex<Vec<GenerateInput>>,
+    requests: Mutex<Vec<GenerateRequest>>,
     aborts: Mutex<Vec<Vec<String>>>,
     telemetry: EngineTelemetry,
 }
@@ -50,21 +49,23 @@ impl Default for RecordingBackend {
 
 #[async_trait]
 impl Engine for RecordingBackend {
-    async fn generate(&self, input: GenerateInput) -> Result<TokenStream, EngineError> {
-        self.requests.lock().unwrap().push(input.clone());
-        Ok(Box::pin(stream::iter([Ok(TokenEvent::Token(Box::new(
-            TokenOutput {
-                request_id: input.request_id,
-                prompt_token_ids: Some(input.prompt_token_ids),
+    async fn generate(&self, input: GenerateRequest) -> Result<TokenStream, EngineError> {
+        let request_id = input.request_id.clone();
+        let prompt_token_ids = input.prompt_token_ids.clone();
+        self.requests.lock().unwrap().push(input);
+        Ok(Box::pin(stream::iter([Ok(GenerateOutput {
+            request_id,
+            prompt_info: Some(vllm_llm::GeneratePromptInfo {
+                prompt_token_ids: prompt_token_ids.into(),
                 prompt_logprobs: None,
-                token_ids: vec![42],
-                logprobs: None,
-                cached_token_count: 2,
-                finish_reason: Some(FinishReason::Stop(None)),
-                kv_transfer_params: None,
-                ec_transfer_params: None,
-            },
-        )))])))
+            }),
+            token_ids: vec![42],
+            logprobs: None,
+            cached_token_count: 2,
+            finish_reason: Some(FinishReason::Stop(None)),
+            kv_transfer_params: None,
+            ec_transfer_params: None,
+        })])))
     }
 
     async fn abort(&self, request_ids: &[String]) -> Result<(), EngineError> {
@@ -134,7 +135,7 @@ struct PendingStreamBackend;
 
 #[async_trait]
 impl Engine for PendingStreamBackend {
-    async fn generate(&self, _: GenerateInput) -> Result<TokenStream, EngineError> {
+    async fn generate(&self, _: GenerateRequest) -> Result<TokenStream, EngineError> {
         Ok(Box::pin(stream::pending()))
     }
 
@@ -162,7 +163,7 @@ struct FailingStreamBackend;
 
 #[async_trait]
 impl Engine for FailingStreamBackend {
-    async fn generate(&self, _: GenerateInput) -> Result<TokenStream, EngineError> {
+    async fn generate(&self, _: GenerateRequest) -> Result<TokenStream, EngineError> {
         Ok(Box::pin(stream::iter([Err(EngineError::Unavailable)])))
     }
 
@@ -189,7 +190,7 @@ async fn generate_forwards_json_input_and_encodes_ndjson() {
     let body = serde_json::json!({
         "request_id": "request-1",
         "prompt_token_ids": [1, 2],
-        "sampling_params": SamplingParams::default(),
+        "sampling_params": {},
         "priority": -2
     });
     let response = app(backend.clone(), true, true)
@@ -209,7 +210,7 @@ async fn generate_forwards_json_input_and_encodes_ndjson() {
     );
     assert_eq!(
         response.into_body().collect().await.unwrap().to_bytes(),
-        "{\"type\":\"token\",\"request_id\":\"request-1\",\"prompt_token_ids\":[1,2],\"prompt_logprobs\":null,\"token_ids\":[42],\"logprobs\":null,\"cached_token_count\":2,\"finish_reason\":{\"Stop\":null},\"kv_transfer_params\":null,\"ec_transfer_params\":null}\n"
+        "{\"type\":\"output\",\"request_id\":\"request-1\",\"prompt_info\":{\"prompt_token_ids\":[1,2],\"prompt_logprobs\":null},\"token_ids\":[42],\"logprobs\":null,\"finish_reason\":{\"Stop\":null},\"cached_token_count\":2,\"kv_transfer_params\":null,\"ec_transfer_params\":null}\n"
     );
     let requests = backend.requests.lock().unwrap();
     assert_eq!(requests[0].prompt_token_ids, [1, 2]);
@@ -240,21 +241,19 @@ async fn generate_accepts_msgpack_multimodal_tensors() {
         },
         mm_hash: None,
     }];
-    let body = rmp_serde::to_vec_named(&foretoken_model_protocol::GenerateInput {
+    let body = rmp_serde::to_vec_named(&GenerateRequest {
         request_id: "request-mm".into(),
         prompt_token_ids: vec![1, 2],
-        extensions: Some(EngineExtensions {
-            mm_features: Some(rmpv::ext::to_value(&mm_features).unwrap()),
-            lora_request: None,
-            reasoning_parser_kwargs: None,
-        }),
-        sampling_params: SamplingParams::default(),
+        mm_features: Some(mm_features),
         arrival_time: None,
         cache_salt: None,
         trace_headers: None,
         priority: 0,
         data_parallel_rank: None,
         session_id: Some("session-mm".into()),
+        reasoning_parser_kwargs: None,
+        lora_request: None,
+        sampling_params: Default::default(),
     })
     .unwrap();
 
@@ -271,15 +270,7 @@ async fn generate_accepts_msgpack_multimodal_tensors() {
     assert_eq!(response.status(), StatusCode::OK);
     let requests = backend.requests.lock().unwrap();
     assert_eq!(requests[0].session_id.as_deref(), Some("session-mm"));
-    let recorded_mm_features: Vec<MmFeatureSpec> = rmpv::ext::from_value(
-        requests[0]
-            .extensions
-            .as_ref()
-            .and_then(|extensions| extensions.mm_features.clone())
-            .expect("mm_features extension present"),
-    )
-    .unwrap();
-    assert_eq!(recorded_mm_features.len(), 1);
+    assert_eq!(requests[0].mm_features.as_ref().unwrap().len(), 1);
 }
 
 #[tokio::test]

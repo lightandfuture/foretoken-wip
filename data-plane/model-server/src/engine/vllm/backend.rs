@@ -9,13 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::{RwLock, mpsc};
-use vllm_llm::{FinishReason, Llm};
+use vllm_llm::{FinishReason, GenerateRequest, Llm};
 use vllm_metrics::EngineLabels;
 
-use super::conversion::to_token_output;
 use super::telemetry::{BoundaryLatencyMetrics, read_vllm_metrics};
 use crate::engine::{Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream};
-use foretoken_model_protocol::{GenerateInput, TokenErrorCode, TokenEvent};
 
 /// vLLM adapter failures. Classified without retaining vLLM's diagnostic text,
 /// then translated into the engine-neutral [`EngineError`] at the trait
@@ -182,13 +180,7 @@ where
             let (event, terminal) = match item {
                 Ok(output) if output.finish_reason == Some(FinishReason::Error) => {
                     inflight.release();
-                    (
-                        Ok(TokenEvent::Error {
-                            request_id: request_id.clone(),
-                            code: TokenErrorCode::RequestFailed,
-                        }),
-                        true,
-                    )
+                    (Err(EngineError::RequestFailed), true)
                 }
                 Ok(mut output) => {
                     let now = Instant::now();
@@ -228,10 +220,7 @@ where
                         inflight.release();
                     }
                     output.request_id.clone_from(&request_id);
-                    (
-                        Ok(TokenEvent::Token(Box::new(to_token_output(output)))),
-                        terminal,
-                    )
+                    (Ok(output), terminal)
                 }
                 Err(error) => {
                     inflight.release();
@@ -263,13 +252,13 @@ where
 
 #[async_trait]
 impl Engine for VllmBackend {
-    async fn generate(&self, request: GenerateInput) -> Result<TokenStream, EngineError> {
+    async fn generate(&self, request: GenerateRequest) -> Result<TokenStream, EngineError> {
         let started_at = Instant::now();
         let guard = self.llm.read().await;
         let llm = guard.as_ref().ok_or(EngineError::Unavailable)?;
         let request_id = request.request_id.clone();
         let stream = llm
-            .generate(super::conversion::to_vllm_request(request)?)
+            .generate(request)
             .await
             .map_err(VllmError::from_llm)
             .map_err(EngineError::from)?;

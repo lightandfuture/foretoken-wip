@@ -5,12 +5,7 @@
 
 pub mod types;
 
-pub use types::{
-    EngineExtensions, FinishReason, Logprobs, ModelDtype, PositionLogprobs, SamplingParams,
-    StopReason, TokenLogprob,
-};
-
-use std::collections::BTreeMap;
+pub use types::ModelDtype;
 
 use serde::{Deserialize, Serialize};
 
@@ -25,50 +20,12 @@ pub enum ModelServerRole {
     Decode,
 }
 
-/// Request accepted by the single model-server ingress owned by one routable ModelGroup.
-/// Its Pod placement is a runtime detail and does not create another routing identity.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GenerateInput {
-    pub request_id: String,
-    pub prompt_token_ids: Vec<u32>,
-    pub sampling_params: SamplingParams,
-    #[serde(default)]
-    pub extensions: Option<EngineExtensions>,
-    #[serde(default)]
-    pub arrival_time: Option<f64>,
-    #[serde(default)]
-    pub cache_salt: Option<String>,
-    #[serde(default)]
-    pub trace_headers: Option<BTreeMap<String, String>>,
-    #[serde(default)]
-    pub priority: i32,
-    #[serde(default)]
-    pub data_parallel_rank: Option<u32>,
-    #[serde(default)]
-    pub session_id: Option<String>,
-}
-
 /// Explicitly scoped cancellation request. Empty lists are rejected by model-server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AbortInput {
     #[serde(default)]
     pub request_ids: Vec<String>,
-}
-
-/// Fields preserved from one engine output update.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TokenOutput {
-    pub request_id: String,
-    pub prompt_token_ids: Option<Vec<u32>>,
-    pub prompt_logprobs: Option<Logprobs>,
-    pub token_ids: Vec<u32>,
-    pub logprobs: Option<Logprobs>,
-    pub cached_token_count: usize,
-    pub finish_reason: Option<FinishReason>,
-    pub kv_transfer_params: Option<serde_json::Value>,
-    pub ec_transfer_params: Option<serde_json::Value>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -248,8 +205,8 @@ pub enum TokenErrorCode {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum TokenEvent {
-    Token(Box<TokenOutput>),
+pub enum StreamEvent {
+    Output(vllm_llm::GenerateOutput),
     Error {
         request_id: String,
         code: TokenErrorCode,

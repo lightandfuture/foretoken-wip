@@ -6,26 +6,28 @@
 #![cfg(feature = "backend-sglang")]
 
 use axum::{Json, Router, routing::post};
-use foretoken_model_protocol::{FinishReason, GenerateInput, SamplingParams, TokenEvent};
 use foretoken_model_server::engine::Engine;
 use foretoken_model_server::engine::sglang::{SglangBackend, SglangLaunchPlan};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
+use vllm_llm::{FinishReason, GenerateRequest};
 
-fn generate_input() -> GenerateInput {
-    GenerateInput {
+fn generate_request() -> GenerateRequest {
+    GenerateRequest {
         request_id: "req".into(),
         prompt_token_ids: vec![1, 2],
-        sampling_params: SamplingParams::default(),
-        extensions: None,
+        sampling_params: Default::default(),
+        mm_features: None,
         arrival_time: None,
         cache_salt: None,
         trace_headers: None,
         priority: 0,
         data_parallel_rank: None,
         session_id: None,
+        reasoning_parser_kwargs: None,
+        lora_request: None,
     }
 }
 
@@ -73,33 +75,26 @@ async fn generate_streams_tokens_and_terminal() {
     let (endpoint, seen) = spawn_mock_server(real_sglang_body()).await;
     let backend = SglangBackend::new(endpoint);
 
-    let mut stream = backend.generate(generate_input()).await.unwrap();
+    let mut stream = backend.generate(generate_request()).await.unwrap();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
         events.push(event.unwrap());
     }
 
     assert_eq!(events.len(), 2);
-    match &events[0] {
-        TokenEvent::Token(output) => {
-            // The first output carries the prompt ids for the frontend decoder.
-            assert_eq!(output.prompt_token_ids.as_deref(), Some(&[1, 2][..]));
-            assert_eq!(output.token_ids, vec![42]);
-            assert_eq!(output.finish_reason, None);
-        }
-        TokenEvent::Error { .. } => panic!("unexpected error"),
-    }
-    match &events[1] {
-        TokenEvent::Token(output) => {
-            assert_eq!(
-                output.token_ids,
-                vec![43],
-                "cumulative ids must become deltas"
-            );
-            assert_eq!(output.finish_reason, Some(FinishReason::Stop(None)));
-        }
-        TokenEvent::Error { .. } => panic!("unexpected error"),
-    }
+    // The first output carries the prompt ids for the frontend decoder.
+    assert_eq!(
+        events[0].prompt_token_ids().map(|ids| ids.as_ref()),
+        Some(&[1, 2][..])
+    );
+    assert_eq!(events[0].token_ids, vec![42]);
+    assert_eq!(events[0].finish_reason, None);
+    assert_eq!(
+        events[1].token_ids,
+        vec![43],
+        "cumulative ids must become deltas"
+    );
+    assert_eq!(events[1].finish_reason, Some(FinishReason::Stop(None)));
 
     // The mock saw the tokenized request.
     let body = seen.lock().unwrap();
@@ -118,15 +113,10 @@ async fn generate_maps_object_length_finish_reason() {
     let (endpoint, _seen) = spawn_mock_server(body).await;
     let backend = SglangBackend::new(endpoint);
 
-    let mut stream = backend.generate(generate_input()).await.unwrap();
-    let event = stream.next().await.unwrap().unwrap();
-    match event {
-        TokenEvent::Token(output) => {
-            assert_eq!(output.token_ids, vec![42]);
-            assert_eq!(output.finish_reason, Some(FinishReason::Length));
-        }
-        TokenEvent::Error { .. } => panic!("unexpected error"),
-    }
+    let mut stream = backend.generate(generate_request()).await.unwrap();
+    let output = stream.next().await.unwrap().unwrap();
+    assert_eq!(output.token_ids, vec![42]);
+    assert_eq!(output.finish_reason, Some(FinishReason::Length));
     assert!(stream.next().await.is_none());
 }
 
@@ -143,7 +133,7 @@ async fn generate_reports_backend_error_on_non_success() {
     });
 
     let backend = SglangBackend::new(format!("http://{addr}"));
-    let result = backend.generate(generate_input()).await;
+    let result = backend.generate(generate_request()).await;
     assert!(result.is_err());
 }
 

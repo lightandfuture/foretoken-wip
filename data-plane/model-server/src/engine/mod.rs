@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
 
-//! Engine-neutral contract between the model-server core and an inference
-//! engine adapter.
+//! Engine boundary between the model-server core and an inference engine
+//! adapter.
 //!
-//! This module defines the trait, error, telemetry, and capability types the
-//! core relies on. It never imports an inference-engine crate; vLLM, SGLang,
-//! and future engines implement [`Engine`] behind this boundary.
+//! The trait uses vLLM's native types for the generate wire; the SGLang
+//! adapter converts them to its own representation internally. The core relies
+//! on this trait plus the engine-local error, telemetry, and capability types
+//! below.
 
 #[cfg(feature = "backend-sglang")]
 pub mod sglang;
@@ -16,11 +17,12 @@ pub mod vllm;
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use foretoken_model_protocol::{CumulativeHistogram, GenerateInput, TokenErrorCode, TokenEvent};
+use foretoken_model_protocol::{CumulativeHistogram, TokenErrorCode};
 use futures::Stream;
+use vllm_llm::{GenerateOutput, GenerateRequest};
 
-/// Stream of per-request token events produced by an engine.
-pub type TokenStream = Pin<Box<dyn Stream<Item = Result<TokenEvent, EngineError>> + Send>>;
+/// Stream of per-request generate outputs produced by an engine.
+pub type TokenStream = Pin<Box<dyn Stream<Item = Result<GenerateOutput, EngineError>> + Send>>;
 
 /// Engine failures classified without retaining engine-specific diagnostic text.
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +88,7 @@ pub struct EngineTelemetry {
 /// Minimal engine operations the group-local model-server core needs.
 #[async_trait]
 pub trait Engine: Send + Sync {
-    async fn generate(&self, request: GenerateInput) -> Result<TokenStream, EngineError>;
+    async fn generate(&self, request: GenerateRequest) -> Result<TokenStream, EngineError>;
     async fn abort(&self, request_ids: &[String]) -> Result<(), EngineError>;
     fn telemetry(&self) -> EngineTelemetry;
     fn capabilities(&self) -> EngineCapabilities;

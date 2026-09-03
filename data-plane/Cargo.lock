@@ -1265,11 +1265,9 @@ dependencies = [
 name = "foretoken-model-protocol"
 version = "0.0.1"
 dependencies = [
- "rmp-serde",
- "rmpv",
  "serde",
  "serde_json",
- "serde_with",
+ "vllm-llm",
 ]
 
 [[package]]

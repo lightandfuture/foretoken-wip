@@ -13,24 +13,22 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use foretoken_model_protocol::{
-    FinishReason, GenerateInput, SamplingParams, TokenEvent, TokenOutput,
-};
 use foretoken_model_server::engine::{
     Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream,
 };
 use futures::{StreamExt, stream};
+use vllm_llm::{FinishReason, GenerateOutput, GenerateRequest};
 
-/// A deterministic engine that replays a scripted sequence of token events and
-/// records every `abort`/`cleanup` call for assertions.
+/// A deterministic engine that replays a scripted sequence of generate outputs
+/// and records every `abort`/`cleanup` call for assertions.
 struct ScriptedEngine {
-    events: Mutex<VecDeque<Result<TokenEvent, EngineError>>>,
+    events: Mutex<VecDeque<Result<GenerateOutput, EngineError>>>,
     aborts: Mutex<Vec<Vec<String>>>,
     cleanups: AtomicUsize,
 }
 
 impl ScriptedEngine {
-    fn new(events: Vec<Result<TokenEvent, EngineError>>) -> Self {
+    fn new(events: Vec<Result<GenerateOutput, EngineError>>) -> Self {
         Self {
             events: Mutex::new(events.into()),
             aborts: Mutex::new(Vec::new()),
@@ -49,7 +47,7 @@ impl ScriptedEngine {
 
 #[async_trait]
 impl Engine for ScriptedEngine {
-    async fn generate(&self, _request: GenerateInput) -> Result<TokenStream, EngineError> {
+    async fn generate(&self, _request: GenerateRequest) -> Result<TokenStream, EngineError> {
         let events: Vec<_> = self.events.lock().unwrap().drain(..).collect();
         Ok(Box::pin(stream::iter(events)))
     }
@@ -73,47 +71,41 @@ impl Engine for ScriptedEngine {
     }
 }
 
-fn generate_input() -> GenerateInput {
-    GenerateInput {
+fn generate_request() -> GenerateRequest {
+    GenerateRequest {
         request_id: "req".into(),
         prompt_token_ids: vec![1, 2],
-        sampling_params: SamplingParams::default(),
-        extensions: None,
+        sampling_params: Default::default(),
+        mm_features: None,
         arrival_time: None,
         cache_salt: None,
         trace_headers: None,
         priority: 0,
         data_parallel_rank: None,
         session_id: None,
+        reasoning_parser_kwargs: None,
+        lora_request: None,
     }
 }
 
-fn token(request_id: &str, token_id: u32) -> TokenEvent {
-    TokenEvent::Token(Box::new(TokenOutput {
+fn output(request_id: &str, token_id: u32) -> GenerateOutput {
+    GenerateOutput {
         request_id: request_id.into(),
-        prompt_token_ids: None,
-        prompt_logprobs: None,
+        prompt_info: None,
         token_ids: vec![token_id],
         logprobs: None,
-        cached_token_count: 0,
         finish_reason: None,
+        cached_token_count: 0,
         kv_transfer_params: None,
         ec_transfer_params: None,
-    }))
+    }
 }
 
-fn terminal(request_id: &str, token_id: u32) -> TokenEvent {
-    TokenEvent::Token(Box::new(TokenOutput {
-        request_id: request_id.into(),
-        prompt_token_ids: None,
-        prompt_logprobs: None,
-        token_ids: vec![token_id],
-        logprobs: None,
-        cached_token_count: 0,
+fn terminal(request_id: &str, token_id: u32) -> GenerateOutput {
+    GenerateOutput {
         finish_reason: Some(FinishReason::Stop(None)),
-        kv_transfer_params: None,
-        ec_transfer_params: None,
-    }))
+        ..output(request_id, token_id)
+    }
 }
 
 /// A valid generation stream ends with exactly one terminal item and yields
@@ -121,12 +113,12 @@ fn terminal(request_id: &str, token_id: u32) -> TokenEvent {
 #[tokio::test]
 async fn generate_stream_ends_with_exactly_one_terminal() {
     let engine = ScriptedEngine::new(vec![
-        Ok(token("req", 1)),
-        Ok(token("req", 2)),
+        Ok(output("req", 1)),
+        Ok(output("req", 2)),
         Ok(terminal("req", 3)),
     ]);
 
-    let mut stream = engine.generate(generate_input()).await.unwrap();
+    let mut stream = engine.generate(generate_request()).await.unwrap();
     let mut terminals = 0;
     let mut after_terminal = false;
     while let Some(event) = stream.next().await {
@@ -134,43 +126,28 @@ async fn generate_stream_ends_with_exactly_one_terminal() {
         if after_terminal {
             panic!("stream yielded an item after the terminal: {event:?}");
         }
-        match &event {
-            TokenEvent::Token(output) => {
-                if output.finish_reason.is_some() {
-                    terminals += 1;
-                    after_terminal = true;
-                }
-            }
-            TokenEvent::Error { .. } => {
-                terminals += 1;
-                after_terminal = true;
-            }
+        if event.finish_reason.is_some() {
+            terminals += 1;
+            after_terminal = true;
         }
     }
     assert_eq!(terminals, 1, "stream must have exactly one terminal item");
     assert!(after_terminal, "stream must end with a terminal item");
 }
 
-/// An `Error` event is a valid terminal on its own.
+/// A stream error is a valid terminal on its own.
 #[tokio::test]
 async fn error_event_is_a_terminal() {
-    let engine = ScriptedEngine::new(vec![
-        Ok(token("req", 1)),
-        Ok(TokenEvent::Error {
-            request_id: "req".into(),
-            code: foretoken_model_protocol::TokenErrorCode::Unavailable,
-        }),
-    ]);
+    let engine = ScriptedEngine::new(vec![Ok(output("req", 1)), Err(EngineError::Unavailable)]);
 
-    let mut stream = engine.generate(generate_input()).await.unwrap();
+    let mut stream = engine.generate(generate_request()).await.unwrap();
     let mut terminals = 0;
     while let Some(event) = stream.next().await {
         match event {
-            Ok(TokenEvent::Error { .. }) => terminals += 1,
-            Ok(TokenEvent::Token(output)) => {
+            Err(_) => terminals += 1,
+            Ok(output) => {
                 assert!(output.finish_reason.is_none(), "non-terminal before error");
             }
-            Err(_) => {}
         }
     }
     assert_eq!(terminals, 1);

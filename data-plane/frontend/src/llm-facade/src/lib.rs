@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
 
 //! Backend-neutral generation execution port and vLLM adapter.
-mod conversion;
 mod facade;
 mod http;
 use async_trait::async_trait;

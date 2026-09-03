@@ -22,9 +22,10 @@ use serde::Serialize;
 use crate::core::kv_events::{KvDeltaError, KvEventAdapter};
 use crate::engine::{Engine, EngineError};
 use foretoken_model_protocol::{
-    AbortInput, GenerateInput, KV_INDEX_DELTA_PATH, KvDeltaQuery, RuntimeMetadataResponse,
-    TelemetryResponse, TokenEvent,
+    AbortInput, KV_INDEX_DELTA_PATH, KvDeltaQuery, RuntimeMetadataResponse, StreamEvent,
+    TelemetryResponse,
 };
+use vllm_llm::GenerateRequest;
 
 // One atomic word linearizes admission close against request acceptance.
 const ADMISSION_OPEN: u64 = 1 << 63;
@@ -199,7 +200,7 @@ async fn generate(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     // Multimodal tensors use MessagePack; ordinary requests keep a human-readable JSON boundary.
-    let input: GenerateInput = if content_type_is(&headers, "application/msgpack") {
+    let input: GenerateRequest = if content_type_is(&headers, "application/msgpack") {
         rmp_serde::from_slice(&body).map_err(|_| ApiError::InvalidRequest)?
     } else {
         serde_json::from_slice(&body).map_err(|_| ApiError::InvalidRequest)?
@@ -219,13 +220,13 @@ async fn generate(
     let body_stream = stream.map(move |item| {
         let _permit = &permit;
         let event = match item {
-            Ok(event) => event,
-            Err(error) => TokenEvent::Error {
+            Ok(event) => StreamEvent::Output(event),
+            Err(error) => StreamEvent::Error {
                 request_id: request_id.clone(),
                 code: error.token_error_code(),
             },
         };
-        let mut encoded = serde_json::to_vec(&event).expect("TokenEvent always serializes");
+        let mut encoded = serde_json::to_vec(&event).expect("StreamEvent always serializes");
         encoded.push(b'\n');
         Ok::<Bytes, Infallible>(Bytes::from(encoded))
     });

@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::{Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream};
-use foretoken_model_protocol::{FinishReason, GenerateInput, TokenEvent, TokenOutput};
+use vllm_llm::{FinishReason, GenerateOutput, GeneratePromptInfo};
 
-use super::conversion::to_sglang_sampling;
+use super::conversion::{out_of_contract_field, to_sglang_sampling};
 
 /// SGLang adapter failures, translated into the engine-neutral [`EngineError`].
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +64,7 @@ struct ChunkMeta {
     finish_reason: Option<serde_json::Value>,
 }
 
-/// Maps an SGLang finish-reason object into the neutral [`FinishReason`].
+/// Maps an SGLang finish-reason object into vLLM's [`FinishReason`].
 fn parse_sglang_finish_reason(reason: &serde_json::Value) -> FinishReason {
     match reason.get("type").and_then(|kind| kind.as_str()) {
         Some("stop") => FinishReason::Stop(None),
@@ -160,21 +160,27 @@ impl SglangBackend {
                         .and_then(|meta| meta.finish_reason)
                         .map(|reason| parse_sglang_finish_reason(&reason))
                         .or_else(|| incremental.is_empty().then_some(FinishReason::Length));
-                    yield Ok(TokenEvent::Token(Box::new(TokenOutput {
+                    if finish_reason == Some(FinishReason::Error) {
+                        yield Err(EngineError::RequestFailed);
+                        return;
+                    }
+                    yield Ok(GenerateOutput {
                         request_id: request_id.clone(),
-                        prompt_token_ids: if first_output {
-                            Some(prompt_token_ids.clone())
+                        prompt_info: if first_output {
+                            Some(GeneratePromptInfo {
+                                prompt_token_ids: prompt_token_ids.clone().into(),
+                                prompt_logprobs: None,
+                            })
                         } else {
                             None
                         },
-                        prompt_logprobs: None,
                         token_ids: incremental,
                         logprobs: None,
-                        cached_token_count: 0,
                         finish_reason,
+                        cached_token_count: 0,
                         kv_transfer_params: None,
                         ec_transfer_params: None,
-                    })));
+                    });
                     first_output = false;
                 }
             }
@@ -188,7 +194,13 @@ impl SglangBackend {
 
 #[async_trait]
 impl Engine for SglangBackend {
-    async fn generate(&self, request: GenerateInput) -> Result<TokenStream, EngineError> {
+    async fn generate(
+        &self,
+        request: vllm_llm::GenerateRequest,
+    ) -> Result<TokenStream, EngineError> {
+        if out_of_contract_field(&request.sampling_params).is_some() {
+            return Err(EngineError::InvalidRequest);
+        }
         let request_id = request.request_id.clone();
         let prompt_token_ids = request.prompt_token_ids.clone();
         let sampling = to_sglang_sampling(&request.sampling_params);
@@ -304,8 +316,11 @@ mod tests {
         let mut events = SglangBackend::token_stream("r1".into(), vec![100, 200], body);
         let first = events.next().await.expect("first event");
         match first {
-            Ok(TokenEvent::Token(token)) => {
-                assert_eq!(token.prompt_token_ids.as_deref(), Some(&[100, 200][..]));
+            Ok(token) => {
+                assert_eq!(
+                    token.prompt_token_ids().map(|ids| ids.as_ref()),
+                    Some(&[100, 200][..])
+                );
                 assert_eq!(token.token_ids, vec![1]);
                 assert_eq!(token.finish_reason, None);
             }
@@ -313,9 +328,13 @@ mod tests {
         }
         let second = events.next().await.expect("second event");
         match second {
-            Ok(TokenEvent::Token(token)) => {
-                assert!(token.prompt_token_ids.is_none());
-                assert_eq!(token.token_ids, vec![2], "cumulative ids must become deltas");
+            Ok(token) => {
+                assert!(token.prompt_info.is_none());
+                assert_eq!(
+                    token.token_ids,
+                    vec![2],
+                    "cumulative ids must become deltas"
+                );
                 assert_eq!(token.finish_reason, Some(FinishReason::Stop(None)));
             }
             _ => panic!("expected second token output"),
@@ -323,10 +342,48 @@ mod tests {
         assert!(events.next().await.is_none());
     }
 
+    #[tokio::test]
+    async fn error_finish_reason_yields_request_failed() {
+        use futures::stream;
+        // An unrecognized finish-reason type maps to FinishReason::Error and
+        // must surface as a request failure, not a successful output.
+        let body = stream::iter(vec![Ok::<_, reqwest::Error>(Bytes::from_static(
+            b"data: {\"output_ids\":[1],\"meta_info\":{\"finish_reason\":{\"type\":\"unrecognized\"}}}\n",
+        ))]);
+        let mut events = SglangBackend::token_stream("r1".into(), vec![100, 200], body);
+        match events.next().await.expect("first event") {
+            Err(EngineError::RequestFailed) => {}
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_out_of_contract_sampling_fields() {
+        // generate() rejects out-of-contract sampling fields before any HTTP,
+        // so the request never reaches SGLang and the caller gets a 400.
+        let backend = SglangBackend::new("http://127.0.0.1:1".into());
+        let request = vllm_llm::GenerateRequest {
+            sampling_params:
+                vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams {
+                    allowed_token_ids: Some(vec![5]),
+                    ..Default::default()
+                },
+            ..Default::default()
+        };
+        match backend.generate(request).await {
+            Err(EngineError::InvalidRequest) => {}
+            Err(other) => panic!("expected InvalidRequest, got {other:?}"),
+            Ok(_) => panic!("expected InvalidRequest, got an output stream"),
+        }
+    }
+
     #[test]
     fn parses_object_finish_reason() {
         assert_eq!(
-            parse_sglang_finish_reason(&serde_json::json!({"type":"stop","stop_reason":"<|im_end|>"})),
+            parse_sglang_finish_reason(
+                &serde_json::json!({"type":"stop","stop_reason":"<|im_end|>"})
+            ),
             FinishReason::Stop(None)
         );
         assert_eq!(
@@ -334,9 +391,14 @@ mod tests {
             FinishReason::Length
         );
         assert_eq!(
-            parse_sglang_finish_reason(&serde_json::json!({"type":"abort","abort_reason":"killed"})),
+            parse_sglang_finish_reason(
+                &serde_json::json!({"type":"abort","abort_reason":"killed"})
+            ),
             FinishReason::Abort
         );
-        assert_eq!(parse_sglang_finish_reason(&serde_json::json!({})), FinishReason::Error);
+        assert_eq!(
+            parse_sglang_finish_reason(&serde_json::json!({})),
+            FinishReason::Error
+        );
     }
 }

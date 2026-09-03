@@ -6,14 +6,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use foretoken_model_protocol::{
-    AbortInput, FinishReason as ForetokenFinishReason, TokenErrorCode, TokenEvent,
-};
+use foretoken_model_protocol::{AbortInput, StreamEvent, TokenErrorCode};
 use futures::StreamExt;
 use serde::Deserialize;
 use vllm_llm::{GenerateOutput, GenerateRequest};
 
-use crate::conversion::{to_generate_input, to_generate_output};
 use crate::{LlmFacade, LlmFacadeError, TokenStream};
 
 pub(crate) const MODEL_SERVER_REQUEST_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -48,8 +45,7 @@ impl HttpFacade {
         &self,
         request: GenerateRequest,
     ) -> Result<TokenStream, LlmFacadeError> {
-        let body = rmp_serde::to_vec_named(&to_generate_input(request)?)
-            .map_err(|_| LlmFacadeError::RequestFailed)?;
+        let body = rmp_serde::to_vec_named(&request).map_err(|_| LlmFacadeError::RequestFailed)?;
         let response = tokio::time::timeout(
             self.request_start_timeout,
             self.client
@@ -176,11 +172,8 @@ pub async fn bootstrap_engine_id(
 
 fn decode_event(line: &[u8]) -> Result<GenerateOutput, LlmFacadeError> {
     match serde_json::from_slice(line).map_err(|_| LlmFacadeError::Protocol)? {
-        TokenEvent::Token(output) if output.finish_reason == Some(ForetokenFinishReason::Error) => {
-            Err(LlmFacadeError::RequestFailed)
-        }
-        TokenEvent::Token(output) => Ok(to_generate_output(*output)),
-        TokenEvent::Error { code, .. } => Err(match code {
+        StreamEvent::Output(output) => Ok(output),
+        StreamEvent::Error { code, .. } => Err(match code {
             TokenErrorCode::Unavailable => LlmFacadeError::Unavailable,
             TokenErrorCode::RequestFailed => LlmFacadeError::RequestFailed,
             TokenErrorCode::Protocol => LlmFacadeError::Protocol,

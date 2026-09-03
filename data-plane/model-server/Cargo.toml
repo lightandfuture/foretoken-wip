@@ -12,13 +12,7 @@ description = "Group-local managed EngineCore and typed streaming API"
 
 [features]
 default = ["backend-vllm"]
-backend-vllm = [
-    "dep:vllm-engine-core-client",
-    "dep:vllm-llm",
-    "dep:vllm-managed-engine",
-    "dep:vllm-metrics",
-    "dep:vllm-tracing",
-]
+backend-vllm = ["dep:vllm-managed-engine", "dep:vllm-metrics", "dep:vllm-tracing"]
 backend-sglang = ["dep:reqwest", "dep:tracing-subscriber"]
 
 [dependencies]
@@ -41,8 +35,8 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, optional = true }
 uuid.workspace = true
 zeromq.workspace = true
-vllm-engine-core-client = { workspace = true, optional = true }
-vllm-llm = { workspace = true, optional = true }
+vllm-engine-core-client.workspace = true
+vllm-llm.workspace = true
 vllm-managed-engine = { workspace = true, optional = true }
 vllm-metrics = { workspace = true, optional = true }
 vllm-tracing = { workspace = true, optional = true }

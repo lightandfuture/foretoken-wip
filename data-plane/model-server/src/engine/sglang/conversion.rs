@@ -3,29 +3,24 @@
 
 //! SGLang sampling-parameter conversion.
 //!
-//! The neutral `foretoken_model_protocol` types carry no engine dependency;
-//! this module is the sole place where the neutral [`SamplingParams`] are
-//! translated into SGLang's native `/generate` sampling dict.
-//!
-//! [`SamplingParams::extra_args`] is ignored here: the frontend fills it with
-//! vLLM field names, which SGLang rejects (ADR-0001).
+//! Translates vLLM's [`EngineCoreSamplingParams`] into SGLang's native
+//! `/generate` sampling dict. Only the shared subset is mapped; vLLM-only
+//! fields SGLang cannot express are out-of-contract and are dropped here.
 
-use foretoken_model_protocol::SamplingParams;
+use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
-/// Builds SGLang's native sampling dict from the neutral typed fields.
+/// Builds SGLang's native sampling dict from vLLM's sampling params.
 ///
-/// Value domains follow sglang v0.5.18 `SamplingParams` (post_init +
-/// verify()): the neutral defaults are legal there (temperature >= 0 with
-/// [0, 1e-6) forcing greedy, top_p in (0, 1], penalties in [-2, 2]), so those
-/// keys are forwarded unconditionally. Only `top_k` and `seed` need
-/// translation:
-/// - neutral `top_k: u32` uses 0 as the vLLM-style "all tokens" sentinel;
-///   sglang maps -1 to the whole vocabulary in post_init and verify() rejects
-///   values < 1 (including 0), so the sentinel is translated by omitting the
-///   key: sglang then applies its whole-vocabulary default.
-/// - `seed` is sent as `sampling_seed`: the neutral key name would raise
-///   TypeError inside `SamplingParams`.
-pub fn to_sglang_sampling(params: &SamplingParams) -> serde_json::Value {
+/// Value domains follow sglang v0.5.18 `SamplingParams` (post_init + verify()):
+/// the shared defaults are legal there (temperature >= 0 with [0, 1e-6) forcing
+/// greedy, top_p in (0, 1], penalties in [-2, 2]), so those keys are forwarded
+/// unconditionally. Only `top_k` and `seed` need translation:
+/// - vLLM's `top_k: u32` uses 0 as the "all tokens" sentinel; sglang maps -1 to
+///   the whole vocabulary in post_init and verify() rejects values < 1
+///   (including 0), so the sentinel is omitted (sglang applies its default).
+/// - `seed` is sent as `sampling_seed`: the vLLM key name would raise TypeError
+///   inside `SamplingParams`.
+pub fn to_sglang_sampling(params: &EngineCoreSamplingParams) -> serde_json::Value {
     let mut json = serde_json::json!({
         "temperature": params.temperature,
         "top_p": params.top_p,
@@ -45,36 +40,32 @@ pub fn to_sglang_sampling(params: &SamplingParams) -> serde_json::Value {
     json
 }
 
+/// Returns the name of the first vLLM-only sampling field that SGLang cannot
+/// express, if any is set. Forwarding such a request silently would violate the
+/// caller's explicit intent, so the adapter rejects it (HTTP 400).
+pub fn out_of_contract_field(params: &EngineCoreSamplingParams) -> Option<&'static str> {
+    if params.allowed_token_ids.is_some() {
+        return Some("allowed_token_ids");
+    }
+    if params.bad_words_token_ids.is_some() {
+        return Some("bad_words_token_ids");
+    }
+    if params.repetition_detection.is_some() {
+        return Some("repetition_detection");
+    }
+    if params.structured_outputs.is_some() {
+        return Some("structured_outputs");
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     #[test]
-    fn drops_vllm_specific_extra_args() {
-        let mut extra = BTreeMap::new();
-        extra.insert(
-            "all_stop_token_ids".into(),
-            serde_json::json!([151643, 151645]),
-        );
-        extra.insert("structured_outputs".into(), serde_json::json!({}));
-        extra.insert("logit_bias".into(), serde_json::json!({}));
-        let params = SamplingParams {
-            temperature: 0.5,
-            max_tokens: 32,
-            stop_token_ids: vec![7],
-            extra_args: extra,
-            ..Default::default()
-        };
-        let json = to_sglang_sampling(&params);
-        assert!(json.get("all_stop_token_ids").is_none());
-        assert!(json.get("structured_outputs").is_none());
-        assert!(json.get("logit_bias").is_none());
-    }
-
-    #[test]
-    fn keeps_neutral_fields() {
-        let params = SamplingParams {
+    fn maps_shared_subset() {
+        let params = EngineCoreSamplingParams {
             temperature: 0.7,
             top_p: 0.9,
             top_k: 40,
@@ -99,8 +90,8 @@ mod tests {
     #[test]
     fn omits_top_k_zero_sentinel() {
         // Guards the top_k=0 sentinel translation (see to_sglang_sampling).
-        let params = SamplingParams {
-            top_k: 0, // also the SamplingParams::default() value
+        let params = EngineCoreSamplingParams {
+            top_k: 0, // also the default value
             ..Default::default()
         };
         let json = to_sglang_sampling(&params);
@@ -112,7 +103,7 @@ mod tests {
 
     #[test]
     fn forwards_explicit_top_k() {
-        let params = SamplingParams {
+        let params = EngineCoreSamplingParams {
             top_k: 5,
             ..Default::default()
         };
@@ -123,12 +114,49 @@ mod tests {
     #[test]
     fn uses_sglang_seed_key_name() {
         // Guards the seed -> sampling_seed key translation (see to_sglang_sampling).
-        let params = SamplingParams {
+        let params = EngineCoreSamplingParams {
             seed: Some(42),
             ..Default::default()
         };
         let json = to_sglang_sampling(&params);
         assert!(json.get("seed").is_none());
         assert_eq!(json["sampling_seed"], 42);
+    }
+
+    #[test]
+    fn drops_unmapped_vllm_fields() {
+        // Fields outside the shared subset are dropped here, not rejected:
+        // `logit_bias` is an S3 key-adaptation field (pending) and
+        // `thinking_token_budget` only has an approximate equivalent. Hard
+        // out-of-contract fields are rejected upstream (see out_of_contract_field).
+        let params = EngineCoreSamplingParams {
+            thinking_token_budget: Some(128),
+            logit_bias: Some(std::collections::HashMap::from([(1234, 1.0_f32)])),
+            ..Default::default()
+        };
+        let json = to_sglang_sampling(&params);
+        assert!(json.get("thinking_token_budget").is_none());
+        assert!(json.get("logit_bias").is_none());
+    }
+
+    #[test]
+    fn out_of_contract_field_detects_rejected_fields() {
+        let rejected = EngineCoreSamplingParams {
+            allowed_token_ids: Some(vec![5, 6]),
+            ..Default::default()
+        };
+        assert_eq!(out_of_contract_field(&rejected), Some("allowed_token_ids"));
+        let rejected = EngineCoreSamplingParams {
+            bad_words_token_ids: Some(vec![vec![1]]),
+            ..Default::default()
+        };
+        assert_eq!(
+            out_of_contract_field(&rejected),
+            Some("bad_words_token_ids")
+        );
+        assert_eq!(
+            out_of_contract_field(&EngineCoreSamplingParams::default()),
+            None
+        );
     }
 }
