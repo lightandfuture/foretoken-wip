@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::engine::{Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream};
 use vllm_llm::{FinishReason, GenerateOutput, GeneratePromptInfo};
 
-use super::conversion::{out_of_contract_field, to_sglang_sampling};
+use super::conversion::{find_out_of_contract_field, to_sglang_sampling};
 
 /// SGLang adapter failures, translated into the engine-neutral [`EngineError`].
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +198,8 @@ impl Engine for SglangBackend {
         &self,
         request: vllm_llm::GenerateRequest,
     ) -> Result<TokenStream, EngineError> {
-        if out_of_contract_field(&request.sampling_params).is_some() {
+        if let Some(field) = find_out_of_contract_field(&request.sampling_params) {
+            tracing::warn!(field, "rejecting out-of-contract sampling field");
             return Err(EngineError::InvalidRequest);
         }
         let request_id = request.request_id.clone();
@@ -363,18 +364,47 @@ mod tests {
         // generate() rejects out-of-contract sampling fields before any HTTP,
         // so the request never reaches SGLang and the caller gets a 400.
         let backend = SglangBackend::new("http://127.0.0.1:1".into());
-        let request = vllm_llm::GenerateRequest {
-            sampling_params:
-                vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams {
-                    allowed_token_ids: Some(vec![5]),
-                    ..Default::default()
-                },
-            ..Default::default()
-        };
-        match backend.generate(request).await {
-            Err(EngineError::InvalidRequest) => {}
-            Err(other) => panic!("expected InvalidRequest, got {other:?}"),
-            Ok(_) => panic!("expected InvalidRequest, got an output stream"),
+        for params in [
+            vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams {
+                allowed_token_ids: Some(vec![5]),
+                ..Default::default()
+            },
+            vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams {
+                bad_words_token_ids: Some(vec![vec![1]]),
+                ..Default::default()
+            },
+            vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams {
+                repetition_detection: Some(
+                    vllm_engine_core_client::protocol::sampling::RepetitionDetectionParams {
+                        max_pattern_size: 5,
+                        min_pattern_size: 0,
+                        min_count: 2,
+                    },
+                ),
+                ..Default::default()
+            },
+            vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams {
+                structured_outputs: Some(
+                    vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams::json(
+                        serde_json::json!({}),
+                    ),
+                ),
+                ..Default::default()
+            },
+            vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams {
+                skip_reading_prefix_cache: Some(true),
+                ..Default::default()
+            },
+        ] {
+            let request = vllm_llm::GenerateRequest {
+                sampling_params: params,
+                ..Default::default()
+            };
+            match backend.generate(request).await {
+                Err(EngineError::InvalidRequest) => {}
+                Err(other) => panic!("expected InvalidRequest, got {other:?}"),
+                Ok(_) => panic!("expected InvalidRequest, got an output stream"),
+            }
         }
     }
 

@@ -4,8 +4,13 @@
 //! SGLang sampling-parameter conversion.
 //!
 //! Translates vLLM's [`EngineCoreSamplingParams`] into SGLang's native
-//! `/generate` sampling dict. Only the shared subset is mapped; vLLM-only
-//! fields SGLang cannot express are out-of-contract and are dropped here.
+//! `/generate` sampling dict. Only the shared subset is mapped here:
+//! fields SGLang cannot express are rejected upstream at `generate()`
+//! ([`find_out_of_contract_field`]) and never reach this conversion;
+//! mappable-but-unmapped (`logit_bias`, `min_p`), approximate
+//! (`thinking_token_budget`), and derived (`eos_token_id`,
+//! `all_stop_token_ids`) fields are intentionally not forwarded
+//! (dispositions in ADR-0002).
 
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
@@ -43,7 +48,7 @@ pub fn to_sglang_sampling(params: &EngineCoreSamplingParams) -> serde_json::Valu
 /// Returns the name of the first vLLM-only sampling field that SGLang cannot
 /// express, if any is set. Forwarding such a request silently would violate the
 /// caller's explicit intent, so the adapter rejects it (HTTP 400).
-pub fn out_of_contract_field(params: &EngineCoreSamplingParams) -> Option<&'static str> {
+pub fn find_out_of_contract_field(params: &EngineCoreSamplingParams) -> Option<&'static str> {
     if params.allowed_token_ids.is_some() {
         return Some("allowed_token_ids");
     }
@@ -55,6 +60,9 @@ pub fn out_of_contract_field(params: &EngineCoreSamplingParams) -> Option<&'stat
     }
     if params.structured_outputs.is_some() {
         return Some("structured_outputs");
+    }
+    if params.skip_reading_prefix_cache.is_some() {
+        return Some("skip_reading_prefix_cache");
     }
     None
 }
@@ -128,7 +136,7 @@ mod tests {
         // Fields outside the shared subset are dropped here, not rejected:
         // `logit_bias` is an S3 key-adaptation field (pending) and
         // `thinking_token_budget` only has an approximate equivalent. Hard
-        // out-of-contract fields are rejected upstream (see out_of_contract_field).
+        // out-of-contract fields are rejected upstream (see find_out_of_contract_field).
         let params = EngineCoreSamplingParams {
             thinking_token_budget: Some(128),
             logit_bias: Some(std::collections::HashMap::from([(1234, 1.0_f32)])),
@@ -140,22 +148,59 @@ mod tests {
     }
 
     #[test]
-    fn out_of_contract_field_detects_rejected_fields() {
+    fn find_out_of_contract_field_detects_rejected_fields() {
         let rejected = EngineCoreSamplingParams {
             allowed_token_ids: Some(vec![5, 6]),
             ..Default::default()
         };
-        assert_eq!(out_of_contract_field(&rejected), Some("allowed_token_ids"));
+        assert_eq!(
+            find_out_of_contract_field(&rejected),
+            Some("allowed_token_ids")
+        );
         let rejected = EngineCoreSamplingParams {
             bad_words_token_ids: Some(vec![vec![1]]),
             ..Default::default()
         };
         assert_eq!(
-            out_of_contract_field(&rejected),
+            find_out_of_contract_field(&rejected),
             Some("bad_words_token_ids")
         );
+        let rejected = EngineCoreSamplingParams {
+            skip_reading_prefix_cache: Some(true),
+            ..Default::default()
+        };
         assert_eq!(
-            out_of_contract_field(&EngineCoreSamplingParams::default()),
+            find_out_of_contract_field(&rejected),
+            Some("skip_reading_prefix_cache")
+        );
+        let rejected = EngineCoreSamplingParams {
+            repetition_detection: Some(
+                vllm_engine_core_client::protocol::sampling::RepetitionDetectionParams {
+                    max_pattern_size: 5,
+                    min_pattern_size: 0,
+                    min_count: 2,
+                },
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            find_out_of_contract_field(&rejected),
+            Some("repetition_detection")
+        );
+        let rejected = EngineCoreSamplingParams {
+            structured_outputs: Some(
+                vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams::json(
+                    serde_json::json!({}),
+                ),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            find_out_of_contract_field(&rejected),
+            Some("structured_outputs")
+        );
+        assert_eq!(
+            find_out_of_contract_field(&EngineCoreSamplingParams::default()),
             None
         );
     }
