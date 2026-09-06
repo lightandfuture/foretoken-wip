@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::engine::{Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream};
 use vllm_llm::{FinishReason, GenerateOutput, GeneratePromptInfo};
 
-use super::conversion::{find_out_of_contract_field, to_sglang_sampling};
+use super::conversion::{find_rejected_field, to_sglang_sampling};
 
 /// SGLang adapter failures, translated into the engine-neutral [`EngineError`].
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -198,8 +198,8 @@ impl Engine for SglangBackend {
         &self,
         request: vllm_llm::GenerateRequest,
     ) -> Result<TokenStream, EngineError> {
-        if let Some(field) = find_out_of_contract_field(&request.sampling_params) {
-            tracing::warn!(field, "rejecting out-of-contract sampling field");
+        if let Some(field) = find_rejected_field(&request.sampling_params) {
+            tracing::warn!(field, "rejecting sampling field SGLang cannot honor");
             return Err(EngineError::InvalidRequest);
         }
         let request_id = request.request_id.clone();
@@ -360,9 +360,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_out_of_contract_sampling_fields() {
-        // generate() rejects out-of-contract sampling fields before any HTTP,
-        // so the request never reaches SGLang and the caller gets a 400.
+    async fn rejects_sampling_fields_sglang_cannot_honor() {
+        // Rejected before any HTTP; the request never reaches SGLang.
         let backend = SglangBackend::new("http://127.0.0.1:1".into());
         for params in [
             vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams {
@@ -393,6 +392,10 @@ mod tests {
             },
             vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams {
                 skip_reading_prefix_cache: Some(true),
+                ..Default::default()
+            },
+            vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams {
+                min_p: 1.5, // outside SGLang's [0, 1] domain
                 ..Default::default()
             },
         ] {

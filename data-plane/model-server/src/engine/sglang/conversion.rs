@@ -3,38 +3,36 @@
 
 //! SGLang sampling-parameter conversion.
 //!
-//! Translates vLLM's [`EngineCoreSamplingParams`] into SGLang's native
-//! `/generate` sampling dict. Only the shared subset is mapped here:
-//! fields SGLang cannot express are rejected upstream at `generate()`
-//! ([`find_out_of_contract_field`]) and never reach this conversion;
-//! mappable-but-unmapped (`logit_bias`, `min_p`), approximate
-//! (`thinking_token_budget`), and derived (`eos_token_id`,
-//! `all_stop_token_ids`) fields are intentionally not forwarded
-//! (dispositions in ADR-0002).
+//! Maps vLLM's [`EngineCoreSamplingParams`] to SGLang's `/generate` sampling
+//! dict. Requests SGLang cannot honor are rejected at `generate()`
+//! ([`find_rejected_field`]) before they reach this conversion; the logprobs
+//! family, `thinking_token_budget`, and engine-derived stop fields are not
+//! forwarded.
 
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
 /// Builds SGLang's native sampling dict from vLLM's sampling params.
 ///
-/// Value domains follow sglang v0.5.18 `SamplingParams` (post_init + verify()):
-/// the shared defaults are legal there (temperature >= 0 with [0, 1e-6) forcing
-/// greedy, top_p in (0, 1], penalties in [-2, 2]), so those keys are forwarded
-/// unconditionally. Only `top_k` and `seed` need translation:
-/// - vLLM's `top_k: u32` uses 0 as the "all tokens" sentinel; sglang maps -1 to
-///   the whole vocabulary in post_init and verify() rejects values < 1
-///   (including 0), so the sentinel is omitted (sglang applies its default).
-/// - `seed` is sent as `sampling_seed`: the vLLM key name would raise TypeError
-///   inside `SamplingParams`.
+/// Forwarded keys are within sglang v0.5.18 verify() domains, enforced
+/// upstream ([`find_rejected_field`]). Keys needing translation:
+/// - `top_k` 0 ("all tokens") is omitted; sglang defaults to -1.
+/// - `seed` -> `sampling_seed`; the vLLM key name raises TypeError.
+/// - `min_tokens` -> `min_new_tokens`; `logit_bias` u32 keys -> strings.
 pub fn to_sglang_sampling(params: &EngineCoreSamplingParams) -> serde_json::Value {
     let mut json = serde_json::json!({
         "temperature": params.temperature,
         "top_p": params.top_p,
         "max_new_tokens": params.max_tokens,
+        "min_p": params.min_p,
         "frequency_penalty": params.frequency_penalty,
         "presence_penalty": params.presence_penalty,
+        "repetition_penalty": params.repetition_penalty,
     });
     if params.top_k > 0 {
         json["top_k"] = serde_json::json!(params.top_k);
+    }
+    if params.min_tokens > 0 {
+        json["min_new_tokens"] = serde_json::json!(params.min_tokens);
     }
     if let Some(seed) = params.seed {
         json["sampling_seed"] = serde_json::json!(seed);
@@ -42,13 +40,26 @@ pub fn to_sglang_sampling(params: &EngineCoreSamplingParams) -> serde_json::Valu
     if !params.stop_token_ids.is_empty() {
         json["stop_token_ids"] = serde_json::json!(params.stop_token_ids);
     }
+    if let Some(logit_bias) = &params.logit_bias {
+        json["logit_bias"] = serde_json::Value::Object(
+            logit_bias
+                .iter()
+                .map(|(token_id, bias)| (token_id.to_string(), serde_json::json!(bias)))
+                .collect(),
+        );
+    }
     json
 }
 
-/// Returns the name of the first vLLM-only sampling field that SGLang cannot
-/// express, if any is set. Forwarding such a request silently would violate the
-/// caller's explicit intent, so the adapter rejects it (HTTP 400).
-pub fn find_out_of_contract_field(params: &EngineCoreSamplingParams) -> Option<&'static str> {
+/// sglang v0.5.18 verify() domain bounds.
+const TOP_P_MAX: f32 = 1.0; // top_p in (0, 1]
+const MIN_P_MAX: f32 = 1.0; // min_p in [0, 1]
+const PENALTY_MAX: f32 = 2.0; // freq/presence [-2, 2]; repetition (0, 2]
+
+/// Name of the first field making a request invalid for SGLang: unsupported
+/// or outside a verify() domain. Guarded so the caller gets a clean 400
+/// instead of SGLang failing mid-request.
+pub fn find_rejected_field(params: &EngineCoreSamplingParams) -> Option<&'static str> {
     if params.allowed_token_ids.is_some() {
         return Some("allowed_token_ids");
     }
@@ -63,6 +74,25 @@ pub fn find_out_of_contract_field(params: &EngineCoreSamplingParams) -> Option<&
     }
     if params.skip_reading_prefix_cache.is_some() {
         return Some("skip_reading_prefix_cache");
+    }
+    // NaN fails these comparisons and is rejected too.
+    if params.temperature < 0.0 || !params.temperature.is_finite() {
+        return Some("temperature");
+    }
+    if !(params.top_p > 0.0 && params.top_p <= TOP_P_MAX) {
+        return Some("top_p");
+    }
+    if !(0.0..=MIN_P_MAX).contains(&params.min_p) {
+        return Some("min_p");
+    }
+    if !(-PENALTY_MAX..=PENALTY_MAX).contains(&params.frequency_penalty) {
+        return Some("frequency_penalty");
+    }
+    if !(-PENALTY_MAX..=PENALTY_MAX).contains(&params.presence_penalty) {
+        return Some("presence_penalty");
+    }
+    if !(params.repetition_penalty > 0.0 && params.repetition_penalty <= PENALTY_MAX) {
+        return Some("repetition_penalty");
     }
     None
 }
@@ -133,44 +163,171 @@ mod tests {
 
     #[test]
     fn drops_unmapped_vllm_fields() {
-        // Fields outside the shared subset are dropped here, not rejected:
-        // `logit_bias` is an S3 key-adaptation field (pending) and
-        // `thinking_token_budget` only has an approximate equivalent. Hard
-        // out-of-contract fields are rejected upstream (see find_out_of_contract_field).
+        // Unmapped, not rejected: `logprobs` is request-level in SGLang;
+        // `thinking_token_budget` has no exact equivalent.
         let params = EngineCoreSamplingParams {
             thinking_token_budget: Some(128),
-            logit_bias: Some(std::collections::HashMap::from([(1234, 1.0_f32)])),
+            logprobs: Some(5),
             ..Default::default()
         };
         let json = to_sglang_sampling(&params);
         assert!(json.get("thinking_token_budget").is_none());
-        assert!(json.get("logit_bias").is_none());
+        assert!(json.get("logprobs").is_none());
     }
 
     #[test]
-    fn find_out_of_contract_field_detects_rejected_fields() {
+    fn maps_contract_mappable_fields() {
+        let params = EngineCoreSamplingParams {
+            min_tokens: 16,
+            min_p: 0.1,
+            repetition_penalty: 1.2,
+            logit_bias: Some(std::collections::HashMap::from([(1234, 1.5_f32)])),
+            ..Default::default()
+        };
+        let json = to_sglang_sampling(&params);
+        assert_eq!(json["min_new_tokens"], 16);
+        assert!(json.get("min_tokens").is_none(), "vLLM key must not leak");
+        assert_eq!(json["min_p"].as_f64().unwrap() as f32, 0.1);
+        assert_eq!(json["repetition_penalty"].as_f64().unwrap() as f32, 1.2);
+        assert_eq!(json["logit_bias"]["1234"], serde_json::json!(1.5));
+        assert!(
+            to_sglang_sampling(&EngineCoreSamplingParams::default())
+                .get("min_new_tokens")
+                .is_none(),
+            "default min_tokens must be omitted"
+        );
+    }
+
+    #[test]
+    fn find_rejected_field_detects_out_of_range_values() {
+        for (params, expected) in [
+            (
+                EngineCoreSamplingParams {
+                    temperature: -0.5,
+                    ..Default::default()
+                },
+                "temperature",
+            ),
+            (
+                EngineCoreSamplingParams {
+                    top_p: 0.0,
+                    ..Default::default()
+                },
+                "top_p",
+            ),
+            (
+                EngineCoreSamplingParams {
+                    top_p: 1.5,
+                    ..Default::default()
+                },
+                "top_p",
+            ),
+            (
+                EngineCoreSamplingParams {
+                    min_p: 1.5,
+                    ..Default::default()
+                },
+                "min_p",
+            ),
+            (
+                EngineCoreSamplingParams {
+                    frequency_penalty: 3.0,
+                    ..Default::default()
+                },
+                "frequency_penalty",
+            ),
+            (
+                EngineCoreSamplingParams {
+                    presence_penalty: -3.0,
+                    ..Default::default()
+                },
+                "presence_penalty",
+            ),
+            (
+                EngineCoreSamplingParams {
+                    repetition_penalty: 0.0,
+                    ..Default::default()
+                },
+                "repetition_penalty",
+            ),
+            (
+                EngineCoreSamplingParams {
+                    repetition_penalty: 2.5,
+                    ..Default::default()
+                },
+                "repetition_penalty",
+            ),
+            // NaN must not slip past the guards into sglang verify().
+            (
+                EngineCoreSamplingParams {
+                    min_p: f32::NAN,
+                    ..Default::default()
+                },
+                "min_p",
+            ),
+            (
+                EngineCoreSamplingParams {
+                    repetition_penalty: f32::NAN,
+                    ..Default::default()
+                },
+                "repetition_penalty",
+            ),
+        ] {
+            assert_eq!(find_rejected_field(&params), Some(expected));
+        }
+        // In-domain edges are accepted.
+        for params in [
+            EngineCoreSamplingParams {
+                temperature: 0.0,
+                ..Default::default()
+            },
+            EngineCoreSamplingParams {
+                top_p: 1.0,
+                ..Default::default()
+            },
+            EngineCoreSamplingParams {
+                min_p: 1.0,
+                ..Default::default()
+            },
+            EngineCoreSamplingParams {
+                frequency_penalty: -2.0,
+                ..Default::default()
+            },
+            EngineCoreSamplingParams {
+                presence_penalty: 2.0,
+                ..Default::default()
+            },
+            EngineCoreSamplingParams {
+                repetition_penalty: 2.0,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(find_rejected_field(&params), None);
+        }
+        assert_eq!(
+            find_rejected_field(&EngineCoreSamplingParams::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn find_rejected_field_detects_unsupported_fields() {
         let rejected = EngineCoreSamplingParams {
             allowed_token_ids: Some(vec![5, 6]),
             ..Default::default()
         };
-        assert_eq!(
-            find_out_of_contract_field(&rejected),
-            Some("allowed_token_ids")
-        );
+        assert_eq!(find_rejected_field(&rejected), Some("allowed_token_ids"));
         let rejected = EngineCoreSamplingParams {
             bad_words_token_ids: Some(vec![vec![1]]),
             ..Default::default()
         };
-        assert_eq!(
-            find_out_of_contract_field(&rejected),
-            Some("bad_words_token_ids")
-        );
+        assert_eq!(find_rejected_field(&rejected), Some("bad_words_token_ids"));
         let rejected = EngineCoreSamplingParams {
             skip_reading_prefix_cache: Some(true),
             ..Default::default()
         };
         assert_eq!(
-            find_out_of_contract_field(&rejected),
+            find_rejected_field(&rejected),
             Some("skip_reading_prefix_cache")
         );
         let rejected = EngineCoreSamplingParams {
@@ -183,10 +340,7 @@ mod tests {
             ),
             ..Default::default()
         };
-        assert_eq!(
-            find_out_of_contract_field(&rejected),
-            Some("repetition_detection")
-        );
+        assert_eq!(find_rejected_field(&rejected), Some("repetition_detection"));
         let rejected = EngineCoreSamplingParams {
             structured_outputs: Some(
                 vllm_engine_core_client::protocol::structured_outputs::StructuredOutputsParams::json(
@@ -195,12 +349,9 @@ mod tests {
             ),
             ..Default::default()
         };
+        assert_eq!(find_rejected_field(&rejected), Some("structured_outputs"));
         assert_eq!(
-            find_out_of_contract_field(&rejected),
-            Some("structured_outputs")
-        );
-        assert_eq!(
-            find_out_of_contract_field(&EngineCoreSamplingParams::default()),
+            find_rejected_field(&EngineCoreSamplingParams::default()),
             None
         );
     }
