@@ -5,9 +5,9 @@
 //!
 //! Maps vLLM's [`EngineCoreSamplingParams`] to SGLang's `/generate` sampling
 //! dict. Requests SGLang cannot honor are rejected at `generate()`
-//! ([`find_rejected_field`]) before they reach this conversion; the logprobs
-//! family, `thinking_token_budget`, and engine-derived stop fields are not
-//! forwarded.
+//! ([`find_rejected_field`]); `logprobs` maps to request-level knobs
+//! ([`to_sglang_logprobs`]); `thinking_token_budget` and engine-derived stop
+//! fields are not forwarded.
 
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 
@@ -56,9 +56,10 @@ const TOP_P_MAX: f32 = 1.0; // top_p in (0, 1]
 const MIN_P_MAX: f32 = 1.0; // min_p in [0, 1]
 const PENALTY_MAX: f32 = 2.0; // freq/presence [-2, 2]; repetition (0, 2]
 
-/// Name of the first field making a request invalid for SGLang: unsupported
-/// or outside a verify() domain. Guarded so the caller gets a clean 400
-/// instead of SGLang failing mid-request.
+/// Name of the first field making a request invalid for SGLang: unsupported,
+/// outside a verify() domain, or a logprobs mode it cannot honor over the
+/// stream. Guarded so the caller gets a clean 400 instead of SGLang failing
+/// mid-request.
 pub fn find_rejected_field(params: &EngineCoreSamplingParams) -> Option<&'static str> {
     if params.allowed_token_ids.is_some() {
         return Some("allowed_token_ids");
@@ -94,7 +95,30 @@ pub fn find_rejected_field(params: &EngineCoreSamplingParams) -> Option<&'static
     if !(params.repetition_penalty > 0.0 && params.repetition_penalty <= PENALTY_MAX) {
         return Some("repetition_penalty");
     }
+    // Logprobs modes SGLang cannot honor over the stream.
+    if params.prompt_logprobs.is_some() {
+        return Some("prompt_logprobs");
+    }
+    if params.logprob_token_ids.is_some() {
+        return Some("logprob_token_ids");
+    }
+    if params.logprobs.is_some_and(|n| n < 0) {
+        return Some("logprobs");
+    }
     None
+}
+
+/// SGLang request-level logprob knobs for a vLLM sampling request.
+///
+/// vLLM's `logprobs` counts the chosen token plus its alternatives; SGLang
+/// splits that into `return_logprob` (on/off) and `top_logprobs_num`
+/// (alternatives). `None` and `0` both disable logprobs; negatives are
+/// rejected upstream by [`find_rejected_field`].
+pub fn to_sglang_logprobs(params: &EngineCoreSamplingParams) -> (Option<bool>, Option<u32>) {
+    match params.logprobs {
+        None | Some(0) => (None, None),
+        Some(n) => (Some(true), Some((n - 1) as u32)),
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +331,63 @@ mod tests {
         assert_eq!(
             find_rejected_field(&EngineCoreSamplingParams::default()),
             None
+        );
+    }
+
+    #[test]
+    fn find_rejected_field_rejects_unhonorable_logprobs_modes() {
+        let params = |f: &dyn Fn(&mut EngineCoreSamplingParams)| {
+            let mut p = EngineCoreSamplingParams::default();
+            f(&mut p);
+            p
+        };
+        assert_eq!(
+            find_rejected_field(&params(&|p| p.prompt_logprobs = Some(5))),
+            Some("prompt_logprobs")
+        );
+        assert_eq!(
+            find_rejected_field(&params(&|p| p.logprobs = Some(-1))),
+            Some("logprobs")
+        );
+        assert_eq!(
+            find_rejected_field(&params(&|p| p.logprob_token_ids = Some(vec![7]))),
+            Some("logprob_token_ids")
+        );
+        assert_eq!(
+            find_rejected_field(&params(&|p| {
+                p.logprobs = Some(3);
+                p.logprob_token_ids = Some(vec![7]);
+            })),
+            Some("logprob_token_ids")
+        );
+    }
+
+    #[test]
+    fn to_sglang_logprobs_maps_count_to_knobs() {
+        assert_eq!(
+            to_sglang_logprobs(&EngineCoreSamplingParams::default()),
+            (None, None)
+        );
+        assert_eq!(
+            to_sglang_logprobs(&EngineCoreSamplingParams {
+                logprobs: Some(0),
+                ..Default::default()
+            }),
+            (None, None)
+        );
+        assert_eq!(
+            to_sglang_logprobs(&EngineCoreSamplingParams {
+                logprobs: Some(1),
+                ..Default::default()
+            }),
+            (Some(true), Some(0))
+        );
+        assert_eq!(
+            to_sglang_logprobs(&EngineCoreSamplingParams {
+                logprobs: Some(5),
+                ..Default::default()
+            }),
+            (Some(true), Some(4))
         );
     }
 
