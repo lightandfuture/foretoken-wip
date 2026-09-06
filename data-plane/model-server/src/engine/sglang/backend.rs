@@ -6,15 +6,13 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use serde::Deserialize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::engine::{Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream};
-use vllm_engine_core_client::protocol::logprobs::{Logprobs, PositionLogprobs, TokenLogprob};
 use vllm_llm::{FinishReason, GenerateOutput, GeneratePromptInfo};
 
-use super::conversion::{find_rejected_field, to_sglang_logprobs, to_sglang_sampling};
+use super::conversion::{SglangRequest, SglangResponseDecoder, parse_sse_chunk};
 
 /// SGLang adapter failures, translated into the engine-neutral [`EngineError`].
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -38,118 +36,6 @@ impl From<SglangError> for EngineError {
             SglangError::RequestFailed => EngineError::RequestFailed,
         }
     }
-}
-
-/// Request body for SGLang's native `/generate`.
-#[derive(serde::Serialize)]
-struct GenerateRequest {
-    input_ids: Vec<u32>,
-    sampling_params: serde_json::Value,
-    stream: bool,
-    /// Request-level logprob knobs; omitted unless `logprobs` was set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    return_logprob: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_logprobs_num: Option<u32>,
-}
-
-/// SGLang logprob triple: `[logprob, token_id, token_text]`. Token text is
-/// null unless the request set `return_text_in_logprobs`.
-type LogprobTriple = (f32, u32, Option<String>);
-
-/// One streamed token chunk from SGLang.
-#[derive(Debug, Deserialize)]
-struct GenerateChunk {
-    output_ids: Vec<u32>,
-    #[serde(default)]
-    meta_info: Option<ChunkMeta>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChunkMeta {
-    /// SGLang reports finish reasons as objects (`{"type":"stop",...}`,
-    /// `{"type":"length","length":N}`, ...), so keep the raw value and
-    /// extract the reason kind from its `type` field.
-    #[serde(default)]
-    finish_reason: Option<serde_json::Value>,
-    /// Cumulative per-generated-token logprobs, aligned with `output_ids`;
-    /// empty when the request did not ask for logprobs.
-    #[serde(default)]
-    output_token_logprobs: Vec<LogprobTriple>,
-    /// Cumulative top-k alternatives per generated token.
-    #[serde(default)]
-    output_top_logprobs: Vec<Vec<LogprobTriple>>,
-}
-
-/// Maps an SGLang finish-reason object into vLLM's [`FinishReason`].
-fn parse_sglang_finish_reason(reason: &serde_json::Value) -> FinishReason {
-    match reason.get("type").and_then(|kind| kind.as_str()) {
-        Some("stop") => FinishReason::Stop(None),
-        Some("length") => FinishReason::Length,
-        Some("abort") => FinishReason::Abort,
-        Some("repetition") => FinishReason::Repetition(None),
-        _ => FinishReason::Error,
-    }
-}
-
-/// Parses one line of SGLang's streaming `/generate` response (Server-Sent
-/// Events) into a chunk.
-///
-/// Each payload line looks like `data: {json}`. Lines that carry no payload
-/// (blank lines, comment/heartbeat lines, and the `[DONE]` terminator) yield
-/// `Ok(None)`; a malformed `data:` payload yields `Err(())`.
-fn parse_sse_chunk(line: &[u8]) -> Result<Option<GenerateChunk>, ()> {
-    let line = std::str::from_utf8(line).map_err(|_| ())?.trim();
-    if line.is_empty() || line.starts_with(':') || line == "[DONE]" {
-        return Ok(None);
-    }
-    let line = line.strip_prefix("data:").unwrap_or(line).trim();
-    serde_json::from_str(line).map(Some).map_err(|_| ())
-}
-
-/// Windows one chunk's cumulative logprobs to its token delta and converts
-/// them into vLLM's per-output [`Logprobs`].
-///
-/// SGLang streams these arrays cumulatively, aligned with the cumulative
-/// `output_ids`, so the same previous-length cut applies. SGLang reports no
-/// vocab ranks; entries use their 1-based position in the returned list.
-fn chunk_logprobs(
-    best: &[LogprobTriple],
-    top: &[Vec<LogprobTriple>],
-    start: usize,
-    end: usize,
-) -> Option<Logprobs> {
-    let window = best.get(start..end.min(best.len()))?;
-    if window.is_empty() {
-        return None;
-    }
-    let positions = window
-        .iter()
-        .enumerate()
-        .map(|(offset, &(logprob, token_id, _))| {
-            let mut entries = vec![TokenLogprob {
-                token_id,
-                logprob,
-                rank: 1,
-            }];
-            // The top-k list may repeat the chosen token; vLLM expects
-            // alternatives only.
-            if let Some(runners) = top.get(start + offset) {
-                for &(runner_logprob, runner_id, _) in runners {
-                    if runner_id == token_id {
-                        continue;
-                    }
-                    entries.push(TokenLogprob {
-                        token_id: runner_id,
-                        logprob: runner_logprob,
-                        rank: entries.len() as u32 + 1,
-                    });
-                }
-            }
-            PositionLogprobs { entries }
-        })
-        .collect();
-    Some(Logprobs { positions })
 }
 
 /// HTTP-backed SGLang engine.
@@ -187,10 +73,7 @@ impl SglangBackend {
             let mut body = body;
             let mut pending: Vec<u8> = Vec::new();
             let mut first_output = true;
-            // SGLang streams cumulative `output_ids` (each chunk repeats the
-            // whole prefix), so track the previous length and emit only the
-            // increment: the frontend's decoder expects per-step deltas.
-            let mut previous_output_len = 0_usize;
+            let mut decoder = SglangResponseDecoder::default();
             while let Some(chunk) = body.next().await {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
@@ -210,27 +93,8 @@ impl SglangBackend {
                             return;
                         }
                     };
-                    let output_len = chunk.output_ids.len();
-                    let incremental = chunk
-                        .output_ids
-                        .get(previous_output_len..)
-                        .unwrap_or(&[])
-                        .to_vec();
-                    let meta = chunk.meta_info.as_ref();
-                    let finish_reason = meta
-                        .and_then(|meta| meta.finish_reason.as_ref())
-                        .map(parse_sglang_finish_reason)
-                        .or_else(|| incremental.is_empty().then_some(FinishReason::Length));
-                    let logprobs = meta.and_then(|meta| {
-                        chunk_logprobs(
-                            &meta.output_token_logprobs,
-                            &meta.output_top_logprobs,
-                            previous_output_len,
-                            output_len,
-                        )
-                    });
-                    previous_output_len = output_len;
-                    if finish_reason == Some(FinishReason::Error) {
+                    let step = decoder.decode(chunk);
+                    if step.finish_reason == Some(FinishReason::Error) {
                         yield Err(EngineError::RequestFailed);
                         return;
                     }
@@ -244,9 +108,9 @@ impl SglangBackend {
                         } else {
                             None
                         },
-                        token_ids: incremental,
-                        logprobs,
-                        finish_reason,
+                        token_ids: step.token_ids,
+                        logprobs: step.logprobs,
+                        finish_reason: step.finish_reason,
                         cached_token_count: 0,
                         kv_transfer_params: None,
                         ec_transfer_params: None,
@@ -268,21 +132,12 @@ impl Engine for SglangBackend {
         &self,
         request: vllm_llm::GenerateRequest,
     ) -> Result<TokenStream, EngineError> {
-        if let Some(field) = find_rejected_field(&request.sampling_params) {
-            tracing::warn!(field, "rejecting sampling field SGLang cannot honor");
-            return Err(EngineError::InvalidRequest);
-        }
+        let body = SglangRequest::try_from(&request).map_err(|field| {
+            tracing::warn!(field, "rejecting field SGLang cannot honor");
+            EngineError::InvalidRequest
+        })?;
         let request_id = request.request_id.clone();
         let prompt_token_ids = request.prompt_token_ids.clone();
-        let sampling = to_sglang_sampling(&request.sampling_params);
-        let (return_logprob, top_logprobs_num) = to_sglang_logprobs(&request.sampling_params);
-        let body = GenerateRequest {
-            input_ids: prompt_token_ids.clone(),
-            sampling_params: sampling,
-            stream: true,
-            return_logprob,
-            top_logprobs_num,
-        };
 
         let response = self
             .client
@@ -351,72 +206,6 @@ impl Drop for RunningGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_sse_chunk_strips_data_prefix() {
-        let chunk = parse_sse_chunk(
-            br#"data: {"text":", I","output_ids":[11,358],"meta_info":{"finish_reason":null}}"#,
-        )
-        .expect("valid SSE payload")
-        .expect("some chunk");
-        assert_eq!(chunk.output_ids, vec![11, 358]);
-        assert!(chunk.meta_info.is_some());
-    }
-
-    #[test]
-    fn parse_sse_chunk_skips_framing_lines() {
-        assert!(parse_sse_chunk(b"").unwrap().is_none());
-        assert!(parse_sse_chunk(b" ").unwrap().is_none());
-        assert!(parse_sse_chunk(b": ping").unwrap().is_none());
-        assert!(parse_sse_chunk(b"[DONE]").unwrap().is_none());
-    }
-
-    #[test]
-    fn parse_sse_chunk_rejects_malformed_payload() {
-        assert!(parse_sse_chunk(b"data: {not-json").is_err());
-    }
-
-    #[test]
-    fn parse_sse_chunk_reads_logprobs_meta() {
-        let chunk = parse_sse_chunk(
-            br#"data: {"output_ids":[11,12],"meta_info":{"output_token_logprobs":[[-0.5,11,null],[-0.2,12,"a"]],"output_top_logprobs":[[[-0.5,11,null],[-0.9,99,null]],[[-0.2,12,null]]],"finish_reason":null}}"#,
-        )
-        .expect("valid SSE payload")
-        .expect("some chunk");
-        let meta = chunk.meta_info.expect("meta present");
-        assert_eq!(meta.output_token_logprobs.len(), 2);
-        assert_eq!(meta.output_token_logprobs[1], (-0.2, 12, Some("a".into())));
-        assert_eq!(meta.output_top_logprobs[0].len(), 2);
-        assert_eq!(meta.output_top_logprobs[1].len(), 1);
-    }
-
-    #[test]
-    fn chunk_logprobs_windows_to_the_token_delta() {
-        let best = vec![(-0.5, 11, None), (-0.2, 12, None), (-0.1, 13, None)];
-        let top = vec![
-            vec![(-0.5, 11, None)],
-            // Repeats the chosen token (12); it must be deduped.
-            vec![(-0.2, 12, None), (-0.4, 99, None)],
-            vec![],
-        ];
-        // The stream had already emitted position 0; the window covers 1..3.
-        let logprobs = chunk_logprobs(&best, &top, 1, 3).expect("window");
-        assert_eq!(logprobs.positions.len(), 2);
-        let second = &logprobs.positions[0];
-        assert_eq!(second.entries.len(), 2);
-        assert_eq!(second.entries[0].token_id, 12);
-        assert_eq!(second.entries[0].rank, 1);
-        assert_eq!(second.entries[1].token_id, 99);
-        assert_eq!(second.entries[1].rank, 2);
-        assert_eq!(logprobs.positions[1].entries.len(), 1);
-    }
-
-    #[test]
-    fn chunk_logprobs_none_when_not_requested() {
-        // sglang sends empty arrays when logprobs were not requested.
-        assert_eq!(chunk_logprobs(&[], &[], 0, 2), None);
-        assert_eq!(chunk_logprobs(&[(-0.5, 11, None)], &[], 1, 2), None);
-    }
 
     #[tokio::test]
     async fn stream_attaches_logprobs_to_the_delta_output() {
@@ -561,29 +350,5 @@ mod tests {
                 Ok(_) => panic!("expected InvalidRequest, got an output stream"),
             }
         }
-    }
-
-    #[test]
-    fn parses_object_finish_reason() {
-        assert_eq!(
-            parse_sglang_finish_reason(
-                &serde_json::json!({"type":"stop","stop_reason":"<|im_end|>"})
-            ),
-            FinishReason::Stop(None)
-        );
-        assert_eq!(
-            parse_sglang_finish_reason(&serde_json::json!({"type":"length","length":5})),
-            FinishReason::Length
-        );
-        assert_eq!(
-            parse_sglang_finish_reason(
-                &serde_json::json!({"type":"abort","abort_reason":"killed"})
-            ),
-            FinishReason::Abort
-        );
-        assert_eq!(
-            parse_sglang_finish_reason(&serde_json::json!({})),
-            FinishReason::Error
-        );
     }
 }
