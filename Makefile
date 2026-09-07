@@ -44,11 +44,18 @@ vllm-source:
 			../../patches/vllm-chat-request-processor.patch; \
 	fi
 	@if git -C data-plane/third_party/vllm apply --reverse --check \
-		../../patches/vllm-llm-serde.patch >/dev/null 2>&1; then \
+		../../patches/vllm-llm.patch >/dev/null 2>&1; then \
 		:; \
 	else \
 		git -C data-plane/third_party/vllm apply \
-			../../patches/vllm-llm-serde.patch; \
+			../../patches/vllm-llm.patch; \
+	fi
+	@if git -C data-plane/third_party/vllm apply --reverse --check \
+		../../patches/vllm-text.patch >/dev/null 2>&1; then \
+		:; \
+	else \
+		git -C data-plane/third_party/vllm apply \
+			../../patches/vllm-text.patch; \
 	fi
 
 build-data-plane: vllm-source

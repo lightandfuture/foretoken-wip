@@ -28,6 +28,7 @@ fn generate_request() -> GenerateRequest {
         session_id: None,
         reasoning_parser_kwargs: None,
         lora_request: None,
+        extensions: Default::default(),
     }
 }
 

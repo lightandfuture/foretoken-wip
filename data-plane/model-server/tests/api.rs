@@ -254,6 +254,7 @@ async fn generate_accepts_msgpack_multimodal_tensors() {
         reasoning_parser_kwargs: None,
         lora_request: None,
         sampling_params: Default::default(),
+        extensions: Default::default(),
     })
     .unwrap();
 
