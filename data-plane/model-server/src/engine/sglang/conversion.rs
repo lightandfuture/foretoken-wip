@@ -9,8 +9,9 @@
 //! [`SglangChunk`]s into per-step output fields. Sampling params SGLang
 //! cannot honor are rejected before they leave this module.
 
-use serde::Deserialize;
+use std::collections::BTreeMap;
 
+use serde::Deserialize;
 use vllm_engine_core_client::protocol::logprobs::{Logprobs, PositionLogprobs, TokenLogprob};
 use vllm_engine_core_client::protocol::sampling::EngineCoreSamplingParams;
 use vllm_llm::{FinishReason, GenerateRequest};
@@ -26,6 +27,10 @@ pub(super) struct SglangRequest {
     return_logprob: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_logprobs_num: Option<u32>,
+    /// Backend-native fields merged into the `/generate` body as top-level
+    /// keys (e.g. `stop_regex`, `custom_params`).
+    #[serde(flatten)]
+    extensions: BTreeMap<String, serde_json::Value>,
 }
 
 impl TryFrom<&GenerateRequest> for SglangRequest {
@@ -35,6 +40,9 @@ impl TryFrom<&GenerateRequest> for SglangRequest {
         if let Some(field) = find_rejected_field(&request.sampling_params) {
             return Err(field);
         }
+        if let Some(field) = find_reserved_extension_key(&request.extensions) {
+            return Err(field);
+        }
         let (return_logprob, top_logprobs_num) = to_sglang_logprobs(&request.sampling_params);
         Ok(SglangRequest {
             input_ids: request.prompt_token_ids.clone(),
@@ -42,6 +50,7 @@ impl TryFrom<&GenerateRequest> for SglangRequest {
             stream: true,
             return_logprob,
             top_logprobs_num,
+            extensions: request.extensions.clone(),
         })
     }
 }
@@ -289,6 +298,27 @@ fn find_rejected_field(params: &EngineCoreSamplingParams) -> Option<&'static str
         return Some("logprobs");
     }
     None
+}
+
+/// SglangRequest's own top-level fields. An extension key matching one of
+/// these would be flattened over the mapped field, silently replacing it, so
+/// such keys are rejected rather than let passthrough corrupt the body.
+const RESERVED_EXTENSION_KEYS: [&str; 5] = [
+    "input_ids",
+    "sampling_params",
+    "stream",
+    "return_logprob",
+    "top_logprobs_num",
+];
+
+/// Name of the first extension key that collides with a mapped field.
+fn find_reserved_extension_key(
+    extensions: &BTreeMap<String, serde_json::Value>,
+) -> Option<&'static str> {
+    RESERVED_EXTENSION_KEYS
+        .iter()
+        .copied()
+        .find(|key| extensions.contains_key(*key))
 }
 
 /// SGLang request-level logprob knobs for a vLLM sampling request.
@@ -640,6 +670,39 @@ mod tests {
             body.sampling_params["temperature"].as_f64().unwrap() as f32,
             0.7
         );
+    }
+
+    #[test]
+    fn sglang_request_merges_extensions_into_the_body() {
+        let request = GenerateRequest {
+            prompt_token_ids: vec![7],
+            extensions: std::collections::BTreeMap::from([
+                ("stop_regex".to_string(), serde_json::json!("\\n")),
+                ("custom_params".to_string(), serde_json::json!({"k": 1})),
+            ]),
+            ..Default::default()
+        };
+        let body = SglangRequest::try_from(&request).expect("valid request");
+        let json = serde_json::to_value(&body).expect("serializes");
+        assert_eq!(json["stop_regex"], serde_json::json!("\\n"));
+        assert_eq!(json["custom_params"], serde_json::json!({"k": 1}));
+        assert_eq!(json["input_ids"], serde_json::json!([7]));
+    }
+
+    #[test]
+    fn sglang_request_rejects_reserved_extension_keys() {
+        let request = GenerateRequest {
+            prompt_token_ids: vec![7],
+            extensions: std::collections::BTreeMap::from([(
+                "input_ids".to_string(),
+                serde_json::json!([1, 2]),
+            )]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            SglangRequest::try_from(&request),
+            Err("input_ids")
+        ));
     }
 
     #[test]

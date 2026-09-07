@@ -133,7 +133,7 @@ impl Engine for SglangBackend {
         request: vllm_llm::GenerateRequest,
     ) -> Result<TokenStream, EngineError> {
         let body = SglangRequest::try_from(&request).map_err(|field| {
-            tracing::warn!(field, "rejecting field SGLang cannot honor");
+            tracing::warn!(field, "rejecting field");
             EngineError::InvalidRequest
         })?;
         let request_id = request.request_id.clone();
