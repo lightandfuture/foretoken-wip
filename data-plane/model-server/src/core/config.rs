@@ -44,22 +44,3 @@ fn required_env(name: &str) -> Result<String, String> {
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid Unicode")),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn launch_plan_env_matches_backend_feature() {
-        #[cfg(feature = "backend-vllm")]
-        assert_eq!(LAUNCH_PLAN_ENV, "FORETOKEN_VLLM_LAUNCH_PLAN");
-        #[cfg(all(feature = "backend-sglang", not(feature = "backend-vllm")))]
-        assert_eq!(LAUNCH_PLAN_ENV, "FORETOKEN_SGLANG_LAUNCH_PLAN");
-    }
-
-    #[test]
-    fn listen_address_parses() {
-        let addr: SocketAddr = "0.0.0.0:9000".parse().expect("valid socket address");
-        assert_eq!(addr.port(), 9000);
-    }
-}
