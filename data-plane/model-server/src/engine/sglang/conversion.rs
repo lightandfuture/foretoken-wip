@@ -240,6 +240,8 @@ fn to_sglang_sampling(params: &EngineCoreSamplingParams) -> serde_json::Value {
                 .collect(),
         );
     }
+    // `thinking_token_budget` is intentionally unmapped: SGLang's
+    // `max_thinking_tokens` (strict-thinking only) is not equivalent.
     json
 }
 

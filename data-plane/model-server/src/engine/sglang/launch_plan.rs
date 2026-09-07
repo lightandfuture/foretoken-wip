@@ -11,6 +11,8 @@ use std::collections::HashSet;
 
 use serde::Deserialize;
 
+use crate::runtime_transport::LOOPBACK_HOST;
+
 fn default_tp() -> usize {
     1
 }
@@ -110,7 +112,7 @@ impl SglangLaunchPlan {
             "-m".to_string(),
             "sglang.launch_server".to_string(),
             format!("--model-path={}", self.model),
-            "--host=127.0.0.1".to_string(),
+            format!("--host={LOOPBACK_HOST}"),
             format!("--port={}", self.port),
             format!("--tp-size={}", self.tp),
             format!("--dp-size={}", self.dp),
@@ -128,6 +130,9 @@ impl SglangLaunchPlan {
 
 /// Restricts `extraArgs` to a known allowlist of value/boolean flags.
 fn validate_extra_args(args: &[String]) -> Result<(), String> {
+    // Keep in sync with control-plane/internal/sglang/config.go
+    // (`sglangValueArgs`/`sglangBoolArgs`): the control-plane validates the
+    // same allowlist before deploying.
     const VALUE_FLAGS: &[&str] = &[
         "--max-total-tokens",
         "--context-length",

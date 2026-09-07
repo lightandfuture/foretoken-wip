@@ -7,9 +7,10 @@
 //! `backend-sglang` cargo feature; this binary never selects an engine at
 //! runtime.
 
-use std::future::IntoFuture;
+use std::future::{Future, IntoFuture};
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use foretoken_model_protocol::{RuntimeMetadataResponse, RuntimeModelIdentity};
 use foretoken_model_server::core::api::{AppState, RuntimeHealth, router};
@@ -23,6 +24,8 @@ use foretoken_model_server::engine::sglang::{SglangBackend, SglangLaunchPlan, Sg
 use foretoken_model_server::engine::vllm::{
     LaunchPlanV1, VllmBackend, VllmProcess, conversion::to_neutral_model_dtype,
 };
+#[cfg(feature = "backend-sglang")]
+use foretoken_model_server::runtime_transport::LOOPBACK_HOST;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
@@ -66,6 +69,49 @@ fn init_tracing() {
 #[cfg(feature = "backend-sglang")]
 fn init_tracing() {
     tracing_subscriber::fmt::init();
+}
+
+/// Stops admission, drains the HTTP server, then tears down the backend and
+/// child process. `shutdown_process` receives the time left in the drain budget.
+async fn finish_shutdown<S, B, E1, P, E2>(
+    health: &RuntimeHealth,
+    shutdown: &Notify,
+    mut server: Pin<Box<S>>,
+    drain_timeout: Duration,
+    stop_is_server: bool,
+    cleanup: B,
+    shutdown_process: impl FnOnce(Duration) -> P,
+    cleanup_msg: &str,
+    process_msg: &str,
+) where
+    S: Future<Output = std::io::Result<()>>,
+    B: Future<Output = Result<(), E1>>,
+    E1: std::fmt::Display,
+    P: Future<Output = Result<(), E2>>,
+    E2: std::fmt::Display,
+{
+    health.set_accepting(false);
+    health.set_client_healthy(false);
+    shutdown.notify_waiters();
+    let deadline = Instant::now() + drain_timeout;
+    if !stop_is_server {
+        match tokio::time::timeout(drain_timeout, server.as_mut()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => error!(%error, "HTTP server failed while draining"),
+            Err(_) => {
+                warn!("HTTP handlers did not drain before deadline");
+                drop(server);
+            }
+        }
+    }
+    if let Err(error) = cleanup.await {
+        warn!(%error, "{}", cleanup_msg);
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if let Err(error) = shutdown_process(remaining).await {
+        warn!(%error, "{}", process_msg);
+    }
+    health.set_process_alive(false);
 }
 
 #[cfg(feature = "backend-vllm")]
@@ -186,29 +232,18 @@ async fn run_vllm(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Error
         }
     }
 
-    // Stop new admission before draining HTTP handlers, the client, and finally the child process.
-    health.set_accepting(false);
-    health.set_client_healthy(false);
-    shutdown.notify_waiters();
-    let deadline = Instant::now() + plan.drain_timeout();
-    if !matches!(&stop, Stop::Server(_)) {
-        match tokio::time::timeout(plan.drain_timeout(), server.as_mut()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => error!(%error, "HTTP server failed while draining"),
-            Err(_) => {
-                warn!("HTTP handlers did not drain before deadline");
-                drop(server);
-            }
-        }
-    }
-    if let Err(error) = backend.cleanup().await {
-        warn!(%error, "could not shut down EngineCore client cleanly");
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if let Err(error) = process.shutdown(remaining).await {
-        warn!(%error, "could not shut down managed EngineCore cleanly");
-    }
-    health.set_process_alive(false);
+    finish_shutdown(
+        &health,
+        &shutdown,
+        server,
+        plan.drain_timeout(),
+        matches!(&stop, Stop::Server(_)),
+        backend.cleanup(),
+        |remaining| process.shutdown(remaining),
+        "could not shut down EngineCore client cleanly",
+        "could not shut down managed EngineCore cleanly",
+    )
+    .await;
 
     match stop {
         Stop::Signal => Ok(()),
@@ -263,7 +298,7 @@ async fn run_sglang(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Err
     health.set_client_healthy(true);
     health.set_accepting(true);
     let backend = Arc::new(SglangBackend::new(format!(
-        "http://127.0.0.1:{}",
+        "http://{LOOPBACK_HOST}:{}",
         plan.port
     )));
 
@@ -310,28 +345,18 @@ async fn run_sglang(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Err
         Stop::ChildExited(reason) | Stop::Server(reason) => warn!(%reason),
     }
 
-    health.set_accepting(false);
-    health.set_client_healthy(false);
-    shutdown.notify_waiters();
-    let deadline = Instant::now() + plan.drain_timeout();
-    if !matches!(&stop, Stop::Server(_)) {
-        match tokio::time::timeout(plan.drain_timeout(), server.as_mut()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => error!(%error, "HTTP server failed while draining"),
-            Err(_) => {
-                warn!("HTTP handlers did not drain before deadline");
-                drop(server);
-            }
-        }
-    }
-    if let Err(error) = backend.cleanup().await {
-        warn!(%error, "could not shut down SGLang backend cleanly");
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if let Err(error) = process.shutdown(remaining).await {
-        warn!(%error, "could not shut down SGLang server cleanly");
-    }
-    health.set_process_alive(false);
+    finish_shutdown(
+        &health,
+        &shutdown,
+        server,
+        plan.drain_timeout(),
+        matches!(&stop, Stop::Server(_)),
+        backend.cleanup(),
+        |remaining| process.shutdown(remaining),
+        "could not shut down SGLang backend cleanly",
+        "could not shut down SGLang server cleanly",
+    )
+    .await;
 
     match stop {
         Stop::Signal => Ok(()),
@@ -349,7 +374,7 @@ async fn wait_for_sglang_health(
     budget_seconds: u64,
 ) -> Result<(), String> {
     let client = reqwest::Client::new();
-    let url = format!("http://127.0.0.1:{}/health", plan.port);
+    let url = format!("http://{LOOPBACK_HOST}:{}/health", plan.port);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(budget_seconds);
     loop {
         match client.get(&url).send().await {
@@ -368,7 +393,7 @@ async fn wait_for_sglang_health(
 /// length.
 #[cfg(feature = "backend-sglang")]
 async fn sglang_context_len(port: u16) -> Result<i64, String> {
-    let url = format!("http://127.0.0.1:{port}/get_server_info");
+    let url = format!("http://{LOOPBACK_HOST}:{port}/get_server_info");
     let info: serde_json::Value = reqwest::Client::new()
         .get(&url)
         .send()
