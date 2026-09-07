@@ -28,7 +28,7 @@ pub(super) struct SglangRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_logprobs_num: Option<u32>,
     /// Backend-native fields merged into the `/generate` body as top-level
-    /// keys (e.g. `stop_regex`, `custom_params`).
+    /// keys (e.g. `custom_params`, `session_params`).
     #[serde(flatten)]
     extensions: BTreeMap<String, serde_json::Value>,
 }
@@ -677,14 +677,17 @@ mod tests {
         let request = GenerateRequest {
             prompt_token_ids: vec![7],
             extensions: std::collections::BTreeMap::from([
-                ("stop_regex".to_string(), serde_json::json!("\\n")),
+                (
+                    "session_params".to_string(),
+                    serde_json::json!({"id": "s1"}),
+                ),
                 ("custom_params".to_string(), serde_json::json!({"k": 1})),
             ]),
             ..Default::default()
         };
         let body = SglangRequest::try_from(&request).expect("valid request");
         let json = serde_json::to_value(&body).expect("serializes");
-        assert_eq!(json["stop_regex"], serde_json::json!("\\n"));
+        assert_eq!(json["session_params"], serde_json::json!({"id": "s1"}));
         assert_eq!(json["custom_params"], serde_json::json!({"k": 1}));
         assert_eq!(json["input_ids"], serde_json::json!([7]));
     }
