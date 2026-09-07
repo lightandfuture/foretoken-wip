@@ -13,9 +13,7 @@ use foretoken_model_protocol::{
     RuntimeModelIdentity,
 };
 use foretoken_model_server::core::api::{AppState, RuntimeHealth, router};
-use foretoken_model_server::engine::{
-    Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream,
-};
+use foretoken_model_server::engine::{Engine, EngineError, EngineTelemetry, TokenStream};
 use futures::stream;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -75,10 +73,6 @@ impl Engine for RecordingBackend {
 
     fn telemetry(&self) -> EngineTelemetry {
         self.telemetry.clone()
-    }
-
-    fn capabilities(&self) -> EngineCapabilities {
-        Default::default()
     }
 
     async fn cleanup(&self) -> Result<(), EngineError> {
@@ -150,10 +144,6 @@ impl Engine for PendingStreamBackend {
         }
     }
 
-    fn capabilities(&self) -> EngineCapabilities {
-        Default::default()
-    }
-
     async fn cleanup(&self) -> Result<(), EngineError> {
         Ok(())
     }
@@ -172,10 +162,6 @@ impl Engine for FailingStreamBackend {
     }
 
     fn telemetry(&self) -> EngineTelemetry {
-        Default::default()
-    }
-
-    fn capabilities(&self) -> EngineCapabilities {
         Default::default()
     }
 

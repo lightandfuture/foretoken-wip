@@ -13,80 +13,51 @@ use vllm_llm::{FinishReason, GenerateRequest, Llm};
 use vllm_metrics::EngineLabels;
 
 use super::telemetry::{BoundaryLatencyMetrics, read_vllm_metrics};
-use crate::engine::{Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream};
+use crate::engine::{Engine, EngineError, EngineTelemetry, TokenStream};
 
-/// vLLM adapter failures. Classified without retaining vLLM's diagnostic text,
-/// then translated into the engine-neutral [`EngineError`] at the trait
-/// boundary.
-#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
-pub enum VllmError {
-    #[error("request was rejected")]
-    Rejected,
-    #[error("request is invalid")]
-    InvalidRequest,
-    #[error("vLLM is unavailable")]
-    Unavailable,
-    #[error("vLLM protocol failed")]
-    Protocol,
-    #[error("vLLM request failed")]
-    RequestFailed,
-}
-
-impl VllmError {
-    fn from_llm(error: vllm_llm::Error) -> Self {
-        match error {
-            vllm_llm::Error::EmptyPromptTokenIds { .. } => Self::InvalidRequest,
-            vllm_llm::Error::EngineCoreClient(error) => Self::from_engine_client(error),
-        }
-    }
-
-    fn from_engine_client(error: vllm_engine_core_client::Error) -> Self {
-        use vllm_engine_core_client::Error;
-
-        match error {
-            Error::EngineCoreDead
-            | Error::ClientClosed { .. }
-            | Error::ControlClosed { .. }
-            | Error::DispatcherClosed { .. }
-            | Error::HandshakeTimeout { .. }
-            | Error::InputRegistrationTimeout { .. }
-            | Error::Io(_)
-            | Error::RequestStreamClosed { .. }
-            | Error::Transport(_)
-            | Error::ZmqRuntimeTask(_) => Self::Unavailable,
-            Error::Encode { .. }
-            | Error::Decode { .. }
-            | Error::ExtValueDecode { .. }
-            | Error::UnexpectedCoordinatorOutput { .. }
-            | Error::UnexpectedDispatcherOutput { .. }
-            | Error::UnexpectedHandshakeIdentity { .. }
-            | Error::UnexpectedHandshakeMessage { .. }
-            | Error::UnsupportedAuxFrames { .. }
-            | Error::UnsupportedCoordinatorEngineId { .. }
-            | Error::UnsupportedExternalCoordinator
-            | Error::UnsupportedField { .. }
-            | Error::ValueDecode(_) => Self::Protocol,
-            Error::DuplicateRequestId { .. }
-            | Error::InvalidDataParallelRank { .. }
-            | Error::InvalidStructuredOutputsParams { .. } => Self::Rejected,
-            Error::UtilityCallClosed { .. }
-            | Error::UtilityCallFailed { .. }
-            | Error::UtilityResultDecode { .. }
-            | Error::InconsistentUtilityResults { .. }
-            | Error::Shared(_) => Self::RequestFailed,
-        }
+/// Classifies a vLLM error into the engine-neutral [`EngineError`].
+fn classify_llm_error(error: vllm_llm::Error) -> EngineError {
+    match error {
+        vllm_llm::Error::EmptyPromptTokenIds { .. } => EngineError::InvalidRequest,
+        vllm_llm::Error::EngineCoreClient(error) => classify_engine_client_error(error),
     }
 }
 
-impl From<VllmError> for EngineError {
-    fn from(error: VllmError) -> Self {
-        match error {
-            VllmError::Rejected => EngineError::Rejected,
-            VllmError::InvalidRequest => EngineError::InvalidRequest,
-            VllmError::Unavailable => EngineError::Unavailable,
-            VllmError::Protocol => EngineError::Protocol,
-            VllmError::RequestFailed => EngineError::RequestFailed,
-        }
+/// Classifies an EngineCore client error into the engine-neutral [`EngineError`].
+fn classify_engine_client_error(error: vllm_engine_core_client::Error) -> EngineError {
+    use vllm_engine_core_client::Error;
+
+    match error {
+        Error::EngineCoreDead
+        | Error::ClientClosed { .. }
+        | Error::ControlClosed { .. }
+        | Error::DispatcherClosed { .. }
+        | Error::HandshakeTimeout { .. }
+        | Error::InputRegistrationTimeout { .. }
+        | Error::Io(_)
+        | Error::RequestStreamClosed { .. }
+        | Error::Transport(_)
+        | Error::ZmqRuntimeTask(_) => EngineError::Unavailable,
+        Error::Encode { .. }
+        | Error::Decode { .. }
+        | Error::ExtValueDecode { .. }
+        | Error::UnexpectedCoordinatorOutput { .. }
+        | Error::UnexpectedDispatcherOutput { .. }
+        | Error::UnexpectedHandshakeIdentity { .. }
+        | Error::UnexpectedHandshakeMessage { .. }
+        | Error::UnsupportedAuxFrames { .. }
+        | Error::UnsupportedCoordinatorEngineId { .. }
+        | Error::UnsupportedExternalCoordinator
+        | Error::UnsupportedField { .. }
+        | Error::ValueDecode(_) => EngineError::Protocol,
+        Error::DuplicateRequestId { .. }
+        | Error::InvalidDataParallelRank { .. }
+        | Error::InvalidStructuredOutputsParams { .. } => EngineError::Rejected,
+        Error::UtilityCallClosed { .. }
+        | Error::UtilityCallFailed { .. }
+        | Error::UtilityResultDecode { .. }
+        | Error::InconsistentUtilityResults { .. }
+        | Error::Shared(_) => EngineError::RequestFailed,
     }
 }
 
@@ -224,7 +195,7 @@ where
                 }
                 Err(error) => {
                     inflight.release();
-                    (Err(VllmError::from_llm(error).into()), true)
+                    (Err(classify_llm_error(error)), true)
                 }
             };
             match sender.try_send(event) {
@@ -257,11 +228,7 @@ impl Engine for VllmBackend {
         let guard = self.llm.read().await;
         let llm = guard.as_ref().ok_or(EngineError::Unavailable)?;
         let request_id = request.request_id.clone();
-        let stream = llm
-            .generate(request)
-            .await
-            .map_err(VllmError::from_llm)
-            .map_err(EngineError::from)?;
+        let stream = llm.generate(request).await.map_err(classify_llm_error)?;
         Ok(tracked_stream(
             stream,
             request_id,
@@ -274,10 +241,7 @@ impl Engine for VllmBackend {
     async fn abort(&self, request_ids: &[String]) -> Result<(), EngineError> {
         let guard = self.llm.read().await;
         let llm = guard.as_ref().ok_or(EngineError::Unavailable)?;
-        llm.abort(request_ids)
-            .await
-            .map_err(VllmError::from_llm)
-            .map_err(EngineError::from)
+        llm.abort(request_ids).await.map_err(classify_llm_error)
     }
 
     fn telemetry(&self) -> EngineTelemetry {
@@ -302,19 +266,12 @@ impl Engine for VllmBackend {
         }
     }
 
-    fn capabilities(&self) -> EngineCapabilities {
-        EngineCapabilities::default()
-    }
-
     async fn cleanup(&self) -> Result<(), EngineError> {
         // `take` makes cleanup idempotent and null-safe against a partially
         // initialized backend.
         let Some(llm) = self.llm.write().await.take() else {
             return Ok(());
         };
-        llm.shutdown()
-            .await
-            .map_err(VllmError::from_llm)
-            .map_err(EngineError::from)
+        llm.shutdown().await.map_err(classify_llm_error)
     }
 }

@@ -49,27 +49,6 @@ impl EngineError {
     }
 }
 
-/// Capabilities an engine advertises. Every field is optional or a fallible
-/// boolean: routing degrades to neutral scoring for capabilities an engine
-/// does not advertise.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct EngineCapabilities {
-    /// Maximum context length served by this engine, when known.
-    pub context_length: Option<u32>,
-    /// Block-structured KV cache block size, when the engine exposes one.
-    pub kv_cache_block_size: Option<u32>,
-    /// Total KV blocks available, when the engine exposes them.
-    pub total_kv_blocks: Option<u64>,
-    /// Maximum number of concurrent sequences, when known.
-    pub max_num_seqs: Option<u32>,
-    /// Whether the engine can publish KV lifecycle events for prefix scoring.
-    pub kv_event_sources: bool,
-    /// Whether the engine supports disaggregated prefill/decode.
-    pub supports_pd: bool,
-    /// Whether the engine supports disaggregated encoder serving.
-    pub supports_ec: bool,
-}
-
 /// Cumulative engine observations included in a telemetry snapshot.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EngineTelemetry {
@@ -91,13 +70,6 @@ pub trait Engine: Send + Sync {
     async fn generate(&self, request: GenerateRequest) -> Result<TokenStream, EngineError>;
     async fn abort(&self, request_ids: &[String]) -> Result<(), EngineError>;
     fn telemetry(&self) -> EngineTelemetry;
-    fn capabilities(&self) -> EngineCapabilities;
-    /// Drains accepted in-flight work before transport teardown. Engines with no
-    /// extra drain step (beyond the core's admission close) keep the no-op
-    /// default.
-    async fn drain(&self) -> Result<(), EngineError> {
-        Ok(())
-    }
     /// Releases engine resources. Must be idempotent and null-safe: repeated
     /// calls, and calls after a partially completed startup, return without
     /// error.

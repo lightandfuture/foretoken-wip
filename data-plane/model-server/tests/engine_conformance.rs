@@ -13,9 +13,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use foretoken_model_server::engine::{
-    Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream,
-};
+use foretoken_model_server::engine::{Engine, EngineError, EngineTelemetry, TokenStream};
 use futures::{StreamExt, stream};
 use vllm_llm::{FinishReason, GenerateOutput, GenerateRequest};
 
@@ -58,10 +56,6 @@ impl Engine for ScriptedEngine {
     }
 
     fn telemetry(&self) -> EngineTelemetry {
-        Default::default()
-    }
-
-    fn capabilities(&self) -> EngineCapabilities {
         Default::default()
     }
 
@@ -176,27 +170,6 @@ async fn cleanup_is_idempotent() {
     engine.cleanup().await.expect("first cleanup succeeds");
     engine.cleanup().await.expect("second cleanup succeeds");
     assert_eq!(engine.cleanup_count(), 2);
-}
-
-/// The default `drain` implementation is a successful no-op.
-#[tokio::test]
-async fn drain_defaults_to_noop() {
-    let engine = ScriptedEngine::new(vec![]);
-    engine.drain().await.expect("default drain succeeds");
-}
-
-/// Default capabilities advertise nothing, so routing degrades to neutral
-/// scoring.
-#[test]
-fn default_capabilities_advertise_nothing() {
-    let capabilities = EngineCapabilities::default();
-    assert_eq!(capabilities.context_length, None);
-    assert_eq!(capabilities.kv_cache_block_size, None);
-    assert_eq!(capabilities.total_kv_blocks, None);
-    assert_eq!(capabilities.max_num_seqs, None);
-    assert!(!capabilities.kv_event_sources);
-    assert!(!capabilities.supports_pd);
-    assert!(!capabilities.supports_ec);
 }
 
 /// `EngineError` maps to a wire-safe token error code.

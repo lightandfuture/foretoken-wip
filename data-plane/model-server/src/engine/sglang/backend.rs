@@ -9,34 +9,10 @@ use futures::{Stream, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::engine::{Engine, EngineCapabilities, EngineError, EngineTelemetry, TokenStream};
+use crate::engine::{Engine, EngineError, EngineTelemetry, TokenStream};
 use vllm_llm::{FinishReason, GenerateOutput, GeneratePromptInfo};
 
 use super::conversion::{SglangRequest, SglangResponseDecoder, parse_sse_chunk};
-
-/// SGLang adapter failures, translated into the engine-neutral [`EngineError`].
-#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
-pub enum SglangError {
-    #[error("request is invalid")]
-    InvalidRequest,
-    #[error("sglang is unavailable")]
-    Unavailable,
-    #[error("sglang protocol failed")]
-    Protocol,
-    #[error("sglang request failed")]
-    RequestFailed,
-}
-
-impl From<SglangError> for EngineError {
-    fn from(error: SglangError) -> Self {
-        match error {
-            SglangError::InvalidRequest => EngineError::InvalidRequest,
-            SglangError::Unavailable => EngineError::Unavailable,
-            SglangError::Protocol => EngineError::Protocol,
-            SglangError::RequestFailed => EngineError::RequestFailed,
-        }
-    }
-}
 
 /// HTTP-backed SGLang engine.
 pub struct SglangBackend {
@@ -78,7 +54,7 @@ impl SglangBackend {
                 let chunk = match chunk {
                     Ok(chunk) => chunk,
                     Err(_) => {
-                        yield Err(EngineError::from(SglangError::Protocol));
+                        yield Err(EngineError::Protocol);
                         return;
                     }
                 };
@@ -89,7 +65,7 @@ impl SglangBackend {
                         Ok(Some(chunk)) => chunk,
                         Ok(None) => continue,
                         Err(()) => {
-                            yield Err(EngineError::from(SglangError::Protocol));
+                            yield Err(EngineError::Protocol);
                             return;
                         }
                     };
@@ -119,7 +95,7 @@ impl SglangBackend {
                 }
             }
             if !pending.is_empty() {
-                yield Err(EngineError::from(SglangError::Protocol));
+                yield Err(EngineError::Protocol);
             }
         };
         Box::pin(stream)
@@ -147,18 +123,17 @@ impl Engine for SglangBackend {
             .await
             .map_err(|error| {
                 if error.is_connect() || error.is_timeout() {
-                    SglangError::Unavailable
+                    EngineError::Unavailable
                 } else {
-                    SglangError::RequestFailed
+                    EngineError::RequestFailed
                 }
             })?;
         if !response.status().is_success() {
             return Err(if response.status().is_server_error() {
-                SglangError::Unavailable
+                EngineError::Unavailable
             } else {
-                SglangError::InvalidRequest
-            }
-            .into());
+                EngineError::InvalidRequest
+            });
         }
 
         let running_requests = self.running_requests.clone();
@@ -171,8 +146,8 @@ impl Engine for SglangBackend {
     }
 
     async fn abort(&self, _request_ids: &[String]) -> Result<(), EngineError> {
-        // SGLang does not expose a stable per-request abort endpoint for the
-        // native `/generate` path; report success to keep the core contract.
+        // SGLang exposes POST /abort_request, but wiring it is deferred;
+        // report success to keep the core contract.
         Ok(())
     }
 
@@ -181,10 +156,6 @@ impl Engine for SglangBackend {
             running_requests: self.running_requests.load(Ordering::Acquire),
             ..Default::default()
         }
-    }
-
-    fn capabilities(&self) -> EngineCapabilities {
-        EngineCapabilities::default()
     }
 
     async fn cleanup(&self) -> Result<(), EngineError> {

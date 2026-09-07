@@ -139,12 +139,8 @@ async fn generate_reports_backend_error_on_non_success() {
 }
 
 #[tokio::test]
-async fn default_capabilities_and_cleanup() {
+async fn cleanup_succeeds() {
     let backend = SglangBackend::new("http://127.0.0.1:1".to_owned());
-    let capabilities = backend.capabilities();
-    assert!(!capabilities.kv_event_sources);
-    assert!(!capabilities.supports_pd);
-    assert!(!capabilities.supports_ec);
     assert!(backend.cleanup().await.is_ok());
 }
 
