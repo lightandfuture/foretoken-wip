@@ -21,7 +21,7 @@ SGLANG_PIN="sglang v0.5.18 (lmsysorg/sglang:v0.5.18)"
 #
 # Depends on: curl. See data-plane/retesting.md for the deployment flow.
 
-set -uo pipefail
+set -euo pipefail
 
 FRONTEND_URL="${FRONTEND_URL:?set FRONTEND_URL to the deployed frontend (see data-plane/retesting.md)}"
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
