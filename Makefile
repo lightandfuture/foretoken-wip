@@ -36,27 +36,12 @@ SGLANG_ENGINE_IMAGE ?=
 vllm-source:
 	@test -f data-plane/third_party/vllm/rust/Cargo.toml || \
 		git submodule update --init data-plane/third_party/vllm
-	@if git -C data-plane/third_party/vllm apply --reverse --check \
-		../../patches/vllm-chat-request-processor.patch >/dev/null 2>&1; then \
-		:; \
-	else \
+	@for patch in vllm-chat-request-processor vllm-llm vllm-text; do \
+		git -C data-plane/third_party/vllm apply --reverse --check \
+			../../patches/$$patch.patch >/dev/null 2>&1 || \
 		git -C data-plane/third_party/vllm apply \
-			../../patches/vllm-chat-request-processor.patch; \
-	fi
-	@if git -C data-plane/third_party/vllm apply --reverse --check \
-		../../patches/vllm-llm.patch >/dev/null 2>&1; then \
-		:; \
-	else \
-		git -C data-plane/third_party/vllm apply \
-			../../patches/vllm-llm.patch; \
-	fi
-	@if git -C data-plane/third_party/vllm apply --reverse --check \
-		../../patches/vllm-text.patch >/dev/null 2>&1; then \
-		:; \
-	else \
-		git -C data-plane/third_party/vllm apply \
-			../../patches/vllm-text.patch; \
-	fi
+			../../patches/$$patch.patch || exit 1; \
+	done
 
 build-data-plane: vllm-source
 	cargo build --manifest-path data-plane/Cargo.toml --workspace --locked
