@@ -3,7 +3,7 @@
 
 //! Defines OpenAI-compatible request data transfer objects (DTOs) and HTTP handlers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -428,6 +428,9 @@ struct CompletionRequest {
     session_id: Option<String>,
     #[serde(default)]
     stop: Option<Stop>,
+    /// OpenAI `extra_body`: backend-native fields forwarded verbatim.
+    #[serde(default)]
+    extra_body: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -517,6 +520,9 @@ struct ChatCompletionRequest {
     reasoning_effort: Option<ReasoningEffort>,
     #[serde(default)]
     include_reasoning: Option<bool>,
+    /// OpenAI `extra_body`: backend-native fields forwarded verbatim.
+    #[serde(default)]
+    extra_body: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -789,6 +795,7 @@ async fn completions(
                     arrival_time: Some(vllm_llm::current_unix_timestamp_secs()),
                     tool_call_parser: ParserSelection::None,
                     reasoning_parser: ParserSelection::None,
+                    extensions: request.extra_body.clone(),
                 })
                 .await
             {
@@ -970,6 +977,7 @@ async fn chat_with_request(
                 } else {
                     ParserSelection::None
                 },
+                extensions: request.extra_body,
             },
             chat,
             include_reasoning,
@@ -1159,7 +1167,7 @@ fn openai_message(message: &OpenAiMessage) -> Result<ChatMessage, GenerationErro
 
 #[cfg(test)]
 mod tests {
-    use super::{GenerationError, openai_error};
+    use super::{ChatCompletionRequest, GenerationError, openai_error};
     use axum::http::StatusCode;
 
     #[test]
@@ -1169,5 +1177,33 @@ mod tests {
         // not a 502.
         let response = openai_error(GenerationError::BackendRejected);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn extra_body_parses_and_unknown_fields_still_reject() {
+        // `extra_body` is a known field, so it parses into the map instead of
+        // tripping deny_unknown_fields.
+        let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "qwen3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "extra_body": {"stop_regex": "END", "custom_params": {"k": 1}},
+        }))
+        .expect("extra_body is a known field");
+        assert_eq!(
+            request.extra_body.get("stop_regex"),
+            Some(&serde_json::json!("END"))
+        );
+        assert_eq!(
+            request.extra_body.get("custom_params"),
+            Some(&serde_json::json!({"k": 1}))
+        );
+
+        // A genuinely unknown top-level field must still be rejected.
+        let unknown = serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+            "model": "qwen3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "bogus": 1,
+        }));
+        assert!(unknown.is_err());
     }
 }
