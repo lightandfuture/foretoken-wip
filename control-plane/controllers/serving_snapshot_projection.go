@@ -300,7 +300,6 @@ func (reconciler *FrontendServiceReconciler) projectableRouting(ctx context.Cont
 					continue
 				}
 				groups = append(groups, routingGroupForService(service, pool, group))
-				groups = append(groups, routingGroupForService(service, pool, group))
 			}
 		}
 	}
@@ -396,11 +395,9 @@ func projectServicePDComponents(service *inferencev1alpha1.ModelService, pools [
 	pipelineScope := servingSnapshotPDPipelineScope{PipelineScopeID: pipelineScopeID}
 	for _, group := range prefills {
 		components = append(components, routingPDComponent(service, group, routingPoolName(pools, group), pipelineScopeID))
-		components = append(components, routingPDComponent(service, group, routingPoolName(pools, group), pipelineScopeID))
 		pipelineScope.PrefillRouteTargetIDs = append(pipelineScope.PrefillRouteTargetIDs, string(group.UID))
 	}
 	for _, group := range decodes {
-		components = append(components, routingPDComponent(service, group, routingPoolName(pools, group), pipelineScopeID))
 		components = append(components, routingPDComponent(service, group, routingPoolName(pools, group), pipelineScopeID))
 		pipelineScope.DecodeRouteTargetIDs = append(pipelineScope.DecodeRouteTargetIDs, string(group.UID))
 	}
