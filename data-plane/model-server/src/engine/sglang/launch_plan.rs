@@ -87,7 +87,7 @@ impl SglangLaunchPlan {
         {
             return Err("launch plan memFraction must be within 0.0 and 1.0".into());
         }
-        validate_extra_args(&self.extra_args)
+        validate_extra_args_shape(&self.extra_args)
     }
 
     /// Startup budget as a [`Duration`].
@@ -124,17 +124,8 @@ impl SglangLaunchPlan {
     }
 }
 
-/// Validates the supported `extraArgs` flags.
-fn validate_extra_args(args: &[String]) -> Result<(), String> {
-    // Keep this allowlist synchronized with the control plane.
-    const VALUE_FLAGS: &[&str] = &[
-        "--max-total-tokens",
-        "--context-length",
-        "--chunked-prefill-size",
-        "--schedule-policy",
-        "--attention-backend",
-    ];
-    const BOOL_FLAGS: &[&str] = &["--disable-radix-cache", "--enable-torch-compile"];
+/// Validates the shape of the controller-owned `extraArgs` payload.
+fn validate_extra_args_shape(args: &[String]) -> Result<(), String> {
     let mut seen = HashSet::new();
     for argument in args {
         if argument.is_empty()
@@ -144,24 +135,13 @@ fn validate_extra_args(args: &[String]) -> Result<(), String> {
         {
             return Err("extraArgs must be one nonempty --long-name token".into());
         }
-        let (name, value) = argument
+        let name = argument
             .split_once('=')
-            .map_or((argument.as_str(), None), |(name, value)| {
-                (name, Some(value))
-            });
-        if argument.matches('=').count() > 1 || name.contains('_') || !seen.insert(name) {
-            return Err(format!("extraArgs flag {name:?} is not allowed"));
-        }
-        if VALUE_FLAGS.contains(&name) {
-            if value.is_none_or(str::is_empty) {
-                return Err(format!("extraArgs flag {name:?} requires a value"));
-            }
-        } else if BOOL_FLAGS.contains(&name) {
-            if value.is_some() {
-                return Err(format!("extraArgs flag {name:?} does not take a value"));
-            }
-        } else {
-            return Err(format!("extraArgs flag {name:?} is not allowed"));
+            .map_or(argument.as_str(), |(name, _)| name);
+        if argument.matches('=').count() > 1 || !seen.insert(name) {
+            return Err(format!(
+                "extraArgs flag {argument:?} is duplicated or malformed"
+            ));
         }
     }
     Ok(())
