@@ -7,6 +7,7 @@
     "controller",
     "workload",
     "frontend",
+    "observability",
     "runtime"
   ],
   "properties": {
@@ -95,7 +96,8 @@
     "workload": {
       "type": "object",
       "required": [
-        "imagePullSecrets"
+        "imagePullSecrets",
+        "cache"
       ],
       "properties": {
         "imagePullSecrets": {
@@ -113,6 +115,24 @@
             },
             "additionalProperties": false
           }
+        },
+        "cache": {
+          "type": "object",
+          "required": [
+            "claimName",
+            "mountPath"
+          ],
+          "properties": {
+            "claimName": {
+              "type": "string"
+            },
+            "mountPath": {
+              "type": "string",
+              "pattern": "^/",
+              "minLength": 2
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -174,6 +194,83 @@
         }
       }
     },
+    "observability": {
+      "type": "object",
+      "required": [
+        "mode"
+      ],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "enabled",
+            "disabled"
+          ]
+        },
+        "additionalLabels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "interval": {
+          "type": "string"
+        },
+        "scrapeTimeout": {
+          "type": "string"
+        },
+        "alerts": {
+          "type": "object",
+          "required": [
+            "language",
+            "thresholds"
+          ],
+          "properties": {
+            "language": {
+              "type": "string",
+              "enum": [
+                "zh",
+                "en",
+                "bilingual"
+              ]
+            },
+            "thresholds": {
+              "type": "object",
+              "required": [
+                "acceleratorUtilizationRatio",
+                "acceleratorMemoryUsageRatio",
+                "nvidiaTemperatureCelsius",
+                "nvidiaPowerWatts"
+              ],
+              "properties": {
+                "acceleratorUtilizationRatio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "acceleratorMemoryUsageRatio": {
+                  "type": "number",
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "nvidiaTemperatureCelsius": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "nvidiaPowerWatts": {
+                  "type": "number",
+                  "minimum": 0
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "runtime": {
       "type": "object",
       "required": [
@@ -186,11 +283,13 @@
             "image",
             "profileRevision",
             "modelServerPort",
-            "gpu"
+            "gpu",
+            "modelSource"
           ],
           "properties": {
             "image": {
-              "type": "string"
+              "type": "string",
+              "minLength": 1
             },
             "profileRevision": {
               "type": "string",
@@ -211,7 +310,8 @@
               ],
               "properties": {
                 "resourceName": {
-                  "type": "string"
+                  "type": "string",
+                  "minLength": 1
                 },
                 "runtimeClassName": {
                   "type": "string"
@@ -229,11 +329,287 @@
                     "value": {
                       "type": "string"
                     }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "ec": {
+              "type": "object",
+              "required": [
+                "profileName",
+                "profileRevision",
+                "connector",
+                "sharedStorageClaim",
+                "sharedStoragePath"
+              ],
+              "properties": {
+                "profileName": {
+                  "type": "string"
+                },
+                "profileRevision": {
+                  "type": "string"
+                },
+                "connector": {
+                  "type": "string"
+                },
+                "sharedStorageClaim": {
+                  "type": "string"
+                },
+                "sharedStoragePath": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "profileName": {
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "profileRevision": {
+                        "minLength": 1
+                      },
+                      "connector": {
+                        "const": "ECExampleConnector"
+                      },
+                      "sharedStorageClaim": {
+                        "minLength": 1
+                      },
+                      "sharedStoragePath": {
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "profileRevision": {
+                        "const": ""
+                      },
+                      "connector": {
+                        "const": "ECExampleConnector"
+                      },
+                      "sharedStorageClaim": {
+                        "const": ""
+                      }
+                    }
                   }
                 }
-              }
+              ]
+            },
+            "pd": {
+              "type": "object",
+              "required": [
+                "profileName",
+                "profileRevision",
+                "protocol",
+                "bootstrapPort",
+                "abortRequestTimeoutSeconds",
+                "rdmaDeviceName",
+                "rdmaResourceName",
+                "rdmaResourceCount"
+              ],
+              "properties": {
+                "profileName": {
+                  "type": "string"
+                },
+                "profileRevision": {
+                  "type": "string"
+                },
+                "protocol": {
+                  "type": "string"
+                },
+                "bootstrapPort": {
+                  "type": "integer"
+                },
+                "abortRequestTimeoutSeconds": {
+                  "type": "integer"
+                },
+                "rdmaDeviceName": {
+                  "type": "string"
+                },
+                "rdmaResourceName": {
+                  "type": "string"
+                },
+                "rdmaResourceCount": {
+                  "type": "integer"
+                }
+              },
+              "additionalProperties": false,
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "profileName": {
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "profileRevision": {
+                        "minLength": 1
+                      },
+                      "protocol": {
+                        "const": "rdma"
+                      },
+                      "bootstrapPort": {
+                        "minimum": 1,
+                        "maximum": 65535
+                      },
+                      "abortRequestTimeoutSeconds": {
+                        "minimum": 1,
+                        "maximum": 2147483647
+                      },
+                      "rdmaDeviceName": {
+                        "minLength": 1
+                      },
+                      "rdmaResourceName": {
+                        "minLength": 1
+                      },
+                      "rdmaResourceCount": {
+                        "minimum": 1,
+                        "maximum": 2147483647
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "profileRevision": {
+                        "const": ""
+                      },
+                      "protocol": {
+                        "const": ""
+                      },
+                      "bootstrapPort": {
+                        "const": 0
+                      },
+                      "abortRequestTimeoutSeconds": {
+                        "const": 0
+                      },
+                      "rdmaDeviceName": {
+                        "const": ""
+                      },
+                      "rdmaResourceName": {
+                        "const": ""
+                      },
+                      "rdmaResourceCount": {
+                        "const": 0
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "mooncakeStore": {
+              "type": "object",
+              "required": [
+                "profileName",
+                "profileRevision",
+                "configMapName",
+                "configMapKey",
+                "pythonHashSeed"
+              ],
+              "properties": {
+                "profileName": {
+                  "type": "string"
+                },
+                "profileRevision": {
+                  "type": "string"
+                },
+                "configMapName": {
+                  "type": "string"
+                },
+                "configMapKey": {
+                  "type": "string"
+                },
+                "pythonHashSeed": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false,
+              "allOf": [
+                {
+                  "if": {
+                    "properties": {
+                      "profileName": {
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  "then": {
+                    "properties": {
+                      "profileRevision": {
+                        "minLength": 1
+                      },
+                      "configMapName": {
+                        "minLength": 1
+                      },
+                      "configMapKey": {
+                        "minLength": 1
+                      },
+                      "pythonHashSeed": {
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  "else": {
+                    "properties": {
+                      "profileRevision": {
+                        "const": ""
+                      },
+                      "configMapName": {
+                        "const": ""
+                      },
+                      "configMapKey": {
+                        "const": ""
+                      },
+                      "pythonHashSeed": {
+                        "const": ""
+                      }
+                    }
+                  }
+                }
+              ]
+            },
+            "modelSource": {
+              "type": "object",
+              "required": [
+                "endpoint",
+                "tokenSecret"
+              ],
+              "properties": {
+                "endpoint": {
+                  "type": "string"
+                },
+                "tokenSecret": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "key"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "key": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
             }
-          }
+          },
+          "additionalProperties": false
         },
         "sglang": {
           "type": "object",
@@ -352,48 +728,6 @@
                 "properties": {
                   "controllerName": {
                     "minLength": 1
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "runtime": {
-            "properties": {
-              "vllm": {
-                "properties": {
-                  "image": {
-                    "minLength": 1
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "runtime": {
-            "properties": {
-              "vllm": {
-                "properties": {
-                  "gpu": {
-                    "properties": {
-                      "resourceName": {
-                        "minLength": 1
-                      },
-                      "nodeSelector": {
-                        "properties": {
-                          "key": {},
-                          "value": {}
-                        }
-                      }
-                    }
                   }
                 }
               }

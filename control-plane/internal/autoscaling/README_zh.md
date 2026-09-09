@@ -1,66 +1,41 @@
-# 自动扩缩容
+# 自动扩缩容架构
 
-自动扩缩容以完整 ModelGroup 为单位，不会独立调整 Pod、rank 或 E/P/D Group 的成员数量。
+[English](README.md) | [中文](README_zh.md)
 
-Controller 首先判断是否需要根据当前观测进行评估。Decision algorithm 随后计算 `DesiredCapacity`，即需要的完整 Group 数。Adjustment algorithm 应用容量边界和单轮调整限制，core 生命周期规则再生成最终 `ScalingDecision`。最后由 ModelService controller 将实际应用的容量写入 `ModelPool.spec.desiredGroups`。
+本包将控制器拥有的观测转换为 `ModelPool` 容量。用户通过 `ModelService.spec.autoscaling` 配置自动扩缩容；配置和状态使用方式见[自动扩缩容指南](../../../docs/autoscaling_zh.md)。
+
+## 职责归属
+
+`ModelService` 控制器负责调度、观测采集、扩缩目标发现、状态发布，以及将容量写入 `ModelPool`。算法保持无副作用：只评估一个完整观测并返回容量建议。
+
+聚合目标扩缩一个 Pool。E/P/D 目标扩缩一个 `EPDPipelineScope`，将相同容量写入 encoder、prefill 和 decode Pool。
+
+## 评估流水线
 
 ```text
-ScalingSnapshot
+控制器轮询
+→ ScalingSnapshot
 → TriggerDecision
-→ DesiredCapacity
-→ ScalingAdjustment
+→ ReplicaRecommendation
+→ ReplicaAdjustment
 → ScalingDecision
+→ ModelPool 容量和 ModelService 状态
 ```
 
-Trigger 可以在计算 `DesiredCapacity` 前保持当前容量。
-观测缺失、过期或不完整时同样保持当前容量，不会将其解释为零负载。
+控制器向流水线提供完整、近期的观测。`periodic` 接受这些观测，不拥有时间间隔或重新入队循环。即使缺少观测，Resolver 仍会应用最小和最大副本数硬限制；目标处于转换中时保持容量。
 
-## 输出示例
+`step` 的稳定窗口使用当前控制器进程保存的近期建议。历史刻意保存在运行时本地，因此重启或 leader 切换不会恢复尚未结束的缩容延迟。
 
-假设一个 Pool 当前请求 2 个 Group，其中 1 个 Group 可路由，队列中有 5 个等待请求。内置 queue algorithm 计算需要增加 1 个完整 Group，step adjustment 允许本轮执行该调整：
+## 扩展边界
 
-```text
-ScalingSnapshot:
-  target:
-    kind: Pool
-    name: aggregate
-    uid: 8c88ee9a-c10f-41fd-98ef-a09d256b5213
-  capacity.requestedGroups: 2
-  capacity.routableGroups: 1
-  observation.queueRequests: 5
-  limits: [1, 8]
+内置算法位于 `algorithm/`。Trigger、Decision 和 Adjustment 实现返回领域结果，不读取 Kubernetes 资源、不修改容量，也不调度工作。新增实现只有在它代表当前独立负责的建议策略时才有意义；控制器生命周期行为保留在 `core` 和 ModelService reconciler 中。
 
-TriggerDecision:
-  disposition: Fire
-  reason: Periodic
+修改本包时，同步核对用户可见算法名称、默认值、校验、状态 reason 和自动扩缩容指南。
 
-DesiredCapacity:
-  disposition: Apply
-  groups: 3
-  reason: QueuePressure
+## 验证
 
-ScalingAdjustment:
-  adjustedGroups: 3
-  reason: StepUp
+修改本包后运行控制面验证：
 
-ScalingDecision:
-  target:
-    kind: Pool
-    name: aggregate
-    uid: 8c88ee9a-c10f-41fd-98ef-a09d256b5213
-  appliedGroups: 3
-  direction: Up
-
-ModelPool[aggregate].spec.desiredGroups: 2 → 3
+```bash
+make -C control-plane verify
 ```
-
-`DesiredCapacity.groups` 是根据负载计算的容量；`adjustedGroups` 和 `appliedGroups` 分别表示经过调整规则和生命周期规则后，本轮实际采用的容量。
-
-```text
-autoscaling/
-├── core/       # 固定输入、接口、流水线和结果规则
-├── algorithm/  # 可替换的 trigger、decision 和 adjustment algorithms
-└── tests/      # 自动扩缩容公共行为测试
-```
-
-实现使用稳定的 lower-snake-case 名称注册。名称为空、重复、未知或配置无效时都会返回明确错误。

@@ -8,14 +8,17 @@ use foretoken_llm_facade::HttpFacade;
 use foretoken_model_protocol::ModelServerRole;
 use foretoken_model_protocol::{KvCacheLocality, KvPlacement, KvStorageTier};
 use foretoken_router::{
-    RouteTarget, RouteTargetId, RouteTargetSet, ScalingTarget, ScalingTargetKind,
+    ModelRouteTable, RouteTarget, RouteTargetId, RouteTargetSet, ScalingTarget, ScalingTargetKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::registry::{Component, RouteTable};
+use crate::registry::Component;
 use crate::snapshot::{ServingSnapshot, SnapshotError};
 
+/// Projects prompt-side KV event sources and route bindings from a serving snapshot.
+///
+/// `BackendRegistryBuild` consumes this derived runtime configuration while the snapshot remains controller-owned.
 pub(crate) fn project_kv_runtime(
     snapshot: &ServingSnapshot,
 ) -> Result<KvRuntimeConfig, SnapshotError> {
@@ -109,18 +112,12 @@ fn pool_target(service_uid: String, pool_uid: String, pool_name: String) -> Scal
     }
 }
 
-fn epd_pipeline_scope_target(service_uid: String) -> ScalingTarget {
-    ScalingTarget {
-        uid: service_uid.clone(),
-        service_uid,
-        name: "epd".into(),
-        kind: ScalingTargetKind::EPDPipelineScope,
-    }
-}
-
+/// Projects validated snapshot topology into the router's route table and backend components.
+///
+/// `BackendRegistry::from_snapshot` takes ownership of both outputs; this function consumes the snapshot.
 pub(crate) fn project_registry(
     snapshot: ServingSnapshot,
-) -> Result<(RouteTable, BTreeMap<RouteTargetId, Component>), SnapshotError> {
+) -> Result<(ModelRouteTable, BTreeMap<RouteTargetId, Component>), SnapshotError> {
     // Validate snapshot-wide identity and admission ownership before consuming topology
     // vectors so every emitted route receives one unambiguous scaling target set.
     if snapshot.version == 0 {
@@ -161,6 +158,7 @@ pub(crate) fn project_registry(
             || group.pool_name.is_empty()
             || group.route_target_id.as_str().is_empty()
             || group.endpoint.is_empty()
+            || group.kv_scope_id.is_empty()
         {
             return Err(SnapshotError::IncompleteGroup(group.route_target_id));
         }
@@ -228,6 +226,7 @@ pub(crate) fn project_registry(
             || component.endpoint.is_empty()
             || component.profile_name.is_empty()
             || component.profile_revision.is_empty()
+            || component.kv_scope_id.is_empty()
         {
             return Err(SnapshotError::IncompletePdComponent(
                 component.route_target_id,
@@ -313,123 +312,97 @@ pub(crate) fn project_registry(
         }
     }
 
-    // E/P/D projection first assembles complete encoder, prefill, and decode triplets.
-    // Cross-role artifact and transport checks run before any triplet becomes routable.
-    let mut epd_pipeline_scopes = BTreeMap::new();
-    for pipeline_scope in &snapshot.epd_pipeline_scopes {
-        if pipeline_scope.pipeline_scope_id.is_empty()
-            || pipeline_scope.encoder_route_target_id.as_str().is_empty()
-            || pipeline_scope.prefill_route_target_id.as_str().is_empty()
-            || pipeline_scope.decode_route_target_id.as_str().is_empty()
-            || epd_pipeline_scopes
-                .insert(pipeline_scope.pipeline_scope_id.clone(), pipeline_scope)
-                .is_some()
-        {
-            return Err(SnapshotError::InvalidEpdPipelineScope(
-                pipeline_scope.pipeline_scope_id.clone(),
-            ));
-        }
-    }
-    let mut epd_pipeline_scope_members =
-        BTreeMap::<String, [Option<&crate::snapshot::SnapshotEpdComponent>; 3]>::new();
+    // The controller owns connector compatibility. The frontend verifies only that every
+    // published route belongs to exactly one complete, service-local scope with the declared role.
+    let mut epd_components_by_id = BTreeMap::new();
     for component in &snapshot.epd_components {
         if component.service_uid.is_empty()
             || component.pool_uid.is_empty()
             || component.pool_name.is_empty()
             || component.route_target_id.as_str().is_empty()
-            || component.pipeline_scope_id.is_empty()
             || component.endpoint.is_empty()
+            || component.kv_scope_id.is_empty()
         {
             return Err(SnapshotError::IncompleteEpdComponent(
                 component.route_target_id.clone(),
             ));
         }
-        let Some(pipeline_scope) = epd_pipeline_scopes.get(&component.pipeline_scope_id) else {
-            return Err(SnapshotError::InvalidEpdPipelineScope(
-                component.pipeline_scope_id.clone(),
-            ));
-        };
-        let (index, expected_id) = match component.role {
-            ModelServerRole::Encoder => (0, &pipeline_scope.encoder_route_target_id),
-            ModelServerRole::Prefill => (1, &pipeline_scope.prefill_route_target_id),
-            ModelServerRole::Decode => (2, &pipeline_scope.decode_route_target_id),
-            ModelServerRole::Aggregate => {
-                return Err(SnapshotError::InvalidEpdPipelineScope(
-                    component.pipeline_scope_id.clone(),
-                ));
-            }
-        };
-        if &component.route_target_id != expected_id
-            || epd_pipeline_scope_members
-                .entry(component.pipeline_scope_id.clone())
-                .or_insert([None, None, None])[index]
-                .replace(component)
-                .is_some()
+        if epd_components_by_id
+            .insert(component.route_target_id.clone(), component)
+            .is_some()
         {
-            return Err(SnapshotError::InvalidEpdPipelineScope(
-                component.pipeline_scope_id.clone(),
+            return Err(SnapshotError::DuplicateRouteTarget(
+                component.route_target_id.clone(),
             ));
         }
     }
-    for (pipeline_scope_id, pipeline_scope) in &epd_pipeline_scopes {
-        let Some([Some(encoder), Some(prefill), Some(decode)]) =
-            epd_pipeline_scope_members.get(pipeline_scope_id)
+
+    let mut pipeline_scope_ids = BTreeSet::new();
+    let mut pipeline_scope_by_route_target = BTreeMap::new();
+    for pipeline_scope in &snapshot.epd_pipeline_scopes {
+        let invalid_scope =
+            || SnapshotError::InvalidEpdPipelineScope(pipeline_scope.pipeline_scope_id.clone());
+        if pipeline_scope.pipeline_scope_id.is_empty()
+            || pipeline_scope.encoder_route_target_ids.is_empty()
+            || pipeline_scope.prefill_route_target_ids.is_empty()
+            || pipeline_scope.decode_route_target_ids.is_empty()
+            || !pipeline_scope_ids.insert(pipeline_scope.pipeline_scope_id.clone())
+        {
+            return Err(invalid_scope());
+        }
+        let Some(reference) = epd_components_by_id.get(&pipeline_scope.encoder_route_target_ids[0])
         else {
-            return Err(SnapshotError::InvalidEpdPipelineScope(
-                pipeline_scope_id.clone(),
-            ));
+            return Err(invalid_scope());
         };
-        // A pipeline is one model artifact with matched EC on encoder/prefill and
-        // matched Mooncake KV transport on prefill/decode; decode never participates in EC.
-        if aggregate_models.contains(&encoder.model)
-            || pd_models.contains(&encoder.model)
-            || encoder.model != prefill.model
-            || encoder.model != decode.model
-            || encoder.revision != prefill.revision
-            || encoder.revision != decode.revision
-            || encoder.tokenizer != prefill.tokenizer
-            || encoder.tokenizer != decode.tokenizer
-            || encoder.tokenizer_revision != prefill.tokenizer_revision
-            || encoder.tokenizer_revision != decode.tokenizer_revision
-            || !encoder.profile_name.is_empty()
-            || !encoder.profile_revision.is_empty()
-            || !encoder.connector.is_empty()
-            || !encoder.protocol.is_empty()
-            || prefill.profile_name.is_empty()
-            || decode.profile_name.is_empty()
-            || prefill.profile_name != decode.profile_name
-            || prefill.profile_revision.is_empty()
-            || decode.profile_revision.is_empty()
-            || prefill.profile_revision != decode.profile_revision
-            || prefill.connector != "MooncakeConnector"
-            || decode.connector != "MooncakeConnector"
-            || prefill.protocol != "rdma"
-            || decode.protocol != "rdma"
-            || prefill.kv_scope_id.is_empty()
-            || decode.kv_scope_id.is_empty()
-            || prefill.kv_scope_id != decode.kv_scope_id
-            || encoder.ec_profile_name.is_empty()
-            || prefill.ec_profile_name.is_empty()
-            || encoder.ec_profile_name != prefill.ec_profile_name
-            || encoder.ec_profile_revision.is_empty()
-            || prefill.ec_profile_revision.is_empty()
-            || encoder.ec_profile_revision != prefill.ec_profile_revision
-            || encoder.ec_connector != "ECExampleConnector"
-            || prefill.ec_connector != "ECExampleConnector"
-            || encoder.ec_connector != prefill.ec_connector
-            || !decode.ec_profile_name.is_empty()
-            || !decode.ec_profile_revision.is_empty()
-            || !decode.ec_connector.is_empty()
-        {
-            return Err(SnapshotError::InvalidEpdPipelineScope(
-                pipeline_scope.pipeline_scope_id.clone(),
-            ));
+        for (role, route_target_ids) in [
+            (
+                ModelServerRole::Encoder,
+                pipeline_scope.encoder_route_target_ids.as_slice(),
+            ),
+            (
+                ModelServerRole::Prefill,
+                pipeline_scope.prefill_route_target_ids.as_slice(),
+            ),
+            (
+                ModelServerRole::Decode,
+                pipeline_scope.decode_route_target_ids.as_slice(),
+            ),
+        ] {
+            for route_target_id in route_target_ids {
+                let Some(component) = epd_components_by_id.get(route_target_id) else {
+                    return Err(invalid_scope());
+                };
+                if pipeline_scope_by_route_target
+                    .insert(
+                        route_target_id.clone(),
+                        pipeline_scope.pipeline_scope_id.clone(),
+                    )
+                    .is_some()
+                    || component.role != role
+                    || component.service_uid != reference.service_uid
+                    || component.model != reference.model
+                {
+                    return Err(invalid_scope());
+                }
+            }
+        }
+        if aggregate_models.contains(&reference.model) || pd_models.contains(&reference.model) {
+            return Err(invalid_scope());
         }
     }
-    // Only fully validated triplets are materialized into executable components and
+    if pipeline_scope_by_route_target.len() != epd_components_by_id.len() {
+        return Err(SnapshotError::InvalidEpdPipelineScope(String::new()));
+    }
+
+    // Only structurally valid scopes are materialized into executable components and
     // service-scoped admission targets.
     for component in snapshot.epd_components {
-        let target = epd_pipeline_scope_target(component.service_uid.clone());
+        let target = ScalingTarget {
+            uid: component.service_uid.clone(),
+            service_uid: component.service_uid.clone(),
+            name: "epd".into(),
+            kind: ScalingTargetKind::EPDPipelineScope,
+        };
         let route = RouteTarget {
             route_target_id: component.route_target_id.clone(),
             admission_targets: admission_targets(&target)?,
@@ -440,7 +413,11 @@ pub(crate) fn project_registry(
             max_input_tokens: component.max_input_tokens,
             ready: true,
             role: component.role,
-            pipeline_scope_id: Some(component.pipeline_scope_id),
+            pipeline_scope_id: Some(
+                pipeline_scope_by_route_target
+                    .remove(&component.route_target_id)
+                    .expect("validated E/P/D scope membership"),
+            ),
             data_parallel_size: component.data_parallel_size,
         };
         let component = match route.role {
@@ -466,5 +443,5 @@ pub(crate) fn project_registry(
         }
         routes.push(route);
     }
-    Ok((RouteTable::new(snapshot.version, routes), components))
+    Ok((ModelRouteTable::new(routes), components))
 }

@@ -24,6 +24,8 @@ use foretoken_model_server::engine::sglang::{SglangBackend, SglangLaunchPlan, Sg
 use foretoken_model_server::engine::vllm::{
     LaunchPlanV1, VllmBackend, VllmProcess, conversion::to_neutral_model_dtype,
 };
+#[cfg(feature = "backend-vllm")]
+use foretoken_model_server::runtime_cache;
 #[cfg(feature = "backend-sglang")]
 use foretoken_model_server::runtime_transport::LOOPBACK_HOST;
 use tokio::net::TcpListener;
@@ -118,6 +120,18 @@ async fn finish_shutdown<S, B, E1, P, E2>(
 async fn run_vllm(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Error>> {
     let plan = LaunchPlanV1::parse(&config.launch_payload).map_err(std::io::Error::other)?;
 
+    let cache_shutdown = Arc::new(Notify::new());
+    let cache_config = runtime_cache::Config::from_env().map_err(std::io::Error::other)?;
+    let mut cache_server = if let Some(server_config) = cache_config.clone() {
+        let address = (config.listen_address.ip(), server_config.observation_port());
+        let listener = TcpListener::bind(address).await?;
+        let shutdown = cache_shutdown.clone();
+        Some(tokio::spawn(async move {
+            runtime_cache::serve(listener, server_config, shutdown).await
+        }))
+    } else {
+        None
+    };
     // Resolve optional KV projection state now; connect only after the engine publisher is ready.
     let kv_events = match kv_event_adapter(&plan) {
         Ok(adapter) => Some(adapter),
@@ -194,6 +208,9 @@ async fn run_vllm(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Error
     if let Some(kv_events) = kv_events {
         app_state = app_state.with_kv_events(kv_events);
     }
+    if let Some(cache_config) = cache_config {
+        app_state = app_state.with_runtime_cache(cache_config);
+    }
     let mut server = Box::pin(
         axum::serve(
             listener,
@@ -209,6 +226,7 @@ async fn run_vllm(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Error
         ClientUnhealthy(String),
         ChildExited(String),
         Server(String),
+        CacheServer(String),
     }
     let stop = tokio::select! {
         () = shutdown_signal() => Stop::Signal,
@@ -224,13 +242,17 @@ async fn run_vllm(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Error
             Ok(()) => "HTTP server stopped unexpectedly".into(),
             Err(error) => format!("HTTP server failed: {error}"),
         }),
+        reason = wait_cache_server(&mut cache_server) => Stop::CacheServer(reason),
     };
     match &stop {
         Stop::Signal => info!("received shutdown signal"),
-        Stop::ClientUnhealthy(reason) | Stop::ChildExited(reason) | Stop::Server(reason) => {
-            warn!(%reason)
-        }
+        Stop::ClientUnhealthy(reason)
+        | Stop::ChildExited(reason)
+        | Stop::Server(reason)
+        | Stop::CacheServer(reason) => warn!(%reason),
     }
+
+    cache_shutdown.notify_waiters();
 
     finish_shutdown(
         &health,
@@ -244,12 +266,16 @@ async fn run_vllm(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Error
         "could not shut down managed EngineCore cleanly",
     )
     .await;
+    if let Some(cache_server) = cache_server {
+        let _ = cache_server.await;
+    }
 
     match stop {
         Stop::Signal => Ok(()),
-        Stop::ClientUnhealthy(reason) | Stop::ChildExited(reason) | Stop::Server(reason) => {
-            Err(std::io::Error::other(reason).into())
-        }
+        Stop::ClientUnhealthy(reason)
+        | Stop::ChildExited(reason)
+        | Stop::Server(reason)
+        | Stop::CacheServer(reason) => Err(std::io::Error::other(reason).into()),
     }
 }
 
@@ -424,6 +450,20 @@ async fn sglang_context_len(port: u16) -> Result<i64, String> {
         }
     }
     Err("sglang get_server_info has no context length".into())
+}
+
+#[cfg(feature = "backend-vllm")]
+async fn wait_cache_server(
+    server: &mut Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+) -> String {
+    let Some(server) = server else {
+        return std::future::pending().await;
+    };
+    match server.await {
+        Ok(Ok(())) => "cache observation server stopped unexpectedly".into(),
+        Ok(Err(error)) => format!("cache observation server failed: {error}"),
+        Err(error) => format!("cache observation task failed: {error}"),
+    }
 }
 
 #[cfg(feature = "backend-vllm")]

@@ -1,65 +1,41 @@
-# Autoscaling
+# Autoscaling Architecture
 
-Autoscaling operates on complete ModelGroups. It never scales individual Pods, ranks, or E/P/D members independently.
+[English](README.md) | [中文](README_zh.md)
 
-The controller first decides whether the current observations should be evaluated. A decision algorithm then calculates `DesiredCapacity`, the desired number of complete Groups. An adjustment algorithm applies the configured bounds and per-round change limits. Core lifecycle rules produce the final `ScalingDecision`, and the ModelService controller writes the applied capacity to `ModelPool.spec.desiredGroups`.
+This package turns controller-owned observations into `ModelPool` capacity. Users configure autoscaling through `ModelService.spec.autoscaling`; configuration and status usage are documented in the [autoscaling guide](../../../docs/autoscaling.md).
+
+## Ownership
+
+The `ModelService` controller owns scheduling, observation collection, target discovery, status publication, and writing capacity to `ModelPool`. Algorithms are side-effect-free: they only evaluate one complete observation and return a recommendation.
+
+An aggregate target scales one Pool. An E/P/D target scales one `EPDPipelineScope`, applying the same capacity to its encoder, prefill, and decode Pools.
+
+## Evaluation pipeline
 
 ```text
-ScalingSnapshot
+controller polling loop
+→ ScalingSnapshot
 → TriggerDecision
-→ DesiredCapacity
-→ ScalingAdjustment
+→ ReplicaRecommendation
+→ ReplicaAdjustment
 → ScalingDecision
+→ ModelPool capacity and ModelService status
 ```
 
-A trigger may hold the current capacity before `DesiredCapacity` is calculated. Missing, stale, or incomplete observations also hold current capacity instead of being interpreted as zero demand.
+The controller supplies complete, fresh observations to the pipeline. `periodic` accepts those observations; it does not own an interval or requeue loop. The resolver applies hard min/max bounds even when observations are missing, and holds capacity while a target is transitioning.
 
-## Output case
+`step` stabilization uses recent recommendations retained by the current controller process. The history is intentionally runtime-local, so a restart or leader change does not restore a pending scale-down delay.
 
-For a Pool with two requested Groups and one routable Group, assume the queue observation contains five waiting requests. The built-in queue algorithm requests one additional complete Group, and the step adjustment allows that change in the current round:
+## Extension boundary
 
-```text
-ScalingSnapshot:
-  target:
-    kind: Pool
-    name: aggregate
-    uid: 8c88ee9a-c10f-41fd-98ef-a09d256b5213
-  capacity.requestedGroups: 2
-  capacity.routableGroups: 1
-  observation.queueRequests: 5
-  limits: [1, 8]
+Built-in algorithms live under `algorithm/`. Trigger, decision, and adjustment implementations return domain results and do not read Kubernetes resources, mutate capacity, or schedule work. Add a new implementation only when it represents a current, independently owned recommendation policy; controller lifecycle behavior remains in `core` and the ModelService reconciler.
 
-TriggerDecision:
-  disposition: Fire
-  reason: Periodic
+Keep user-visible algorithm names, defaults, validation, status reasons, and the autoscaling guide synchronized with the API and controller.
 
-DesiredCapacity:
-  disposition: Apply
-  groups: 3
-  reason: QueuePressure
+## Validation
 
-ScalingAdjustment:
-  adjustedGroups: 3
-  reason: StepUp
+Use the control-plane verification target after changing this package:
 
-ScalingDecision:
-  target:
-    kind: Pool
-    name: aggregate
-    uid: 8c88ee9a-c10f-41fd-98ef-a09d256b5213
-  appliedGroups: 3
-  direction: Up
-
-ModelPool[aggregate].spec.desiredGroups: 2 → 3
+```bash
+make -C control-plane verify
 ```
-
-`DesiredCapacity.groups` is the capacity calculated from demand. `adjustedGroups` and `appliedGroups` show what this reconciliation round applies after adjustment and lifecycle rules.
-
-```text
-autoscaling/
-├── core/       # fixed inputs, interfaces, pipeline, and result rules
-├── algorithm/  # replaceable trigger, decision, and adjustment algorithms
-└── tests/      # behavior tests for the public autoscaling contracts
-```
-
-Implementations register under stable lower-snake-case names. Empty, duplicate, unknown, or invalid selections return explicit errors.

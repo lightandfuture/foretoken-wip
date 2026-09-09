@@ -46,6 +46,14 @@ type ModelGroupArtifacts struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=256
 	TokenizerRevision string `json:"tokenizerRevision"`
+
+	// Cache is the persistent runtime cache selected for this immutable Group revision.
+	// +optional
+	Cache *RuntimeCacheBinding `json:"cache,omitempty"`
+
+	// SourceAccess contains runtime-adapter settings for loading the model.
+	// +optional
+	SourceAccess *RuntimeSourceAccess `json:"sourceAccess,omitempty"`
 }
 
 // ModelGroupPDRuntimeConfig defines the resolved P/D transport runtime.

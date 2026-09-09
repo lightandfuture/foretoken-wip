@@ -405,6 +405,38 @@ spec:
                     - prefill
                     - decode
                     type: string
+                  runtimeCache:
+                    description: RuntimeCache is set by the ModelService controller
+                      when persistent runtime caching is enabled.
+                    properties:
+                      claimName:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      mountPath:
+                        maxLength: 1024
+                        minLength: 2
+                        pattern: ^/
+                        type: string
+                    required:
+                    - claimName
+                    - mountPath
+                    type: object
+                  sourceAccess:
+                    description: SourceAccess is set by the ModelService controller
+                      from the selected runtime profile.
+                    properties:
+                      endpoint:
+                        description: Endpoint is interpreted by the selected runtime
+                          adapter.
+                        type: string
+                      tokenSecretKey:
+                        type: string
+                      tokenSecretName:
+                        description: TokenSecretName and TokenSecretKey identify an
+                          optional namespace-local credential.
+                        type: string
+                    type: object
                   timeouts:
                     description: ModelTimeouts defines ModelService lifecycle budgets.
                     properties:

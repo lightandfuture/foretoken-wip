@@ -36,11 +36,13 @@ const (
 	modelServerTelemetryVersion = 2
 )
 
-type drainTelemetry struct {
-	Version               uint8  `json:"version"`
-	Accepting             bool   `json:"accepting"`
-	RunningRequests       uint64 `json:"running_requests"`
-	MaxConcurrentRequests uint64 `json:"max_concurrent_requests"`
+type modelServerTelemetry struct {
+	Version                  uint8   `json:"version"`
+	CollectedAtUnixMS        uint64  `json:"collected_at_unix_ms"`
+	Accepting                bool    `json:"accepting"`
+	RunningRequests          uint64  `json:"running_requests"`
+	SchedulerRunningRequests *uint64 `json:"scheduler_running_requests"`
+	SchedulerWaitingRequests *uint64 `json:"scheduler_waiting_requests"`
 }
 
 type frontendDiagnostics struct {
@@ -50,7 +52,7 @@ type frontendDiagnostics struct {
 // ModelGroupDrainClient observes frontend generations and controls group-local admission.
 type ModelGroupDrainClient interface {
 	FrontendGeneration(context.Context, string) (uint64, error)
-	CloseAdmission(context.Context, string) (drainTelemetry, error)
+	CloseAdmission(context.Context, string) (modelServerTelemetry, error)
 }
 
 type httpModelGroupDrainClient struct {
@@ -61,6 +63,7 @@ func newHTTPModelGroupDrainClient() ModelGroupDrainClient {
 	return &httpModelGroupDrainClient{client: &http.Client{}}
 }
 
+// FrontendGeneration reads the active serving snapshot generation from one frontend Pod.
 func (client *httpModelGroupDrainClient) FrontendGeneration(ctx context.Context, endpoint string) (uint64, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint+"/statusz", nil)
 	if err != nil {
@@ -84,29 +87,31 @@ func (client *httpModelGroupDrainClient) FrontendGeneration(ctx context.Context,
 	return *diagnostics.ActiveGeneration, nil
 }
 
-func (client *httpModelGroupDrainClient) CloseAdmission(ctx context.Context, endpoint string) (drainTelemetry, error) {
+// CloseAdmission closes model-server admission and returns its current drain telemetry.
+func (client *httpModelGroupDrainClient) CloseAdmission(ctx context.Context, endpoint string) (modelServerTelemetry, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/v1/internal/admission/close", nil)
 	if err != nil {
-		return drainTelemetry{}, err
+		return modelServerTelemetry{}, err
 	}
 	response, err := client.client.Do(request)
 	if err != nil {
-		return drainTelemetry{}, err
+		return modelServerTelemetry{}, err
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return drainTelemetry{}, fmt.Errorf("admission close returned HTTP %d", response.StatusCode)
+		return modelServerTelemetry{}, fmt.Errorf("admission close returned HTTP %d", response.StatusCode)
 	}
-	var telemetry drainTelemetry
+	var telemetry modelServerTelemetry
 	if err := json.NewDecoder(response.Body).Decode(&telemetry); err != nil {
-		return drainTelemetry{}, fmt.Errorf("decode admission close response: %w", err)
+		return modelServerTelemetry{}, fmt.Errorf("decode admission close response: %w", err)
 	}
 	if telemetry.Version != modelServerTelemetryVersion {
-		return drainTelemetry{}, fmt.Errorf("unsupported model-server telemetry version %d", telemetry.Version)
+		return modelServerTelemetry{}, fmt.Errorf("unsupported model-server telemetry version %d", telemetry.Version)
 	}
 	return telemetry, nil
 }
 
+// reconcileDelete coordinates admission closure, route withdrawal, and bounded request drain before deletion.
 func (reconciler *ModelGroupReconciler) reconcileDelete(ctx context.Context, group *inferencev1alpha1.ModelGroup) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(group, modelGroupDrainFinalizer) {
 		return ctrl.Result{}, nil
@@ -182,6 +187,7 @@ func (reconciler *ModelGroupReconciler) reconcileDelete(ctx context.Context, gro
 	return ctrl.Result{}, reconciler.removeDrainFinalizer(ctx, group)
 }
 
+// finishDrainTimeout records an incomplete drain and releases the deletion finalizer.
 func (reconciler *ModelGroupReconciler) finishDrainTimeout(ctx context.Context, group *inferencev1alpha1.ModelGroup) (ctrl.Result, error) {
 	routingWithdrawn := meta.IsStatusConditionTrue(group.Status.Conditions, conditionRoutingWithdrawn)
 	admissionClosed := meta.IsStatusConditionTrue(group.Status.Conditions, conditionAdmissionClosed)
@@ -191,6 +197,7 @@ func (reconciler *ModelGroupReconciler) finishDrainTimeout(ctx context.Context, 
 	return ctrl.Result{}, reconciler.removeDrainFinalizer(ctx, group)
 }
 
+// routingWithdrawn verifies that every frontend snapshot and replica has observed route withdrawal.
 func (reconciler *ModelGroupReconciler) routingWithdrawn(ctx context.Context, group *inferencev1alpha1.ModelGroup) (bool, error) {
 	var frontends inferencev1alpha1.FrontendServiceList
 	if err := reconciler.List(ctx, &frontends, client.InNamespace(group.Namespace)); err != nil {
@@ -305,6 +312,7 @@ func (reconciler *ModelGroupReconciler) now() time.Time {
 	return time.Now()
 }
 
+// updateDrainStatus publishes the current ModelGroup deletion-drain milestone.
 func (reconciler *ModelGroupReconciler) updateDrainStatus(ctx context.Context, group *inferencev1alpha1.ModelGroup, started *metav1.Time, routingWithdrawn, admissionClosed, drained bool, reason, message string) error {
 	base := group.DeepCopy()
 	group.Status.Phase = inferencev1alpha1.ModelGroupPhaseDraining
@@ -324,6 +332,7 @@ func (reconciler *ModelGroupReconciler) updateDrainStatus(ctx context.Context, g
 	return nil
 }
 
+// removeDrainFinalizer releases ModelGroup deletion after the drain lifecycle completes.
 func (reconciler *ModelGroupReconciler) removeDrainFinalizer(ctx context.Context, group *inferencev1alpha1.ModelGroup) error {
 	base := group.DeepCopy()
 	controllerutil.RemoveFinalizer(group, modelGroupDrainFinalizer)

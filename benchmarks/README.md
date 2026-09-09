@@ -2,97 +2,64 @@
 
 English | [简体中文](README_zh.md)
 
-`benchmarks/` is the evaluation module for Foretoken.
+Use `foretoken bench` to measure latency and throughput against a Foretoken deployment or an existing OpenAI-compatible endpoint.
 
-It sends requests to a deployed inference service, measures performance, compares configurations, and checks whether answer quality meets the bar. The goal is reproducible experiments that answer: can this service hold latency and throughput, and is the quality good enough?
+## Before you start
 
-## When to Use It
+Run benchmark commands from the repository root with Python 3.10 or later:
 
-- You want latency and throughput at a given concurrency or arrival rate.
-- You want to compare concurrency, request count, generation settings, or server configs.
-- You want to confirm the model is not only fast, but also correct on answers and tool use.
-- You want a suitable load point or capacity plan under latency and throughput targets.
+```bash
+pip install 'foretoken[bench]'
 
-If you are only poking the API by hand, you usually do not need the full evaluation flow.
+# For source installation from the repository:
+# pip install -e .
+# pip install -e '.[bench]'
+```
 
-## Main Features
+For a Foretoken deployment, install the platform before benchmarking a Kustomize configuration:
 
-| Feature | Description |
-|---|---|
-| Performance benchmark | Stress the inference service and measure latency, throughput, time to first token, and related metrics |
-| Load sweep | Sweep concurrency, request count, or arrival rate to see how performance changes |
-| Parameter sweep | Combine server and bench parameters to compare configurations in batch |
-| Correctness evaluation | Check answer quality and tool calling, not speed alone |
-| SLO evaluation | Search or simulate against latency and quality targets to guide capacity and autoscaling |
+```bash
+foretoken install
+foretoken bench examples/quickstart
+```
 
-## What It Produces
+The command reuses the Quick Start when it is already running. Otherwise it deploys the rendered resources and removes only the resources it created after the benchmark.
 
-- Readable summary results in the console
-- Locally saved configs, raw results, and metrics for later review
-- Optional Weights & Biases (W&B) experiment logs and charts for cross-run comparison and config selection
-
-## Examples
-
-Fixed prompt:
+To benchmark an existing endpoint, Foretoken and its Kubernetes platform are not required:
 
 ```bash
 foretoken bench \
   --url http://127.0.0.1:8008/v1/chat/completions \
-  --model Qwen3.6-27B \
-  --prompt "hello" \
+  --model Qwen/Qwen3-0.6B \
+  --prompt "Hello" \
   --parallel 2 \
   --number 20
 ```
 
-Local dataset file:
+## Results and output
 
-```bash
-foretoken bench \
-  --url http://127.0.0.1:8008/v1/chat/completions \
-  --model Qwen3.6-27B \
-  --dataset foretoken/conversation.jsonl \
-  --parallel 4 \
-  --number 20 \
-  --wandb
-```
+Without `--output`, the benchmark prints a summary, writes local artifacts under `results/`, and attempts a W&B upload. If W&B is unavailable, local results remain available.
 
-Random synthetic prompts (tokenizer required):
+`--output` replaces the default output choices:
 
-```bash
-foretoken bench \
-  --url http://127.0.0.1:8008/v1/chat/completions \
-  --model Qwen3.6-27B \
-  --dataset random \
-  --tokenizer-path Qwen/Qwen3.6-27B \
-  --min-prompt-length 128 --max-prompt-length 512 \
-  --parallel 4 --number 20 --max-tokens 64 \
-  --rate 5 \
-  --wandb
-```
+| Goal | `--output` value |
+| --- | --- |
+| Default console, local artifacts, and W&B | omit `--output` |
+| Local artifacts only | `local` |
+| Local artifacts without console output | `local,quiet` |
+| Local artifacts and W&B without console output | `local,wandb,quiet` |
+| W&B only | `wandb` |
 
-HuggingFace dataset id (rows: `messages`, `prompt`, or `user`[+`system`]):
+To suppress console output while retaining results, combine `quiet` with `local`, `wandb`, or both. Use `--output-dir PATH` to change the local artifact directory.
 
-```bash
-foretoken bench \
-  --url http://127.0.0.1:8008/v1/chat/completions \
-  --model Qwen3.6-27B \
-  --dataset r0b0tlab/qwen3.8-max-distillation-50k:train \
-  --parallel 4 \
-  --number 20 \
-  --wandb
-```
+## Metrics
 
-Multiple JSONL / HuggingFace sources (comma-separated). `--number` is the
-**total** across all datasets (split evenly); each source runs sequentially,
-then raw results are merged and metrics recomputed. With `--wandb`, the
-experiment is one W&B **group** and each dataset is its own **run**:
+The summary includes request latency, time to first token (TTFT), time per output token (TPOT), failure rate, input/output token counts, and output throughput.
 
-```bash
-foretoken bench \
-  --url http://127.0.0.1:8008/v1/chat/completions \
-  --model Qwen3.6-27B \
-  --dataset /path/a.jsonl,org/name:train,/path/b.jsonl \
-  --parallel 4 \
-  --number 30 \
-  --wandb
-```
+For parameter sweeps, `token/s/user` means output throughput divided by the configured closed-loop `--parallel` value. It is not a count of real users or active sessions. In open-loop runs (`--rate`), its denominator is one, so it equals total output throughput. `token/s/GPU` divides output throughput by the configured GPU count for that point.
+
+A sweep always writes every valid point. It creates `pareto/PARETO.png` only when the sweep has at least two valid points.
+
+## Next steps
+
+Scenario recipes for datasets, random prompts, trace replay, prefix reuse, multiple datasets, and parameter sweeps are in [Benchmark examples](docs/examples.md). The command reference and result formats are exposed through `foretoken bench --help` and the generated local artifacts.

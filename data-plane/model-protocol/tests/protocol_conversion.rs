@@ -4,6 +4,7 @@
 //! Wire-shape contract for normalized vLLM KV lifecycle events.
 
 use foretoken_model_protocol::*;
+// Protects the cross-process KV event envelope and privacy-preserving removal payload.
 #[test]
 fn lifecycle_wire_shape_is_typed_and_hash_only_remove() {
     let placement = KvPlacement {
@@ -88,13 +89,4 @@ fn lifecycle_wire_shape_is_typed_and_hash_only_remove() {
         }))
         .is_err()
     );
-}
-
-#[test]
-fn kv_delta_query_requires_camel_case_data_parallel_rank() {
-    let query: KvDeltaQuery =
-        serde_json::from_str(r#"{"dpRank":1,"limit":16}"#).expect("camel-case query");
-    assert_eq!(query.dp_rank, 1);
-    assert!(serde_json::from_str::<KvDeltaQuery>(r#"{"limit":16}"#).is_err());
-    assert!(serde_json::from_str::<KvDeltaQuery>(r#"{"dp_rank":1}"#).is_err());
 }

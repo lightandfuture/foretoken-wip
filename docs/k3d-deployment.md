@@ -1,0 +1,245 @@
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: Copyright contributors to the Foretoken project -->
+
+# Deploy Foretoken with k3d
+
+[English](k3d-deployment.md) | [中文](k3d-deployment_zh.md)
+
+k3d runs the lightweight k3s Kubernetes distribution in Docker containers. It is well suited to creating an isolated, disposable Foretoken cluster on a shared GPU server while retaining standard Helm, CRDs, and Kubernetes APIs. All k3d cluster nodes run on one Docker host; use k3s or Kubernetes for deployments across physical machines.
+
+After creating the k3d cluster, install the shared Foretoken Kubernetes platform with `foretoken install`. Use `foretoken install -e .` to build its images from the current source tree instead of using release images. Source mode imports only changed local images into the active k3d cluster; model services are deployed separately.
+
+## How k3d restricts physical GPUs
+
+A standard Kubernetes Pod requests a GPU type and count:
+
+```yaml
+resources:
+  limits:
+    nvidia.com/gpu: 1
+```
+
+Pods do not specify host GPU indices. When creating Kubernetes node containers, k3d can first limit which devices Docker exposes:
+
+```text
+Host physical GPUs 6 and 7
+→ Docker --gpus '"device=6,7"'
+→ k3d node container
+→ k3s NVIDIA device plugin
+→ Foretoken Pod
+```
+
+## Prerequisites
+
+The host needs:
+
+- Python 3.10 or later;
+- Linux;
+- an NVIDIA driver;
+- NVIDIA Container Toolkit;
+- Docker configured to use the NVIDIA runtime; and
+- k3d, kubectl, and Helm.
+
+## 1. Enter the repository and select GPUs
+
+Run the remaining commands from the Foretoken repository root:
+
+```bash
+cd /path/to/your/foretoken
+```
+
+List GPUs:
+
+```bash
+nvidia-smi
+```
+
+The Quick Start workload requests one GPU, 8 CPU, and 52 GiB memory; allow additional capacity for the platform. The following example selects GPUs 6 and 7 and names the cluster `foretoken-qwen-test`:
+
+```bash
+export GPU_INDICES=6,7
+export CLUSTER=foretoken-qwen-test
+```
+
+## 2. Create a GPU-restricted k3d cluster
+
+The following Bash code finds the NVIDIA runtime, configuration, and dependent libraries, then prepares mount arguments for k3d:
+
+```bash
+declare -a K3D_VOLUME_ARGS=()
+declare -A K3D_MOUNTED_PATHS=()
+
+add_k3d_mount() {
+  local path="$1"
+  [ -e "$path" ] || return 0
+  [ -z "${K3D_MOUNTED_PATHS[$path]+x}" ] || return 0
+  K3D_MOUNTED_PATHS["$path"]=1
+  K3D_VOLUME_ARGS+=(--volume "$path:$path@server:0")
+}
+
+for NAME in \
+  nvidia-container-runtime \
+  nvidia-container-runtime-hook \
+  nvidia-container-cli \
+  nvidia-ctk; do
+  TOOL_PATH="$(command -v "$NAME")"
+  add_k3d_mount "$TOOL_PATH"
+
+  while read -r PATH_KIND LIBRARY_PATH; do
+    if [ "$PATH_KIND" = directory ]; then
+      add_k3d_mount "$(realpath -m "$(dirname "$LIBRARY_PATH")")"
+    else
+      add_k3d_mount "$LIBRARY_PATH"
+    fi
+  done < <(
+    ldd "$TOOL_PATH" |
+      awk '
+        $2 == "=>" && $3 ~ /^\// { print "directory", $3 }
+        $1 ~ /^\// { print "file", $1 }
+      '
+  )
+done
+
+for CONFIG_DIR in \
+  /etc/nvidia-container-runtime \
+  /usr/local/etc/nvidia-container-runtime; do
+  add_k3d_mount "$CONFIG_DIR"
+done
+
+for LDCONFIG_PATH in \
+  "$(command -v ldconfig)" \
+  /sbin/ldconfig.real \
+  /usr/sbin/ldconfig.real; do
+  add_k3d_mount "$LDCONFIG_PATH"
+done
+```
+
+Create a single-server cluster:
+
+```bash
+k3d cluster create "$CLUSTER" \
+  --config deploy/k3d/config.yaml \
+  --gpus "\"device=$GPU_INDICES\"" \
+  "${K3D_VOLUME_ARGS[@]}"
+```
+
+View the resulting nodes:
+
+```bash
+kubectl get nodes
+```
+
+## 3. Install the NVIDIA device plugin
+
+```bash
+kubectl apply -f \
+  https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/v0.17.4/deployments/static/nvidia-device-plugin.yml
+```
+
+Configure the inner NVIDIA runtime with the same host GPU list that k3d uses:
+
+```bash
+kubectl set env daemonset/nvidia-device-plugin-daemonset \
+  --namespace kube-system \
+  NVIDIA_VISIBLE_DEVICES="$GPU_INDICES"
+
+kubectl rollout status daemonset/nvidia-device-plugin-daemonset \
+  --namespace kube-system \
+  --timeout=3m
+```
+
+## 4. Install and access Foretoken
+
+Install the command-line tool with pip:
+
+```bash
+pip install -e .
+```
+
+Or create and activate a virtual environment with uv:
+
+```bash
+uv venv
+source .venv/bin/activate
+uv pip install -e .
+```
+
+### 4.1 Choose a deployment method
+
+- **Use release images**: continue with [section 4.2: Local mode](#42-local-mode) or [section 4.3: Gateway mode](#43-gateway-mode).
+- **Deploy from source in local mode**: run the complete commands below, then continue with [section 4.4: Send a request](#44-send-an-openai-api-compatible-request).
+
+```bash
+foretoken install -e .
+foretoken deploy examples/quickstart --timeout 6m
+FORETOKEN_FRONTEND_URL="$(foretoken endpoint examples/quickstart)"
+FORETOKEN_REQUEST_HOST="$(foretoken endpoint examples/quickstart --host)"
+```
+
+### 4.2 Local mode
+
+Install Foretoken from release images and deploy the Quick Start:
+
+```bash
+foretoken install
+
+foretoken deploy examples/quickstart --timeout 6m
+```
+
+Resolve the address that k3s ServiceLB assigns to the frontend:
+
+```bash
+FORETOKEN_FRONTEND_URL="$(foretoken endpoint examples/quickstart)"
+FORETOKEN_REQUEST_HOST="$(foretoken endpoint examples/quickstart --host)"
+```
+
+### 4.3 Gateway mode
+
+First, set the public hostname in `examples/quickstart/frontend.yaml`:
+
+```yaml
+spec:
+  hostname: foretoken.example.com
+```
+
+Install Gateway mode and deploy the Quick Start from release images. The command-line tool installs Envoy Gateway automatically when the cluster has no accepted Envoy controller:
+
+```bash
+foretoken install --frontend-mode gateway
+foretoken deploy examples/quickstart --timeout 6m
+```
+
+Resolve the configured Gateway endpoint:
+
+```bash
+FORETOKEN_FRONTEND_URL="$(foretoken endpoint examples/quickstart)"
+FORETOKEN_REQUEST_HOST="$(foretoken endpoint examples/quickstart --host)"
+```
+
+### 4.4 Send an OpenAI API-compatible request
+
+```bash
+curl "$FORETOKEN_FRONTEND_URL/v1/chat/completions" \
+  -H "Host: $FORETOKEN_REQUEST_HOST" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "Qwen/Qwen3-0.6B",
+    "messages": [{"role": "user", "content": "Reply with: Foretoken is ready"}],
+    "max_tokens": 32,
+    "temperature": 0
+  }'
+printf '\n'
+```
+
+Foretoken YAML continues to request standard `nvidia.com/gpu` resources; host GPU selection occurs when the k3d cluster is created.
+
+
+## 5. Clean up
+
+Delete the cluster:
+
+```bash
+k3d cluster delete "$CLUSTER"
+```
+
+Deleting the cluster stops every Pod in it, removes its Kubernetes resources, and releases the GPUs passed to the k3d node containers.

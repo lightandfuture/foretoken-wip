@@ -57,6 +57,31 @@ type NormalizedKVCache struct {
 	MooncakeStore *NormalizedMooncakeStore `json:"mooncakeStore,omitempty"`
 }
 
+// RuntimeCacheBinding identifies the persistent runtime cache shared by serving workloads.
+type RuntimeCacheBinding struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	ClaimName string `json:"claimName"`
+
+	// +kubebuilder:validation:MinLength=2
+	// +kubebuilder:validation:MaxLength=1024
+	// +kubebuilder:validation:Pattern="^/"
+	MountPath string `json:"mountPath"`
+}
+
+// RuntimeSourceAccess contains optional source settings consumed by the runtime adapter.
+type RuntimeSourceAccess struct {
+	// Endpoint is interpreted by the selected runtime adapter.
+	// +optional
+	Endpoint string `json:"endpoint,omitempty"`
+
+	// TokenSecretName and TokenSecretKey identify an optional namespace-local credential.
+	// +optional
+	TokenSecretName string `json:"tokenSecretName,omitempty"`
+	// +optional
+	TokenSecretKey string `json:"tokenSecretKey,omitempty"`
+}
+
 // NormalizedPoolTemplate is the normalized configuration produced from ModelService intent.
 // Platform runtime and accelerator resolution may further constrain it before Groups are created.
 // +kubebuilder:validation:XValidation:rule="self.memberCount == self.nodeCount",message="memberCount must equal nodeCount in v1alpha1"
@@ -80,6 +105,14 @@ type NormalizedPoolTemplate struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=256
 	TokenizerRevision string `json:"tokenizerRevision,omitempty"`
+
+	// RuntimeCache is set by the ModelService controller when persistent runtime caching is enabled.
+	// +optional
+	RuntimeCache *RuntimeCacheBinding `json:"runtimeCache,omitempty"`
+
+	// SourceAccess is set by the ModelService controller from the selected runtime profile.
+	// +optional
+	SourceAccess *RuntimeSourceAccess `json:"sourceAccess,omitempty"`
 
 	// +kubebuilder:validation:Enum=vllm;sglang
 	Backend string `json:"backend"`

@@ -8,5 +8,6 @@ compile_error!("exactly one backend feature (vllm or sglang) may be enabled");
 
 pub mod core;
 pub mod engine;
+pub mod runtime_cache;
 #[doc(hidden)]
 pub mod runtime_transport;

@@ -3,13 +3,16 @@
 
 //! Scored-candidate selection and Picker implementations.
 
-mod max_picker;
-mod round_robin_picker;
+use crate::{CandidateIndex, RouterRequest, RoutingProgress, ScoredCandidate};
 
-use crate::{CandidateIndex, RouterRequest, ScoredCandidate};
-
-pub use max_picker::MaxPicker;
-pub use round_robin_picker::RoundRobinPicker;
+// Each entry declares the module, re-exports the implementation, and binds its user-facing Picker name.
+// For example, `round_robin_picker => RoundRobinPicker = "round_robin"` maps
+// `round_robin_picker.rs`, the `RoundRobinPicker` type, and the user-facing name.
+declare_router_algorithms! {
+    descriptor = PickerDescriptor;
+    max_picker => MaxPicker = "max",
+    round_robin_picker => RoundRobinPicker = "round_robin",
+}
 
 /// Selects one route target from the scored candidates available in the current routing stage.
 ///
@@ -18,9 +21,10 @@ pub use round_robin_picker::RoundRobinPicker;
 /// empty result for a nonempty slice as a routing error.
 ///
 /// - `request`: model, prompt tokens, sampling, multimodal, LoRA, and priority.
-/// - `scored_candidates`: current-stage candidates with route target metadata and `RouteScore` locality
-///   and load values.
-/// - `customized_context`: user-defined `C`, created per request and shared by Prefill and Decode.
+/// - `scored_candidates`: current-stage candidates with route target metadata and numeric or
+///   lexicographic `RouteScore` preferences.
+/// - `routing_progress`: immutable E/P/D selection round and progress supplied by `RouteSession`.
+/// - `customized_context`: user-defined `C`, created per request and shared across E/P/D rounds.
 ///
 /// Returns the selected position in `scored_candidates`, or `None` when the list is empty.
 pub trait RoutePicker<C: Send + 'static = ()>: Send + Sync {
@@ -28,6 +32,7 @@ pub trait RoutePicker<C: Send + 'static = ()>: Send + Sync {
         &self,
         request: &RouterRequest,
         scored_candidates: &[ScoredCandidate],
+        routing_progress: &RoutingProgress<'_>,
         customized_context: &mut C,
     ) -> Option<CandidateIndex>;
 }

@@ -26,6 +26,7 @@ import (
 	inferencev1alpha1 "github.com/shiweijiezero/foretoken/control-plane/api/v1alpha1"
 	"github.com/shiweijiezero/foretoken/control-plane/controllers"
 	"github.com/shiweijiezero/foretoken/control-plane/internal/resolver"
+	"github.com/shiweijiezero/foretoken/control-plane/internal/runtimeconfig"
 )
 
 const (
@@ -74,6 +75,11 @@ func main() {
 	var autoscalingTelemetryRequestTimeout time.Duration
 	var autoscalingTelemetryConcurrency int
 	var workloadImagePullSecretNames []string
+	var cacheClaimName string
+	var cacheMountPath string
+	var modelSourceEndpoint string
+	var modelSourceTokenSecretName string
+	var modelSourceTokenSecretKey string
 
 	// Metrics stay disabled until the chart exposes a secured endpoint.
 	flag.StringVar(&metricsAddress, "metrics-bind-address", "0", "Metrics endpoint bind address; 0 disables metrics.")
@@ -96,6 +102,11 @@ func main() {
 		workloadImagePullSecretNames = append(workloadImagePullSecretNames, value)
 		return nil
 	})
+	flag.StringVar(&cacheClaimName, "cache-claim", "", "Existing namespace-local PVC shared by runtime workloads.")
+	flag.StringVar(&cacheMountPath, "cache-mount-path", "/var/cache/foretoken", "Absolute runtime cache root mounted into workload Pods.")
+	flag.StringVar(&modelSourceEndpoint, "model-source-endpoint", "", "Optional model source endpoint interpreted by the runtime adapter.")
+	flag.StringVar(&modelSourceTokenSecretName, "model-source-token-secret-name", "", "Namespace-local Secret containing the model source credential.")
+	flag.StringVar(&modelSourceTokenSecretKey, "model-source-token-secret-key", "", "Key in the model source credential Secret.")
 	flag.StringVar(&inferenceEngineProfileRevision, "inference-engine-profile-revision", "default", "Opaque revision of the configured inference engine profile.")
 	flag.StringVar(&vllmEngineImage, "vllm-engine-image", "", "vLLM inference engine image containing the Foretoken model-server adapter.")
 	flag.StringVar(&sglangEngineImage, "sglang-engine-image", "", "SGLang inference engine image containing the Foretoken model-server adapter.")
@@ -130,7 +141,17 @@ func main() {
 	for index, name := range workloadImagePullSecretNames {
 		workloadImagePullSecrets[index] = corev1.LocalObjectReference{Name: name}
 	}
+	cacheProfile := controllers.RuntimeCacheProfile{ClaimName: cacheClaimName, MountPath: cacheMountPath}
+	sourceProfile := controllers.RuntimeSourceProfile{Endpoint: modelSourceEndpoint, TokenSecretName: modelSourceTokenSecretName, TokenSecretKey: modelSourceTokenSecretKey}
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&logOptions)))
+	if err := cacheProfile.Validate(); err != nil {
+		ctrl.Log.Error(err, "invalid runtime cache profile")
+		os.Exit(1)
+	}
+	if err := sourceProfile.Validate(); err != nil {
+		ctrl.Log.Error(err, "invalid runtime source profile")
+		os.Exit(1)
+	}
 	if modelServerPort < 1 || modelServerPort > 65535 {
 		ctrl.Log.Error(errors.New("model-server-port must be between 1 and 65535"), "invalid inference engine profile")
 		os.Exit(1)
@@ -143,8 +164,32 @@ func main() {
 		ctrl.Log.Error(errors.New("frontend-mode must be local or gateway"), "invalid frontend profile")
 		os.Exit(1)
 	}
-	if vllmPDProfileName != "" && (vllmPDBootstrapPort < 1 || vllmPDBootstrapPort > 65535 || vllmPDAbortRequestTimeoutSeconds < 1 || int64(vllmPDAbortRequestTimeoutSeconds) > int64(1<<31-1) || vllmPDRDMAResourceCount < 1 || int64(vllmPDRDMAResourceCount) > int64(1<<31-1)) {
-		ctrl.Log.Error(errors.New("vLLM P/D numeric settings are outside their supported ranges"), "invalid P/D profile")
+	if err := (runtimeconfig.Profiles{
+		EC: runtimeconfig.ECProfile{
+			Name: vllmECProfileName, Revision: vllmECProfileRevision,
+			Connector:          vllmECConnector,
+			SharedStorageClaim: vllmECSharedStorageClaim,
+			SharedStoragePath:  vllmECSharedStoragePath,
+		},
+		PD: runtimeconfig.PDProfile{
+			Name:                       vllmPDProfileName,
+			Revision:                   vllmPDProfileRevision,
+			Protocol:                   vllmPDProtocol,
+			BootstrapPort:              vllmPDBootstrapPort,
+			AbortRequestTimeoutSeconds: vllmPDAbortRequestTimeoutSeconds,
+			RDMADeviceName:             vllmPDRDMADeviceName,
+			RDMAResourceName:           vllmPDRDMAResourceName,
+			RDMAResourceCount:          vllmPDRDMAResourceCount,
+		},
+		MooncakeStore: runtimeconfig.MooncakeStoreProfile{
+			Name:           vllmMooncakeStoreProfileName,
+			Revision:       vllmMooncakeStoreProfileRevision,
+			ConfigMapName:  vllmMooncakeStoreConfigMapName,
+			ConfigMapKey:   vllmMooncakeStoreConfigMapKey,
+			PythonHashSeed: vllmMooncakeStorePythonHashSeed,
+		},
+	}).Validate(); err != nil {
+		ctrl.Log.Error(err, "invalid vLLM runtime profile")
 		os.Exit(1)
 	}
 	var mooncakePD *resolver.MooncakePDProfile
@@ -222,6 +267,10 @@ func main() {
 	}
 
 	// Controllers are registered explicitly so each resource keeps one lifecycle owner.
+	if err := (&controllers.RuntimeCacheReconciler{Client: manager.GetClient()}).SetupWithManager(manager); err != nil {
+		ctrl.Log.Error(err, "unable to register RuntimeCache controller")
+		os.Exit(1)
+	}
 	if frontendEnabled {
 		var gateway *controllers.GatewayParent
 		if frontendMode == frontendModeGateway {
@@ -232,8 +281,9 @@ func main() {
 			}
 		}
 		frontendReconciler := &controllers.FrontendServiceReconciler{
-			Client:    manager.GetClient(),
-			APIReader: manager.GetAPIReader(),
+			Client:       manager.GetClient(),
+			APIReader:    manager.GetAPIReader(),
+			CacheProfile: cacheProfile,
 			RuntimeProfile: controllers.FrontendRuntimeProfile{
 				Image:            frontendImage,
 				Port:             int32(frontendPort),
@@ -247,8 +297,10 @@ func main() {
 		}
 	}
 	if err := (&controllers.ModelServiceReconciler{
-		Client: manager.GetClient(),
-		PoolMetricsProvider: controllers.NewHTTPPoolMetricsProvider(manager.GetClient(), controllers.AutoscalingTelemetryOptions{
+		Client:        manager.GetClient(),
+		CacheProfile:  cacheProfile,
+		SourceProfile: sourceProfile,
+		MetricsProvider: controllers.NewHTTPScalingMetricsProvider(manager.GetClient(), controllers.AutoscalingTelemetryOptions{
 			CollectionTimeout: autoscalingTelemetryCollectionTimeout,
 			RequestTimeout:    autoscalingTelemetryRequestTimeout,
 			Concurrency:       autoscalingTelemetryConcurrency,

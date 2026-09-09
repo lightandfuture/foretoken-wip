@@ -13,7 +13,7 @@ We aim to turn an inference cluster into a token factory that continuously conve
 - Route requests based on load, queue depth, or KV cache state.
 - Autoscale inference instances based on traffic and SLO targets.
 - Compare aggregated serving, Prefill/Decode disaggregation, and different parallelism strategies.
-- Use the same orchestration stack across NVIDIA, MetaX, Huawei Ascend, and other accelerators.
+- Use the same orchestration stack across NVIDIA and MetaX accelerators.
 
 If you only need to serve a single model on one GPU, using an inference engine such as vLLM directly is usually enough.
 
@@ -23,199 +23,131 @@ If you only need to serve a single model on one GPU, using an inference engine s
 |---|---|---|
 | Benchmarking | Performance benchmarks and parameter sweeps, correctness evaluation, and SLO simulation | In development |
 | Profiling | Use PyTorch Profiler and Nsight to identify compute, communication, and CPU/GPU bottlenecks | Planned |
-| Hardware support | Common interfaces for device capabilities, runtimes, communication, and metrics | In development |
+| Hardware support | Common interfaces for device capabilities, runtimes, communication, and metrics; see [MetaX deployment](docs/metax-deployment.md) | In development |
 | Request routing | Select instances based on load, queues, KV reuse, and service levels | Research |
 | Distributed inference | Aggregated serving, Prefill/Decode disaggregation, and WideEP parallelism | Research |
-| Control plane | Model services, instance groups, autoscaling, updates, and failure recovery | Planned |
-| Deployment and observability | Kubernetes deployment, metrics, dashboards, and alerts | Planned |
+| Control plane | Model services, replica management, autoscaling, updates, and failure recovery | In development |
+| [Observability](observability/README.md) | Collect runtime metrics, evaluate alerts, and profile CPU/GPU bottlenecks | In development |
 
 ## Quick Start
 
-The deployment and cleanup steps are the same in both access modes. Choose one mode when installing Foretoken.
+This Quick Start requires Python 3.10+, Kubernetes with an expandable default `StorageClass`, `kubectl`, Helm, one GPU, and a working `LoadBalancer` (k3s ServiceLB is sufficient for k3d). See the [k3d guide](docs/k3d-deployment.md) for a single-machine test cluster.
 
-### 1. Install Foretoken
+### 1. Install the command-line tool
 
-#### Local mode
-
-Local mode obtains an address from a `LoadBalancer` Service, so the cluster must support that Service type:
+Install the published command-line tool package:
 
 ```bash
-helm upgrade --install foretoken \
-  oci://ghcr.io/shiweijiezero/foretoken/charts/foretoken \
-  --namespace foretoken-platform \
-  --create-namespace \
-  --set frontend.enabled=true \
-  --set frontend.mode=local \
-  --wait
+pip install foretoken
+
+# For source installation from the repository:
+# pip install -e .
 ```
 
-#### Gateway mode
+### 2. Install the Kubernetes platform
 
-First set the public hostname under `spec` in `examples/quickstart/frontend.yaml`:
+By default, installation uses the Foretoken images published on GHCR:
+
+```bash
+# Release images:
+foretoken install
+
+# Source installation from the repository:
+# foretoken install -e .
+```
+
+This installs the Foretoken CRDs and controller in the `foretoken-platform` namespace and waits for the controller to become ready. The default mode exposes the frontend through a `LoadBalancer` Service. Source installation rebuilds the images and updates the cluster; to deploy the current source to a remote cluster, see the [source deployment guide](docs/custom-deployment.md).
+
+### 3. Deploy the Quick Start
+
+```bash
+foretoken deploy examples/quickstart
+```
+
+This example deploys one frontend service, one `Qwen/Qwen3-0.6B` model replica, and an automatically expanding runtime cache PVC starting at 10 GiB. The workload requests one GPU, 8 CPU, and 52 GiB memory; allow additional capacity for the platform. See the [single-model example](examples/quickstart/README.md) for its resource configuration and [`examples/`](examples/) for more deployments.
+
+### 4. Send a test request
+
+```bash
+FORETOKEN_FRONTEND_URL="$(foretoken endpoint examples/quickstart)"
+
+curl --fail-with-body --no-buffer \
+  "$FORETOKEN_FRONTEND_URL/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+### 5. Run a benchmark
+
+```bash
+pip install 'foretoken[bench]'
+
+# For source installation from the repository:
+# pip install -e .
+# pip install -e '.[bench]'
+foretoken bench examples/quickstart
+```
+
+See [Benchmarking](benchmarks/README.md) for datasets, remote endpoints, result storage, and parameter sweeps.
+
+## Gateway Mode
+
+Gateway mode provides a shared entry point through Kubernetes Gateway and a hostname. It suits clusters that already use Gateway or manage external traffic centrally.
+
+Foretoken creates its default Gateway for Envoy Gateway. Install Envoy Gateway, then add the public hostname under `spec` in `examples/quickstart/frontend.yaml`:
 
 ```yaml
 spec:
   hostname: foretoken.example.com
 ```
 
-Gateway mode requires a Gateway Controller. This example installs Envoy Gateway:
+Then run:
 
 ```bash
+# Install Envoy Gateway
 helm upgrade --install envoy-gateway \
   oci://docker.io/envoyproxy/gateway-helm \
   --namespace envoy-gateway-system \
   --create-namespace \
   --wait
-```
 
-Then let the Foretoken Chart create a dedicated `GatewayClass` and `Gateway`:
+# Install the platform in Gateway mode
+foretoken install --frontend-mode gateway
 
-```bash
-helm upgrade --install foretoken \
-  oci://ghcr.io/shiweijiezero/foretoken/charts/foretoken \
-  --namespace foretoken-platform \
-  --create-namespace \
-  --set frontend.enabled=true \
-  --set frontend.mode=gateway \
-  --set frontend.gateway.create=true \
-  --wait
-```
+# Deploy the Quick Start
+foretoken deploy examples/quickstart
 
-If the platform already has a suitable `Gateway`, first list its name and namespace:
+# Resolve the Gateway address and request hostname
+FORETOKEN_FRONTEND_URL="$(foretoken endpoint examples/quickstart)"
+FORETOKEN_REQUEST_HOST="$(foretoken endpoint examples/quickstart --host)"
 
-```bash
-kubectl get gateway -A
-```
-
-For example:
-
-```text
-NAMESPACE        NAME
-gateway-system   inference-gateway
-```
-
-Do not set `frontend.gateway.create=true`. Instead, use these values in the Foretoken installation command above:
-
-```bash
---set frontend.gateway.name=inference-gateway \
---set frontend.gateway.namespace=gateway-system \
---set frontend.gateway.sectionName=https
-```
-
-`name` comes from the `NAME` column, `namespace` from `NAMESPACE`, and `sectionName` is the listener name selected from that Gateway. The Gateway must allow `HTTPRoute` resources from the frontend namespace; DNS and TLS remain owned by the platform Gateway.
-
-### 2. Deploy a model service
-
-`examples/quickstart/kustomization.yaml` is the deployment entrypoint. It organizes the frontend and model services, while the Operator creates and manages the underlying resources.
-
-```bash
-kubectl apply --server-side -k examples/quickstart
-```
-
-### 3. Wait for serving to become ready
-
-```bash
-kubectl wait --for=condition=Ready \
-  --namespace foretoken-demo \
-  --timeout=15m \
-  frontendservice/quickstart-frontend \
-  modelservice/quickstart-qwen3-0.6b
-```
-
-### 4. Send a generation request
-
-#### Local mode
-
-Read the frontend address and send the request:
-
-```bash
-kubectl wait --for=jsonpath='{.status.loadBalancer.ingress}' \
-  --namespace foretoken-demo \
-  --timeout=5m \
-  service/quickstart-frontend
-
-FORETOKEN_FRONTEND_ADDRESS=$(kubectl get service quickstart-frontend \
-  --namespace foretoken-demo \
-  -o jsonpath='{.status.loadBalancer.ingress[0].ip}{.status.loadBalancer.ingress[0].hostname}')
-
+# Send a test request
 curl --fail-with-body --no-buffer \
-  "http://${FORETOKEN_FRONTEND_ADDRESS}:8080/v1/chat/completions" \
+  "$FORETOKEN_FRONTEND_URL/v1/chat/completions" \
+  -H "Host: $FORETOKEN_REQUEST_HOST" \
   -H "Content-Type: application/json" \
-  -d '{"model":"quickstart-qwen3-0.6b","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+  -d '{"model":"Qwen/Qwen3-0.6B","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 ```
 
-#### Gateway mode
-
-For the Chart-created HTTP Gateway, read its address and send the configured hostname:
-
-```bash
-FORETOKEN_GATEWAY_ADDRESS=$(kubectl get gateway foretoken-gateway \
-  --namespace foretoken-platform \
-  -o jsonpath='{.status.addresses[0].value}')
-
-curl --fail-with-body --no-buffer \
-  "http://${FORETOKEN_GATEWAY_ADDRESS}/v1/chat/completions" \
-  -H "Host: foretoken.example.com" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"quickstart-qwen3-0.6b","messages":[{"role":"user","content":"Hello"}],"stream":true}'
-```
-
-When reusing a platform Gateway, use that Gateway's configured hostname, port, and TLS settings.
+See the [command-line tool guide](cli/README.md) to reuse a Gateway from another controller, select a listener, or configure TLS.
 
 ## Stop and Uninstall
 
-Delete the serving configuration so the Operator can stop the service and clean up its resources:
-
 ```bash
-kubectl delete --wait=true --timeout=10m \
-  -k examples/quickstart
+# Delete the Quick Start resources, including its namespace and runtime cache PVC
+foretoken delete examples/quickstart
+
+# Uninstall the Foretoken platform
+foretoken uninstall
 ```
 
-After the serving resources are gone, uninstall Foretoken:
+The uninstall command preserves Foretoken CRDs and reused cluster components. It removes the platform and the monitoring or Gateway resources managed by the command-line tool.
 
-```bash
-helm uninstall foretoken \
-  --namespace foretoken-platform \
-  --wait --timeout 5m
-```
+## Deployment Guides
 
-A `GatewayClass` and `Gateway` created with `frontend.gateway.create=true` are removed with the Foretoken release; a reused platform Gateway is left unchanged.
-
-If Envoy Gateway was installed only for this Foretoken deployment, uninstall it as well:
-
-```bash
-helm uninstall envoy-gateway \
-  --namespace envoy-gateway-system \
-  --wait --timeout 5m
-```
-
-Do not run this step while other services still use Envoy Gateway.
-
-Uninstalling the control plane preserves Foretoken CRDs and custom resources. Delete the CRDs explicitly only after all Foretoken resources have been removed:
-
-```bash
-kubectl delete crd \
-  frontendservices.inference.foretoken.io \
-  kvservices.inference.foretoken.io \
-  kvpools.inference.foretoken.io \
-  kvgroups.inference.foretoken.io \
-  modelservices.inference.foretoken.io \
-  modelpools.inference.foretoken.io \
-  modelgroups.inference.foretoken.io
-```
-
-## Install from Source
-
-Use the local Chart from a source checkout:
-
-```bash
-helm upgrade --install foretoken ./deploy/charts/foretoken \
-  --namespace foretoken-platform \
-  --create-namespace \
-  --set frontend.enabled=true \
-  --set frontend.mode=local \
-  --wait
-```
+- [Source builds and private registries](docs/custom-deployment.md)
+- [Single-machine GPU clusters with k3d](docs/k3d-deployment.md)
+- [MetaX GPUs](docs/metax-deployment.md)
 
 ## Related Projects
 
@@ -227,9 +159,15 @@ helm upgrade --install foretoken ./deploy/charts/foretoken \
 
 ## Contributing
 
-Contributions to deployment baselines, hardware support, benchmarking, routing and autoscaling algorithms, tests, and documentation are welcome.
+Contributions of all kinds are welcome, including code, documentation, tests, design discussions, issue reports, and improvements to deployment, hardware, benchmarking, routing, and autoscaling.
 Performance-related changes should include the test setup, raw results, and reproducible commands.
 See [Contributing to Foretoken](CONTRIBUTING.md) for development principles, collaboration expectations, and the pull request workflow.
+
+Thank you to everyone who has contributed to Foretoken.
+
+<a href="https://github.com/shiweijiezero/foretoken/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=shiweijiezero/foretoken" alt="Foretoken contributors" />
+</a>
 
 ## License
 

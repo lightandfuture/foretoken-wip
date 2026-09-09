@@ -20,27 +20,22 @@ type FrontendTimeouts struct {
 	StreamIdle Duration `json:"streamIdle"`
 }
 
-// RouterFilterAlgorithm identifies a compiled Router Filter.
-// +kubebuilder:validation:Enum=allow_all
+// RouterFilterAlgorithm names a Filter validated by the selected Frontend image.
 type RouterFilterAlgorithm string
 
-// RouterScorerAlgorithm identifies a compiled Router Scorer.
-// +kubebuilder:validation:Enum=uniform;least_loaded;kv_least_loaded
+// RouterScorerAlgorithm names a Scorer validated by the selected Frontend image.
 type RouterScorerAlgorithm string
 
-// RouterPickerAlgorithm identifies a compiled Router Picker.
-// +kubebuilder:validation:Enum=max;round_robin
+// RouterPickerAlgorithm names a Picker validated by the selected Frontend image.
 type RouterPickerAlgorithm string
 
 const (
-	RouterFilterAllowAll RouterFilterAlgorithm = "allow_all"
-
-	RouterScorerUniform       RouterScorerAlgorithm = "uniform"
-	RouterScorerLeastLoaded   RouterScorerAlgorithm = "least_loaded"
-	RouterScorerKVLeastLoaded RouterScorerAlgorithm = "kv_least_loaded"
-
-	RouterPickerMax        RouterPickerAlgorithm = "max"
-	RouterPickerRoundRobin RouterPickerAlgorithm = "round_robin"
+	// DefaultRouterFilter is applied by the API when a Filter is omitted.
+	DefaultRouterFilter RouterFilterAlgorithm = "allow_all"
+	// DefaultRouterScorer is applied by the API when a Scorer is omitted.
+	DefaultRouterScorer RouterScorerAlgorithm = "kv_least_loaded"
+	// DefaultRouterPicker is applied by the API when a Picker is omitted.
+	DefaultRouterPicker RouterPickerAlgorithm = "round_robin"
 )
 
 // RouterPipeline selects each independently composable routing algorithm stage.
@@ -69,6 +64,7 @@ type FrontendServiceSpec struct {
 	Timeouts  FrontendTimeouts  `json:"timeouts"`
 
 	// +optional
+	// +kubebuilder:default={}
 	RouterPipeline RouterPipeline `json:"routerPipeline,omitempty"`
 
 	// Hostname is required when the platform exposes frontends through a Gateway.

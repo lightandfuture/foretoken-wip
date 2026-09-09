@@ -7,9 +7,13 @@
 from __future__ import annotations
 
 import logging
+import random
+from collections import defaultdict
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from evalscope.perf.arguments import Arguments
 from evalscope.perf.plugin.datasets.random_dataset import RandomDatasetPlugin
 from huggingface_hub import snapshot_download
@@ -17,6 +21,7 @@ from huggingface_hub import snapshot_download
 from benchmarks.config import BenchConfig
 
 logger = logging.getLogger(__name__)
+_MOONCAKE_BLOCK_TOKENS = 512
 
 # Hub file patterns kept when resolving a remote ``--tokenizer-path``.
 _TOKENIZER_ALLOW_PATTERNS = (
@@ -34,7 +39,7 @@ _TOKENIZER_ALLOW_PATTERNS = (
 def resolve_tokenizer_path(tokenizer_path: str) -> str:
     """Resolve ``tokenizer_path`` to a local directory.
 
-    Existing local paths are returned as-is; HuggingFace repo ids are fetched
+    Existing local paths are returned as-is; Hugging Face repo ids are fetched
     with ``_TOKENIZER_ALLOW_PATTERNS`` only.
     """
     local = Path(tokenizer_path).expanduser()
@@ -42,7 +47,7 @@ def resolve_tokenizer_path(tokenizer_path: str) -> str:
         return str(local.resolve())
 
     logger.info(
-        "Resolving tokenizer from HuggingFace repo %r",
+        "Resolving tokenizer from Hugging Face repo %r",
         tokenizer_path,
     )
     return snapshot_download(
@@ -52,28 +57,34 @@ def resolve_tokenizer_path(tokenizer_path: str) -> str:
 
 
 def _build_perf_arguments(
-    config: BenchConfig, *, tokenizer_path: str
+    config: BenchConfig,
+    *,
+    tokenizer_path: str,
+    number: int,
+    min_prompt_length: int,
+    max_prompt_length: int,
 ) -> Arguments:
     """Map ``BenchConfig`` to EvalScope ``Arguments`` for random generation."""
     dataset = config.dataset
-    apply_chat = dataset.resolve_apply_chat_template(config.target.url)
+    apply_chat = dataset.resolve_apply_chat_template(config.endpoint.url)
     return Arguments.model_construct(
-        model=config.target.model,
-        url=config.target.url,
-        api_key=config.target.api_key or None,
+        model=config.endpoint.model,
+        url=config.endpoint.url,
+        api_key=config.endpoint.api_key,
         dataset="random",
         tokenizer_path=tokenizer_path,
-        number=config.load.number[0],
-        parallel=config.load.parallel[0],
-        rate=float(config.load.rate[0]),
+        number=number,
+        parallel=config.load.parallel,
+        rate=float(config.load.rate),
         open_loop=config.load.open_loop,
-        min_prompt_length=dataset.min_prompt_length,
-        max_prompt_length=dataset.max_prompt_length,
+        min_prompt_length=min_prompt_length,
+        max_prompt_length=max_prompt_length,
         prefix_length=dataset.prefix_length,
         dataset_offset=dataset.dataset_offset,
         apply_chat_template=apply_chat,
         tokenize_prompt=False,
         dataset_args={},
+        seed=dataset.random_seed,
         num_workers=0,
         warmup_num=0,
         max_tokens=config.generation.max_tokens,
@@ -97,27 +108,166 @@ def _to_request(message: Any) -> dict[str, Any]:
     raise TypeError(f"Unexpected message type: {type(message)!r}")
 
 
-def generate_random_requests(config: BenchConfig) -> list[dict[str, Any]]:
-    """Build ``number`` random requests from the benchmark config."""
+def _generate_random_requests(
+    config: BenchConfig,
+    *,
+    tokenizer_path: str,
+    number: int,
+    min_prompt_length: int,
+    max_prompt_length: int,
+) -> list[dict[str, Any]]:
+    arguments = _build_perf_arguments(
+        config,
+        tokenizer_path=tokenizer_path,
+        number=number,
+        min_prompt_length=min_prompt_length,
+        max_prompt_length=max_prompt_length,
+    )
+    return _collect_random_requests(RandomDatasetPlugin(arguments), number)
+
+
+def _collect_random_requests(
+    plugin: RandomDatasetPlugin,
+    number: int,
+) -> list[dict[str, Any]]:
+    """Collect exactly ``number`` requests from an initialized plugin."""
+    requests: list[dict[str, Any]] = []
+    for message in plugin.build_messages():
+        requests.append(_to_request(message))
+        if len(requests) >= number:
+            break
+    if len(requests) < number:
+        raise RuntimeError(
+            f"Random dataset yielded {len(requests)} messages, need {number}"
+        )
+    return requests
+
+
+def generate_random_requests(
+    config: BenchConfig,
+    *,
+    number: int | None = None,
+    input_lengths: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Build random requests, optionally matching per-request input lengths."""
     dataset = config.dataset
     if not dataset.tokenizer_path:
         raise ValueError(
             "tokenizer_path is required for random data generation"
         )
 
+    np.random.seed(dataset.random_seed)
     tokenizer_path = resolve_tokenizer_path(dataset.tokenizer_path)
-    arguments = _build_perf_arguments(config, tokenizer_path=tokenizer_path)
-    plugin = RandomDatasetPlugin(arguments)
-
-    number = config.load.number[0]
-    requests: list[dict[str, Any]] = []
-    for message in plugin.build_messages():
-        requests.append(_to_request(message))
-        if len(requests) >= number:
-            break
-
-    if len(requests) < number:
-        raise RuntimeError(
-            f"Random dataset yielded {len(requests)} messages, need {number}"
+    if input_lengths is None:
+        count = config.load.number if number is None else number
+        return _generate_random_requests(
+            config,
+            tokenizer_path=tokenizer_path,
+            number=count,
+            min_prompt_length=dataset.min_prompt_length,
+            max_prompt_length=dataset.max_prompt_length,
         )
+
+    if not input_lengths:
+        return []
+
+    if number is not None and number != len(input_lengths):
+        raise ValueError("number must match input_lengths")
+    positions: dict[int, list[int]] = defaultdict(list)
+    for index, input_length in enumerate(input_lengths):
+        positions[input_length].append(index)
+
+    arguments = _build_perf_arguments(
+        config,
+        tokenizer_path=tokenizer_path,
+        number=len(input_lengths),
+        min_prompt_length=min(input_lengths),
+        max_prompt_length=max(input_lengths),
+    )
+    plugin = RandomDatasetPlugin(arguments)
+    requests: list[dict[str, Any] | None] = [None] * len(input_lengths)
+    for input_length, indexes in positions.items():
+        plugin.query_parameters.min_prompt_length = input_length
+        plugin.query_parameters.max_prompt_length = input_length
+        plugin.number = len(indexes)
+        generated = _collect_random_requests(plugin, len(indexes))
+        for index, request in zip(indexes, generated):
+            requests[index] = request
+    if any(request is None for request in requests):
+        raise RuntimeError("Random dataset generation returned missing requests")
+    return [request for request in requests if request is not None]
+
+
+def generate_synthetic_prefix_reuse_requests(
+    config: BenchConfig,
+    *,
+    input_lengths: list[int],
+    hash_id_lists: list[list[int] | None],
+) -> list[dict[str, Any]]:
+    """Build deterministic Mooncake-prefix payloads from ``hash_ids``.
+
+    Each hash id maps to a fixed synthetic 512-token block. A request joins
+    its blocks in trace order and truncates the final block to ``input_length``.
+    """
+    dataset = config.dataset
+    if not dataset.tokenizer_path:
+        raise ValueError(
+            "tokenizer_path is required for random data generation"
+        )
+    if len(input_lengths) != len(hash_id_lists):
+        raise ValueError("input_lengths must match hash_id_lists")
+
+    from transformers import AutoTokenizer
+
+    tokenizer_path = resolve_tokenizer_path(dataset.tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    vocab_size = int(tokenizer.vocab_size)
+    special_ids = set(tokenizer.all_special_ids)
+    allowed_token_ids = [
+        token_id
+        for token_id in range(vocab_size)
+        if token_id not in special_ids
+    ]
+    if not allowed_token_ids:
+        raise ValueError("Tokenizer has no non-special tokens")
+
+    @lru_cache(maxsize=1024)
+    def block_for(hash_id: int) -> tuple[int, ...]:
+        generator = random.Random(dataset.random_seed + hash_id)
+        return tuple(
+            generator.choice(allowed_token_ids)
+            for _ in range(_MOONCAKE_BLOCK_TOKENS)
+        )
+
+    requests: list[dict[str, Any]] = []
+    for input_length, hash_ids in zip(input_lengths, hash_id_lists):
+        if hash_ids is None:
+            raise ValueError(
+                "--trace-synthetic-prefix-reuse requires hash_ids on every "
+                "selected trace event"
+            )
+        expected_blocks = (
+            input_length + _MOONCAKE_BLOCK_TOKENS - 1
+        ) // _MOONCAKE_BLOCK_TOKENS
+        if len(hash_ids) != expected_blocks:
+            raise ValueError(
+                "Mooncake hash_ids must cover every 512-token input block; "
+                f"got {len(hash_ids)} hash_ids for input_length={input_length}"
+            )
+
+        prompt_token_ids = [
+            token_id
+            for hash_id in hash_ids
+            for token_id in block_for(hash_id)
+        ][:input_length]
+        prompt = tokenizer.decode(
+            prompt_token_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        if not prompt:
+            raise ValueError(
+                "Tokenizer produced an empty synthetic prefix-reuse prompt"
+            )
+        requests.append({"prompt": prompt})
     return requests

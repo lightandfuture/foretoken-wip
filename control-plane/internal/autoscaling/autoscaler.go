@@ -5,8 +5,8 @@
 package autoscaling
 
 import (
-	"context"
 	"errors"
+
 	"github.com/shiweijiezero/foretoken/control-plane/internal/autoscaling/algorithm"
 	_ "github.com/shiweijiezero/foretoken/control-plane/internal/autoscaling/algorithm/adjustment"
 	_ "github.com/shiweijiezero/foretoken/control-plane/internal/autoscaling/algorithm/decision"
@@ -18,6 +18,7 @@ var ErrAutoscalerRequired = errors.New("autoscaler is required")
 
 type Autoscaler struct{ pipeline core.Pipeline }
 
+// New assembles the configured decision, trigger, and adjustment algorithms into an Autoscaler.
 func New(configuration Configuration) (*Autoscaler, error) {
 	decisionName := string(configuration.DecisionAlgorithm)
 	if decisionName == "" {
@@ -35,20 +36,19 @@ func New(configuration Configuration) (*Autoscaler, error) {
 	if !automatic {
 		adjustmentName = string(AdjustmentAlgorithmDirect)
 	}
-	adjustment, err := algorithm.BuildAdjustment(adjustmentName)
+	adjustment, err := algorithm.BuildAdjustment(adjustmentName, configuration.Adjustment)
 	if err != nil {
 		return nil, err
 	}
 	pipeline := core.Pipeline{DecisionAlgorithm: decision, AdjustmentAlgorithm: adjustment, Automatic: automatic}
 	if !automatic {
 		pipeline.Resolver.AllowDuringTransition = true
-	}
-	if automatic {
+	} else {
 		triggerName := string(configuration.TriggerAlgorithm)
 		if triggerName == "" {
 			triggerName = string(TriggerAlgorithmPeriodic)
 		}
-		trigger, err := algorithm.BuildTrigger(triggerName, configuration.Trigger)
+		trigger, err := algorithm.BuildTrigger(triggerName)
 		if err != nil {
 			return nil, err
 		}
@@ -56,6 +56,8 @@ func New(configuration Configuration) (*Autoscaler, error) {
 	}
 	return &Autoscaler{pipeline: pipeline}, nil
 }
+
+// Manual returns an Autoscaler that applies the ModelService baseline capacity.
 func Manual() *Autoscaler {
 	autoscaler, err := New(Configuration{DecisionAlgorithm: DecisionAlgorithmManual})
 	if err != nil {
@@ -63,27 +65,24 @@ func Manual() *Autoscaler {
 	}
 	return autoscaler
 }
+
+// Automatic reports whether the Autoscaler evaluates demand-driven capacity.
 func (autoscaler *Autoscaler) Automatic() bool {
 	return autoscaler != nil && autoscaler.pipeline.Automatic
 }
+
+// TriggerAlgorithmName reports the configured trigger algorithm for status consumers.
 func (autoscaler *Autoscaler) TriggerAlgorithmName() string {
 	if autoscaler == nil || autoscaler.pipeline.TriggerAlgorithm == nil {
 		return ""
 	}
 	return autoscaler.pipeline.TriggerAlgorithm.Name()
 }
-func (autoscaler *Autoscaler) AdjustmentAlgorithmName() string {
-	if autoscaler == nil || autoscaler.pipeline.AdjustmentAlgorithm == nil {
-		return ""
-	}
-	return autoscaler.pipeline.AdjustmentAlgorithm.Name()
-}
-func (autoscaler *Autoscaler) Plan(ctx context.Context, snapshots []core.ScalingSnapshot) ([]core.ScalingDecision, error) {
+
+// Plan evaluates scaling snapshots through the configured autoscaling pipeline.
+func (autoscaler *Autoscaler) Plan(snapshots []core.ScalingSnapshot) ([]core.ScalingDecision, error) {
 	if autoscaler == nil {
 		return nil, ErrAutoscalerRequired
 	}
-	return autoscaler.pipeline.Plan(ctx, snapshots)
-}
-func NewWithAlgorithms(decision core.DecisionAlgorithm, trigger core.TriggerAlgorithm, adjustment core.AdjustmentAlgorithm, automatic bool) *Autoscaler {
-	return &Autoscaler{pipeline: core.Pipeline{DecisionAlgorithm: decision, TriggerAlgorithm: trigger, AdjustmentAlgorithm: adjustment, Automatic: automatic}}
+	return autoscaler.pipeline.Plan(snapshots)
 }

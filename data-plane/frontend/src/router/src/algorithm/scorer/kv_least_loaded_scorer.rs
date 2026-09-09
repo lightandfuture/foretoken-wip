@@ -7,28 +7,23 @@ use foretoken_kv_indexer::KvPrefixIndexer;
 use foretoken_model_protocol::ModelServerRole;
 
 use super::{decode_loads_by_pipeline_scope, load};
-use std::sync::Arc;
 
-use crate::{RouteCandidate, RouteScore, RouteScorer, RouterRequest, ScorerDescriptor};
-
-inventory::submit! {
-    ScorerDescriptor {
-        name: "kv_least_loaded",
-        factory: || Arc::new(KvLeastLoadedScorer),
-    }
-}
+use crate::{RouteCandidate, RouteScore, RouteScorer, RouterRequest};
 
 /// Prefers longer confirmed-locality KV-prefix matches, then lower current and downstream Decode load.
 #[derive(Default)]
 pub struct KvLeastLoadedScorer;
 
 impl RouteScorer for KvLeastLoadedScorer {
+    /// Returns prefix-locality and load preferences in candidate order for Router selection.
+    #[allow(unused_variables)]
     fn score(
         &self,
         request: &RouterRequest,
         candidates: &[RouteCandidate],
-        kv: &dyn KvPrefixIndexer,
-        _: &mut (),
+        kv_prefix_indexer: &dyn KvPrefixIndexer,
+        routing_progress: &crate::RoutingProgress<'_>,
+        customized_context: &mut (),
     ) -> Vec<RouteScore> {
         let decode_loads = decode_loads_by_pipeline_scope(candidates);
         candidates
@@ -44,7 +39,7 @@ impl RouteScorer for KvLeastLoadedScorer {
                     );
                     match lookup.map_or_else(
                         foretoken_kv_indexer::KvPrefixQueryResult::Unavailable,
-                        |lookup| kv.prefix_matches(lookup),
+                        |lookup| kv_prefix_indexer.prefix_matches(lookup),
                     ) {
                         foretoken_kv_indexer::KvPrefixQueryResult::Matches(matches) => matches
                             // Providers outside this crate are not trusted to have applied indexer
@@ -88,6 +83,7 @@ impl RouteScorer for KvLeastLoadedScorer {
                     tier_preference: tier,
                     locality_preference: locality,
                     load: load(candidate).saturating_add(downstream).saturating_neg(),
+                    ..RouteScore::default()
                 }
             })
             .collect()

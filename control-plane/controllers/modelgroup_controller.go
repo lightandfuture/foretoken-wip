@@ -46,6 +46,8 @@ const (
 	modelGroupFieldOwner           = "foretoken-modelgroup-controller"
 	controlPlanePodLabel           = "app.kubernetes.io/name"
 	controlPlanePodLabelValue      = "foretoken-control-plane"
+	metricsScraperNamespaceLabel   = "inference.foretoken.io/metrics-scraper"
+	metricsScraperNamespaceValue   = "true"
 )
 
 // ModelGroupReconciler owns the Kubernetes workload for one execution Group.
@@ -125,6 +127,7 @@ func (reconciler *ModelGroupReconciler) Reconcile(ctx context.Context, request c
 	return ctrl.Result{}, nil
 }
 
+// validateModelPoolOwnership verifies that the referenced ModelPool controls the ModelGroup.
 func (reconciler *ModelGroupReconciler) validateModelPoolOwnership(ctx context.Context, group *inferencev1alpha1.ModelGroup) error {
 	pool := new(inferencev1alpha1.ModelPool)
 	key := client.ObjectKey{Namespace: group.Namespace, Name: group.Spec.ModelPoolRef.Name}
@@ -139,6 +142,7 @@ func (reconciler *ModelGroupReconciler) validateModelPoolOwnership(ctx context.C
 
 // Workload reconciliation and desired resources.
 
+// reconcileDeployment applies the ModelGroup Deployment and returns its persisted state.
 func (reconciler *ModelGroupReconciler) reconcileDeployment(ctx context.Context, group *inferencev1alpha1.ModelGroup) (*appsv1.Deployment, error) {
 	desired, err := desiredDeployment(group, reconciler.ImagePullSecrets)
 	if err != nil {
@@ -253,6 +257,7 @@ func desiredDeployment(group *inferencev1alpha1.ModelGroup, imagePullSecrets []c
 		{Name: "FORETOKEN_KV_SCOPE_ID", Value: kvScopeID(group)},
 		{Name: "FORETOKEN_MODEL_GROUP_UID", Value: string(group.UID)},
 	}
+	env = append(env, vllmconfig.RuntimeCacheEnv(group.Spec.Artifacts.Cache, group.Spec.Artifacts.SourceAccess)...)
 	if group.Spec.PDRuntime != nil {
 		env = append(env,
 			corev1.EnvVar{Name: "VLLM_MOONCAKE_BOOTSTRAP_PORT", Value: strconv.Itoa(int(group.Spec.PDRuntime.BootstrapPort))},
@@ -292,6 +297,16 @@ func desiredDeployment(group *inferencev1alpha1.ModelGroup, imagePullSecrets []c
 		{Name: "kv-indexer", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: kvIndexerSecretName, Items: []corev1.KeyToPath{{Key: kvIndexerSecretKey, Path: "key"}}}}},
 	}
 	mounts := []corev1.VolumeMount{{Name: "tmp", MountPath: "/tmp"}, {Name: "dshm", MountPath: "/dev/shm"}, {Name: "kv-indexer", MountPath: "/etc/foretoken/kv-indexer", ReadOnly: true}}
+	if cache := group.Spec.Artifacts.Cache; cache != nil {
+		volumes = append(volumes, corev1.Volume{Name: runtimeCacheVolumeName, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: cache.ClaimName}}})
+		mounts = append(mounts, corev1.VolumeMount{Name: runtimeCacheVolumeName, MountPath: cache.MountPath})
+		ports = append(ports, corev1.ContainerPort{Name: "cache-observe", ContainerPort: runtimeCacheObservationPort(group.Spec.Runtime.Port), Protocol: corev1.ProtocolTCP})
+		env = append(env,
+			corev1.EnvVar{Name: "FORETOKEN_CACHE_MOUNT_PATH", Value: cache.MountPath},
+			corev1.EnvVar{Name: "FORETOKEN_CACHE_OBSERVATION_PORT", Value: strconv.Itoa(int(runtimeCacheObservationPort(group.Spec.Runtime.Port)))},
+			corev1.EnvVar{Name: "FORETOKEN_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
+		)
+	}
 	if group.Spec.ECRuntime != nil {
 		volumes = append(volumes, corev1.Volume{Name: "ec-shared-storage", VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: group.Spec.ECRuntime.SharedStorageClaim}}})
 		mounts = append(mounts, corev1.VolumeMount{Name: "ec-shared-storage", MountPath: group.Spec.ECRuntime.SharedStoragePath})
@@ -392,6 +407,7 @@ func modelGroupServiceName(group *inferencev1alpha1.ModelGroup) string {
 	return serviceNamePrefix + prefix + "-" + identity
 }
 
+// reconcileService applies the stable Service owned by the ModelGroup.
 func (reconciler *ModelGroupReconciler) reconcileService(ctx context.Context, group *inferencev1alpha1.ModelGroup) error {
 	labels := modelGroupLabels(group)
 	desired := &corev1.Service{
@@ -443,6 +459,7 @@ func modelServerProbe(path string, periodSeconds, failureThreshold int32) *corev
 	}
 }
 
+// reconcileNetworkPolicy allows the frontend, control plane, runtime peers, and trusted metrics-scraper namespaces to reach a ModelGroup.
 func (reconciler *ModelGroupReconciler) reconcileNetworkPolicy(ctx context.Context, group *inferencev1alpha1.ModelGroup) error {
 	labels := modelGroupLabels(group)
 	protocol := corev1.ProtocolTCP
@@ -465,6 +482,21 @@ func (reconciler *ModelGroupReconciler) reconcileNetworkPolicy(ctx context.Conte
 		},
 		Ports: []networkingv1.NetworkPolicyPort{{Protocol: &protocol, Port: &modelServerPort}},
 	}}
+	if group.Spec.Artifacts.Cache != nil {
+		cacheObservationPort := intstr.FromString("cache-observe")
+		ingress = append(ingress, networkingv1.NetworkPolicyIngressRule{
+			From: []networkingv1.NetworkPolicyPeer{{
+				NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": reconciler.ControlPlaneNamespace}},
+				PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{controlPlanePodLabel: controlPlanePodLabelValue}},
+			}},
+			Ports: []networkingv1.NetworkPolicyPort{{Protocol: &protocol, Port: &cacheObservationPort}},
+		})
+	}
+	ingress[0].From = append(ingress[0].From, networkingv1.NetworkPolicyPeer{
+		NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+			metricsScraperNamespaceLabel: metricsScraperNamespaceValue,
+		}},
+	})
 	if group.Spec.PDRuntime != nil {
 		// Mooncake opens bidirectional runtime side channels on dynamic ports
 		// after bootstrap. Restrict them to the same controller-owned P/D linked processing unit.
@@ -591,6 +623,7 @@ func modelGroupDeploymentAvailable(deployment *appsv1.Deployment) bool {
 	return false
 }
 
+// updateStatus projects workload availability and scheduler capacity into ModelGroup status.
 func (reconciler *ModelGroupReconciler) updateStatus(ctx context.Context, group *inferencev1alpha1.ModelGroup, state modelGroupStatusState) error {
 	base := group.DeepCopy()
 	group.Status.Phase = state.phase

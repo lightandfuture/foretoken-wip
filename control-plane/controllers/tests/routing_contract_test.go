@@ -19,14 +19,16 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
+// TestFrontendRoutingSnapshotAndReadinessContract protects Gateway routing publication and readiness as one frontend lifecycle.
 func TestFrontendRoutingSnapshotAndReadinessContract(t *testing.T) {
 	ctx := context.Background()
 	frontend := &inferencev1alpha1.FrontendService{
 		TypeMeta:   metav1.TypeMeta{APIVersion: inferencev1alpha1.GroupVersion.String(), Kind: "FrontendService"},
 		ObjectMeta: metav1.ObjectMeta{Name: "chat", Namespace: "default", UID: "chat-uid", Generation: 1},
 		Spec: inferencev1alpha1.FrontendServiceSpec{
-			Replicas: pointer(int32(1)),
-			Hostname: "chat.example.com",
+			Replicas:       pointer(int32(1)),
+			Hostname:       "chat.example.com",
+			RouterPipeline: routerPipeline(),
 			Resources: inferencev1alpha1.FrontendResources{
 				Requests: inferencev1alpha1.ComputeResourceRequests{CPU: "1", Memory: "1Gi"},
 			},
@@ -40,6 +42,10 @@ func TestFrontendRoutingSnapshotAndReadinessContract(t *testing.T) {
 		if _, err := r.Reconcile(ctx, request); err != nil {
 			t.Fatal(err)
 		}
+	}
+	frontendService := get(t, ctx, c, request.NamespacedName, new(corev1.Service))
+	if frontendService.Labels["inference.foretoken.io/frontend-service"] != frontend.Name || len(frontendService.Spec.Ports) != 1 || frontendService.Spec.Ports[0].Name != "http" {
+		t.Fatalf("frontend service discovery contract = %#v", frontendService)
 	}
 	var deployments appsv1.DeploymentList
 	if err := c.List(ctx, &deployments, client.InNamespace(frontend.Namespace)); err != nil {
@@ -94,15 +100,17 @@ func TestFrontendRoutingSnapshotAndReadinessContract(t *testing.T) {
 	}
 }
 
+// TestFrontendLocalModeNeedsNoGateway protects local LoadBalancer readiness from depending on Gateway resources.
 func TestFrontendLocalModeNeedsNoGateway(t *testing.T) {
 	ctx := context.Background()
 	frontend := &inferencev1alpha1.FrontendService{
 		TypeMeta:   metav1.TypeMeta{APIVersion: inferencev1alpha1.GroupVersion.String(), Kind: "FrontendService"},
 		ObjectMeta: metav1.ObjectMeta{Name: "local", Namespace: "default", UID: "local-uid", Generation: 1},
 		Spec: inferencev1alpha1.FrontendServiceSpec{
-			Replicas:  pointer(int32(1)),
-			Resources: inferencev1alpha1.FrontendResources{Requests: inferencev1alpha1.ComputeResourceRequests{CPU: "1", Memory: "1Gi"}},
-			Timeouts:  inferencev1alpha1.FrontendTimeouts{Request: "10m", StreamIdle: "5m"},
+			Replicas:       pointer(int32(1)),
+			RouterPipeline: routerPipeline(),
+			Resources:      inferencev1alpha1.FrontendResources{Requests: inferencev1alpha1.ComputeResourceRequests{CPU: "1", Memory: "1Gi"}},
+			Timeouts:       inferencev1alpha1.FrontendTimeouts{Request: "10m", StreamIdle: "5m"},
 		},
 	}
 	staleRoute := &gatewayv1.HTTPRoute{
@@ -121,6 +129,7 @@ func TestFrontendLocalModeNeedsNoGateway(t *testing.T) {
 	r := &controllers.FrontendServiceReconciler{
 		Client: c, APIReader: c,
 		RuntimeProfile: controllers.FrontendRuntimeProfile{Image: "frontend:test", Port: 8080},
+		CacheProfile:   controllers.RuntimeCacheProfile{ClaimName: "model-cache", MountPath: "/cache"},
 	}
 	request := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(frontend)}
 	for range 2 {
@@ -136,6 +145,11 @@ func TestFrontendLocalModeNeedsNoGateway(t *testing.T) {
 		t.Fatalf("local frontend Service type = %q", service.Spec.Type)
 	}
 	deployment := get(t, ctx, c, request.NamespacedName, new(appsv1.Deployment))
+	for _, volume := range deployment.Spec.Template.Spec.Volumes {
+		if volume.Name == "runtime-cache" && volume.PersistentVolumeClaim != nil {
+			t.Fatalf("frontend switched cache before the selected model generation: %#v", volume)
+		}
+	}
 	deployment.Status.ObservedGeneration = deployment.Generation
 	deployment.Status.AvailableReplicas = 1
 	deployment.Status.Conditions = []appsv1.DeploymentCondition{{Type: appsv1.DeploymentAvailable, Status: corev1.ConditionTrue}}
@@ -151,5 +165,58 @@ func TestFrontendLocalModeNeedsNoGateway(t *testing.T) {
 	}
 	if condition := meta.FindStatusCondition(current.Status.Conditions, "RouteAccepted"); condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "NotRequired" {
 		t.Fatalf("local frontend route condition = %#v", current.Status)
+	}
+
+	cachedGroup := modelGroup(pool, "local-model-r2-0", 0)
+	cachedGroup.Spec.Revision = "r2"
+	cachedGroup.Spec.Artifacts.Cache = &inferencev1alpha1.RuntimeCacheBinding{ClaimName: "model-cache", MountPath: "/cache"}
+	markGroupReady(cachedGroup)
+	if err := c.Create(ctx, cachedGroup); err != nil {
+		t.Fatal(err)
+	}
+	model = get(t, ctx, c, client.ObjectKeyFromObject(model), new(inferencev1alpha1.ModelService))
+	model.Status.ServingPoolRevisions[0].Revision = "r2"
+	if err := c.Status().Update(ctx, model); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	deployment = get(t, ctx, c, request.NamespacedName, new(appsv1.Deployment))
+	cacheMounted := false
+	for _, volume := range deployment.Spec.Template.Spec.Volumes {
+		if volume.Name == "runtime-cache" && volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == "model-cache" {
+			cacheMounted = true
+		}
+	}
+	if !cacheMounted {
+		t.Fatalf("frontend did not switch after the cached generation was selected: %#v", deployment.Spec.Template.Spec.Volumes)
+	}
+
+	r.CacheProfile = controllers.RuntimeCacheProfile{MountPath: "/cache"}
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	deployment = get(t, ctx, c, request.NamespacedName, new(appsv1.Deployment))
+	if deployment.Spec.Template.Spec.Volumes[1].PersistentVolumeClaim == nil {
+		t.Fatal("frontend removed the cache before an uncached generation was selected")
+	}
+	uncachedGroup := modelGroup(pool, "local-model-r3-0", 0)
+	uncachedGroup.Spec.Revision = "r3"
+	markGroupReady(uncachedGroup)
+	if err := c.Create(ctx, uncachedGroup); err != nil {
+		t.Fatal(err)
+	}
+	model = get(t, ctx, c, client.ObjectKeyFromObject(model), new(inferencev1alpha1.ModelService))
+	model.Status.ServingPoolRevisions[0].Revision = "r3"
+	if err := c.Status().Update(ctx, model); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	deployment = get(t, ctx, c, request.NamespacedName, new(appsv1.Deployment))
+	if deployment.Spec.Template.Spec.Volumes[1].PersistentVolumeClaim != nil {
+		t.Fatalf("frontend retained the cache after the uncached generation was selected: %#v", deployment.Spec.Template.Spec.Volumes)
 	}
 }

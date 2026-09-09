@@ -94,6 +94,23 @@ spec:
                 description: ModelGroupArtifacts identifies immutable model and tokenizer
                   inputs.
                 properties:
+                  cache:
+                    description: Cache is the persistent runtime cache selected for
+                      this immutable Group revision.
+                    properties:
+                      claimName:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      mountPath:
+                        maxLength: 1024
+                        minLength: 2
+                        pattern: ^/
+                        type: string
+                    required:
+                    - claimName
+                    - mountPath
+                    type: object
                   model:
                     maxLength: 1024
                     minLength: 1
@@ -102,6 +119,21 @@ spec:
                     maxLength: 256
                     minLength: 1
                     type: string
+                  sourceAccess:
+                    description: SourceAccess contains runtime-adapter settings for
+                      loading the model.
+                    properties:
+                      endpoint:
+                        description: Endpoint is interpreted by the selected runtime
+                          adapter.
+                        type: string
+                      tokenSecretKey:
+                        type: string
+                      tokenSecretName:
+                        description: TokenSecretName and TokenSecretKey identify an
+                          optional namespace-local credential.
+                        type: string
+                    type: object
                   tokenizer:
                     maxLength: 1024
                     minLength: 1

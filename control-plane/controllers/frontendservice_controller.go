@@ -65,6 +65,7 @@ type FrontendRuntimeProfile struct {
 	Image            string
 	Port             int32
 	ImagePullSecrets []corev1.LocalObjectReference
+	RuntimeCache     *inferencev1alpha1.RuntimeCacheBinding
 	Gateway          *GatewayParent
 }
 
@@ -73,6 +74,7 @@ type FrontendServiceReconciler struct {
 	client.Client
 	APIReader      client.Reader
 	RuntimeProfile FrontendRuntimeProfile
+	CacheProfile   RuntimeCacheProfile
 }
 
 // SetupWithManager watches each resource whose state contributes to frontend readiness.
@@ -89,9 +91,11 @@ func (reconciler *FrontendServiceReconciler) SetupWithManager(manager ctrl.Manag
 		Watches(&inferencev1alpha1.ModelService{}, handler.EnqueueRequestsFromMapFunc(reconciler.frontendsInNamespace)).
 		Watches(&inferencev1alpha1.ModelPool{}, handler.EnqueueRequestsFromMapFunc(reconciler.frontendsInNamespace)).
 		Watches(&inferencev1alpha1.ModelGroup{}, handler.EnqueueRequestsFromMapFunc(reconciler.frontendsInNamespace)).
+		Watches(&inferencev1alpha1.RuntimeCache{}, handler.EnqueueRequestsFromMapFunc(reconciler.frontendsInNamespace)).
 		Complete(reconciler)
 }
 
+// frontendsInNamespace maps model lifecycle changes to every frontend in the same namespace.
 func (reconciler *FrontendServiceReconciler) frontendsInNamespace(ctx context.Context, object client.Object) []reconcile.Request {
 	var frontends inferencev1alpha1.FrontendServiceList
 	if err := reconciler.List(ctx, &frontends, client.InNamespace(object.GetNamespace())); err != nil {
@@ -102,6 +106,55 @@ func (reconciler *FrontendServiceReconciler) frontendsInNamespace(ctx context.Co
 		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&frontends.Items[index])})
 	}
 	return requests
+}
+
+// servingCacheReady reports whether every selected ModelGroup revision uses the configured cache.
+func (reconciler *FrontendServiceReconciler) servingCacheReady(ctx context.Context, namespace string, cache *inferencev1alpha1.RuntimeCacheBinding) (bool, error) {
+	var services inferencev1alpha1.ModelServiceList
+	if err := reconciler.List(ctx, &services, client.InNamespace(namespace)); err != nil {
+		return false, fmt.Errorf("list ModelServices for frontend runtime cache: %w", err)
+	}
+	var pools inferencev1alpha1.ModelPoolList
+	if err := reconciler.List(ctx, &pools, client.InNamespace(namespace)); err != nil {
+		return false, fmt.Errorf("list ModelPools for frontend runtime cache: %w", err)
+	}
+	var groups inferencev1alpha1.ModelGroupList
+	if err := reconciler.List(ctx, &groups, client.InNamespace(namespace)); err != nil {
+		return false, fmt.Errorf("list ModelGroups for frontend runtime cache: %w", err)
+	}
+	for serviceIndex := range services.Items {
+		service := &services.Items[serviceIndex]
+		if !service.DeletionTimestamp.IsZero() {
+			continue
+		}
+		for _, selected := range service.Status.ServingPoolRevisions {
+			var pool *inferencev1alpha1.ModelPool
+			for poolIndex := range pools.Items {
+				candidate := &pools.Items[poolIndex]
+				if candidate.Spec.PoolName == selected.PoolName && string(candidate.UID) == selected.PoolUID && routingPoolOwnedBy(candidate, service) {
+					pool = candidate
+					break
+				}
+			}
+			if pool == nil {
+				return false, nil
+			}
+			matched := false
+			for groupIndex := range groups.Items {
+				group := &groups.Items[groupIndex]
+				if routingGroupOwnedBy(group, pool) && group.Spec.Revision == selected.Revision {
+					matched = true
+					if !routingGroupReady(group) || !reflect.DeepEqual(group.Spec.Artifacts.Cache, cache) {
+						return false, nil
+					}
+				}
+			}
+			if !matched {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }
 
 // Reconcile applies frontend resources and keeps readiness fail-closed until a serving snapshot is installed.
@@ -123,12 +176,40 @@ func (reconciler *FrontendServiceReconciler) Reconcile(ctx context.Context, requ
 	if err != nil {
 		return ctrl.Result{}, reconciler.updateStatus(ctx, frontend, frontendState{FailureReason: "ServingSnapshotProjectionFailed", FailureMessage: err.Error()})
 	}
+	runtimeCache, cacheReady, err := reconciler.CacheProfile.Resolve(ctx, reconciler.Client, frontend.Namespace)
+	if err != nil {
+		statusErr := reconciler.updateStatus(ctx, frontend, frontendState{FailureReason: "RuntimeCacheProjectionFailed", FailureMessage: err.Error()})
+		return ctrl.Result{}, errors.Join(err, statusErr)
+	}
+	if cacheReady {
+		cacheReady, err = reconciler.servingCacheReady(ctx, frontend.Namespace, runtimeCache)
+		if err != nil {
+			statusErr := reconciler.updateStatus(ctx, frontend, frontendState{FailureReason: "RuntimeCacheProjectionFailed", FailureMessage: err.Error()})
+			return ctrl.Result{}, errors.Join(err, statusErr)
+		}
+	}
+	profile := reconciler.RuntimeProfile
+	profile.RuntimeCache = runtimeCache
+	applyDeployment := true
+	if !cacheReady {
+		current := new(appsv1.Deployment)
+		if err := reconciler.Get(ctx, client.ObjectKeyFromObject(frontend), current); err == nil {
+			applyDeployment = false
+		} else if apierrors.IsNotFound(err) {
+			profile.RuntimeCache = nil
+		} else {
+			return ctrl.Result{}, reconciler.updateStatus(ctx, frontend, frontendState{FailureReason: "RuntimeCacheProjectionFailed", FailureMessage: err.Error()})
+		}
+	}
 
-	deployment, service, route, err := frontendDesiredResources(frontend, reconciler.RuntimeProfile)
+	deployment, service, route, err := frontendDesiredResources(frontend, profile)
 	if err != nil {
 		return ctrl.Result{}, reconciler.updateStatus(ctx, frontend, frontendState{FailureReason: "InvalidIntent", FailureMessage: err.Error()})
 	}
-	objects := []client.Object{deployment, service}
+	objects := []client.Object{service}
+	if applyDeployment {
+		objects = append([]client.Object{deployment}, objects...)
+	}
 	if route != nil {
 		objects = append(objects, route)
 	}
@@ -186,6 +267,7 @@ func (profile FrontendRuntimeProfile) validate() error {
 	return nil
 }
 
+// applyOwned server-side applies a FrontendService-owned resource after checking ownership.
 func (reconciler *FrontendServiceReconciler) applyOwned(ctx context.Context, owner *inferencev1alpha1.FrontendService, desired client.Object) error {
 	current := desired.DeepCopyObject().(client.Object)
 	err := reconciler.Get(ctx, client.ObjectKeyFromObject(desired), current)
@@ -201,6 +283,7 @@ func (reconciler *FrontendServiceReconciler) applyOwned(ctx context.Context, own
 	return nil
 }
 
+// deleteOwnedHTTPRoute removes the FrontendService route when local exposure no longer needs it.
 func (reconciler *FrontendServiceReconciler) deleteOwnedHTTPRoute(ctx context.Context, frontend *inferencev1alpha1.FrontendService) error {
 	reader := reconciler.APIReader
 	if reader == nil {
@@ -233,6 +316,7 @@ type frontendState struct {
 	FailureMessage string
 }
 
+// updateStatus publishes workload, route, and serving-snapshot readiness for the frontend.
 func (reconciler *FrontendServiceReconciler) updateStatus(ctx context.Context, frontend *inferencev1alpha1.FrontendService, state frontendState) error {
 	base := frontend.DeepCopy()
 	frontend.Status.ObservedGeneration = frontend.Generation

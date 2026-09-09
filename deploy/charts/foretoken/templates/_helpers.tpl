@@ -47,6 +47,24 @@
 {{- end -}}
 {{- end }}
 
+{{/* Enables Prometheus Operator resources explicitly or when both required APIs are discoverable. */}}
+{{- define "foretoken.observabilityEnabled" -}}
+{{- if eq .Values.observability.mode "enabled" -}}
+true
+{{- else if and (eq .Values.observability.mode "auto") (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/ServiceMonitor") (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1/PrometheusRule") -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end }}
+
+{{- define "foretoken.observabilityLabels" -}}
+{{ include "foretoken.labels" . }}
+{{- with .Values.observability.additionalLabels }}
+{{ toYaml . }}
+{{- end }}
+{{- end }}
+
 {{- define "foretoken.selectorLabels" -}}
 app.kubernetes.io/name: foretoken-control-plane
 app.kubernetes.io/instance: {{ .Release.Name }}
@@ -92,6 +110,12 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- if and (ne (trim .Values.runtime.vllm.modelSource.tokenSecret.name) "") (eq (trim .Values.runtime.vllm.modelSource.tokenSecret.key) "") -}}
+{{- fail "runtime.vllm.modelSource.tokenSecret.key is required when name is set" -}}
+{{- end -}}
+{{- if and (eq (trim .Values.workload.cache.claimName) "") (or (ne (trim .Values.runtime.vllm.modelSource.endpoint) "") (ne (trim .Values.runtime.vllm.modelSource.tokenSecret.name) "")) -}}
+{{- fail "workload.cache.claimName is required when runtime.vllm.modelSource is configured" -}}
 {{- end -}}
 {{- if ne (trim .Values.runtime.vllm.image) "" -}}
 {{- if eq (trim .Values.runtime.vllm.gpu.resourceName) "" -}}

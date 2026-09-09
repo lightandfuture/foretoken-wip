@@ -3,7 +3,7 @@
 
 //! Defines the controller-projected component/pipeline-scope routing snapshot contract.
 use foretoken_model_protocol::ModelServerRole;
-use foretoken_router::{RouteTargetId, RouteTargetSet, ScalingTarget, ScalingTargetKind};
+use foretoken_router::{RouteTargetId, RouteTargetSet};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -11,7 +11,6 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServingSnapshot {
     pub version: u64,
-    #[serde(default)]
     pub models: Vec<SnapshotModel>,
     pub groups: Vec<SnapshotGroup>,
     #[serde(default)]
@@ -32,8 +31,6 @@ pub struct SnapshotModel {
     pub tokenizer_revision: String,
     #[serde(default)]
     pub capabilities: BTreeSet<String>,
-    #[serde(default)]
-    pub max_input_tokens: Option<usize>,
     pub admission_target_sets: Vec<RouteTargetSet>,
 }
 
@@ -47,25 +44,10 @@ pub struct SnapshotEpdComponent {
     pub pool_name: String,
     pub route_target_id: RouteTargetId,
     pub role: ModelServerRole,
-    pub pipeline_scope_id: String,
     pub model: String,
     pub revision: String,
     pub tokenizer: String,
     pub tokenizer_revision: String,
-    #[serde(default)]
-    pub profile_name: String,
-    #[serde(default)]
-    pub profile_revision: String,
-    #[serde(default)]
-    pub connector: String,
-    #[serde(default)]
-    pub protocol: String,
-    #[serde(default)]
-    pub ec_profile_name: String,
-    #[serde(default)]
-    pub ec_profile_revision: String,
-    #[serde(default)]
-    pub ec_connector: String,
     #[serde(default)]
     pub capabilities: BTreeSet<String>,
     #[serde(default)]
@@ -73,16 +55,15 @@ pub struct SnapshotEpdComponent {
     pub endpoint: String,
     #[serde(default)]
     pub prefill_bootstrap_endpoint: Option<String>,
-    #[serde(default)]
     pub kv_scope_id: String,
     pub data_parallel_size: u32,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotEpdPipelineScope {
     pub pipeline_scope_id: String,
-    pub encoder_route_target_id: RouteTargetId,
-    pub prefill_route_target_id: RouteTargetId,
-    pub decode_route_target_id: RouteTargetId,
+    pub encoder_route_target_ids: Vec<RouteTargetId>,
+    pub prefill_route_target_ids: Vec<RouteTargetId>,
+    pub decode_route_target_ids: Vec<RouteTargetId>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotPdComponent {
@@ -110,7 +91,6 @@ pub struct SnapshotPdComponent {
     pub endpoint: String,
     #[serde(default)]
     pub prefill_bootstrap_endpoint: Option<String>,
-    #[serde(default)]
     pub kv_scope_id: String,
     pub data_parallel_size: u32,
 }
@@ -138,7 +118,6 @@ pub struct SnapshotGroup {
     #[serde(default)]
     pub max_input_tokens: Option<usize>,
     pub endpoint: String,
-    #[serde(default)]
     pub kv_scope_id: String,
     pub data_parallel_size: u32,
 }
@@ -150,8 +129,9 @@ pub struct ModelIdentity {
     pub capabilities: BTreeSet<String>,
 }
 impl ServingSnapshot {
-    // Prefer the controller-projected logical targets in `models`. Model-less snapshots fall
-    // back to topology-derived targets, then all sets are ordered and deduplicated consistently.
+    /// Returns each model's deterministically ordered, controller-owned admission target sets.
+    ///
+    /// Registry projection consumes these sets to attribute request admission; malformed or conflicting ownership is rejected.
     pub fn admission_target_sets(
         &self,
     ) -> Result<BTreeMap<String, Vec<RouteTargetSet>>, SnapshotError> {
@@ -176,48 +156,6 @@ impl ServingSnapshot {
                 .or_default()
                 .extend(model.admission_target_sets.clone());
         }
-        if targets.is_empty() {
-            for group in &self.groups {
-                targets
-                    .entry(group.model.clone())
-                    .or_default()
-                    .push(RouteTargetSet::new(vec![ScalingTarget {
-                        service_uid: group.service_uid.clone(),
-                        name: group.pool_name.clone(),
-                        uid: group.pool_uid.clone(),
-                        kind: ScalingTargetKind::Pool,
-                    }]));
-            }
-            let mut pd_targets = BTreeMap::<(String, String), Vec<ScalingTarget>>::new();
-            for component in &self.pd_components {
-                pd_targets
-                    .entry((component.model.clone(), component.service_uid.clone()))
-                    .or_default()
-                    .push(ScalingTarget {
-                        service_uid: component.service_uid.clone(),
-                        name: component.pool_name.clone(),
-                        uid: component.pool_uid.clone(),
-                        kind: ScalingTargetKind::Pool,
-                    });
-            }
-            for ((model, _), values) in pd_targets {
-                targets
-                    .entry(model)
-                    .or_default()
-                    .push(RouteTargetSet::new(values));
-            }
-            for component in &self.epd_components {
-                targets
-                    .entry(component.model.clone())
-                    .or_default()
-                    .push(RouteTargetSet::new(vec![ScalingTarget {
-                        service_uid: component.service_uid.clone(),
-                        name: "epd".into(),
-                        uid: component.service_uid.clone(),
-                        kind: ScalingTargetKind::EPDPipelineScope,
-                    }]));
-            }
-        }
         for values in targets.values_mut() {
             values.sort_by(|left, right| left.targets().cmp(right.targets()));
             values.dedup();
@@ -225,6 +163,9 @@ impl ServingSnapshot {
         Ok(targets)
     }
 
+    /// Returns the consistent model identity declared across all snapshot topology records.
+    ///
+    /// Registry projection uses this validation before materializing routes; the returned map is derived for the caller.
     pub fn model_identities(&self) -> Result<BTreeMap<String, ModelIdentity>, SnapshotError> {
         let mut identities = BTreeMap::new();
         for (model, revision, tokenizer, tokenizer_revision, capabilities) in self
@@ -295,8 +236,6 @@ impl ServingSnapshot {
 }
 #[derive(Debug, Error)]
 pub enum SnapshotError {
-    #[error("routing snapshot is not valid JSON: {0}")]
-    Parse(serde_json::Error),
     #[error("routing snapshot version must be greater than zero")]
     InvalidVersion,
     #[error("routing snapshot has an incomplete model or tokenizer identity")]
@@ -325,14 +264,8 @@ pub enum SnapshotError {
     ConflictingIdentity(String),
     #[error("routing snapshot endpoint {endpoint:?} is invalid: {message}")]
     InvalidEndpoint { endpoint: String, message: String },
-    #[error("routing snapshot component {0:?} has conflicting KV index endpoint or scope")]
-    ConflictingKvEventSource(String),
     #[error("routing snapshot has incomplete E/P/D component {0:?}")]
     IncompleteEpdComponent(RouteTargetId),
-    #[error("routing snapshot E/P/D component {0:?} has an invalid EC or KV transfer contract")]
-    InvalidEpdTransferContract(RouteTargetId),
-    #[error(
-        "routing configuration E/P/D linked processing unit {0:?} is incomplete, inconsistent, or not a static triplet"
-    )]
+    #[error("routing configuration E/P/D compatibility scope {0:?} is incomplete or inconsistent")]
     InvalidEpdPipelineScope(String),
 }

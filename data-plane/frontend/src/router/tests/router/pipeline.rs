@@ -8,23 +8,25 @@ use std::sync::{Arc, Mutex};
 use foretoken_kv_indexer::KvPrefixIndexer;
 use foretoken_model_protocol::ModelServerRole;
 
-use std::time::Duration;
-
-use super::support::{TestStatsReader, inventory, request, route, stats};
+use super::support::{inventory, request, route};
 use foretoken_router::{
     CandidateIndex, PipelineRouter, RouteCandidate, RouteFilter, RoutePicker, RouteScore,
-    RouteScorer, RouteTargetId, RouteTargetStats, Router, RouterPipeline, RouterRequest,
+    RouteScorer, Router, RouterPipeline, RouterRequest, RoutingProgress, RoutingStage,
     ScoredCandidate,
 };
 
-type CandidateObservations = Vec<Vec<(Option<u64>, Option<usize>)>>;
+#[derive(Debug, PartialEq, Eq)]
+struct ScorerRound {
+    stage: RoutingStage,
+    completed_stages: Vec<ModelServerRole>,
+    pipeline_scope_id: Option<String>,
+    candidates: Vec<(ModelServerRole, Vec<ModelServerRole>)>,
+}
 
 #[derive(Default)]
 struct ContextTrace {
     events: Mutex<Vec<String>>,
-    scorer_roles: Mutex<Vec<Vec<ModelServerRole>>>,
-    filter_observations: Mutex<CandidateObservations>,
-    scorer_observations: Mutex<CandidateObservations>,
+    scorer_rounds: Mutex<Vec<ScorerRound>>,
     picker_roles: Mutex<Vec<Vec<ModelServerRole>>>,
 }
 
@@ -43,26 +45,10 @@ impl RouteFilter<RoutingContext> for ContextFilter {
         _: &RouterRequest,
         candidates: &[RouteCandidate],
         _: &dyn KvPrefixIndexer,
+        _: &RoutingProgress<'_>,
         context: &mut RoutingContext,
     ) -> Vec<CandidateIndex> {
         context.rounds += 1;
-        context.trace.filter_observations.lock().unwrap().push(
-            candidates
-                .iter()
-                .map(|candidate| {
-                    (
-                        candidate
-                            .route_target_stats
-                            .as_ref()
-                            .map(|stats| stats.running_requests),
-                        candidate
-                            .route_target_stats
-                            .as_ref()
-                            .map(|stats| Arc::as_ptr(stats) as usize),
-                    )
-                })
-                .collect(),
-        );
         context
             .trace
             .events
@@ -81,6 +67,7 @@ impl RouteScorer<RoutingContext> for ContextScorer {
         _: &RouterRequest,
         candidates: &[RouteCandidate],
         _: &dyn KvPrefixIndexer,
+        routing_progress: &RoutingProgress<'_>,
         context: &mut RoutingContext,
     ) -> Vec<RouteScore> {
         // Consume the round established by Filter. Picker consumes this value below.
@@ -91,27 +78,18 @@ impl RouteScorer<RoutingContext> for ContextScorer {
         ));
         context
             .trace
-            .scorer_roles
+            .scorer_rounds
             .lock()
             .unwrap()
-            .push(candidates.iter().map(|candidate| candidate.role).collect());
-        context.trace.scorer_observations.lock().unwrap().push(
-            candidates
-                .iter()
-                .map(|candidate| {
-                    (
-                        candidate
-                            .route_target_stats
-                            .as_ref()
-                            .map(|stats| stats.running_requests),
-                        candidate
-                            .route_target_stats
-                            .as_ref()
-                            .map(|stats| Arc::as_ptr(stats) as usize),
-                    )
-                })
-                .collect(),
-        );
+            .push(ScorerRound {
+                stage: routing_progress.current_stage,
+                completed_stages: routing_progress.completed_stages.to_vec(),
+                pipeline_scope_id: routing_progress.pipeline_scope_id.map(str::to_owned),
+                candidates: candidates
+                    .iter()
+                    .map(|candidate| (candidate.role, candidate.future_stages().to_vec()))
+                    .collect(),
+            });
         vec![RouteScore::default(); candidates.len()]
     }
 }
@@ -123,6 +101,7 @@ impl RoutePicker<RoutingContext> for ContextPicker {
         &self,
         _: &RouterRequest,
         scored_candidates: &[ScoredCandidate],
+        _: &RoutingProgress<'_>,
         context: &mut RoutingContext,
     ) -> Option<CandidateIndex> {
         assert_eq!(context.scorer_round, context.rounds);
@@ -140,68 +119,15 @@ impl RoutePicker<RoutingContext> for ContextPicker {
     }
 }
 
+// Protects request-local algorithm state and explicit stage context across E/P/D routing.
 #[test]
-fn customized_context_is_request_owned_and_shared_by_filter_scorer_picker_across_epd() {
+fn algorithms_share_request_state_and_observe_each_epd_selection_stage() {
     let inventory = inventory(vec![
         route("e", ModelServerRole::Encoder),
         route("p", ModelServerRole::Prefill),
         route("d", ModelServerRole::Decode),
     ]);
     let trace = Arc::new(ContextTrace::default());
-    let stat_values = stats();
-    stat_values.lock().unwrap().extend([
-        (
-            RouteTargetId::new("e"),
-            RouteTargetStats {
-                collected_at_unix_ms: 1,
-                observed_window: Duration::from_secs(60),
-                running_requests: 3,
-                max_concurrent_requests: 8,
-                scheduler_running_requests: Some(2),
-                scheduler_waiting_requests: Some(1),
-                kv_cache_usage: Some(0.5),
-                prompt_tokens_per_second: Some(100.0),
-                generation_tokens_per_second: Some(50.0),
-                ttft: None,
-                tpot: None,
-                e2e_latency: None,
-            },
-        ),
-        (
-            RouteTargetId::new("p"),
-            RouteTargetStats {
-                collected_at_unix_ms: 1,
-                observed_window: Duration::from_secs(60),
-                running_requests: 3,
-                max_concurrent_requests: 8,
-                scheduler_running_requests: Some(2),
-                scheduler_waiting_requests: Some(1),
-                kv_cache_usage: Some(0.5),
-                prompt_tokens_per_second: Some(100.0),
-                generation_tokens_per_second: Some(50.0),
-                ttft: None,
-                tpot: None,
-                e2e_latency: None,
-            },
-        ),
-        (
-            RouteTargetId::new("d"),
-            RouteTargetStats {
-                collected_at_unix_ms: 1,
-                observed_window: Duration::from_secs(60),
-                running_requests: 3,
-                max_concurrent_requests: 8,
-                scheduler_running_requests: Some(2),
-                scheduler_waiting_requests: Some(1),
-                kv_cache_usage: Some(0.5),
-                prompt_tokens_per_second: Some(100.0),
-                generation_tokens_per_second: Some(50.0),
-                ttft: None,
-                tpot: None,
-                e2e_latency: None,
-            },
-        ),
-    ]);
     let pipeline = RouterPipeline::with_customized_context(
         Arc::new(ContextFilter),
         Arc::new(ContextScorer),
@@ -216,8 +142,7 @@ fn customized_context_is_request_owned_and_shared_by_filter_scorer_picker_across
             }
         },
     );
-    let router = PipelineRouter::with_pipeline(inventory, pipeline)
-        .with_route_target_stats_reader(Arc::new(TestStatsReader::new(stat_values)));
+    let router = PipelineRouter::with_pipeline(inventory, pipeline);
     let mut session = router.start(request());
 
     assert_eq!(
@@ -246,38 +171,38 @@ fn customized_context_is_request_owned_and_shared_by_filter_scorer_picker_across
             "request:picker:3",
         ]
     );
-    assert_eq!(
-        *trace.scorer_roles.lock().unwrap(),
+    let candidates = || {
         vec![
-            vec![
-                ModelServerRole::Decode,
+            (ModelServerRole::Decode, vec![]),
+            (
                 ModelServerRole::Encoder,
-                ModelServerRole::Prefill
-            ],
-            vec![
-                ModelServerRole::Decode,
-                ModelServerRole::Encoder,
-                ModelServerRole::Prefill
-            ],
-            vec![
-                ModelServerRole::Decode,
-                ModelServerRole::Encoder,
-                ModelServerRole::Prefill
-            ],
+                vec![ModelServerRole::Prefill, ModelServerRole::Decode],
+            ),
+            (ModelServerRole::Prefill, vec![ModelServerRole::Decode]),
         ]
-    );
+    };
     assert_eq!(
-        *trace.filter_observations.lock().unwrap(),
-        *trace.scorer_observations.lock().unwrap()
-    );
-    assert!(
-        trace
-            .scorer_observations
-            .lock()
-            .unwrap()
-            .iter()
-            .flatten()
-            .all(|(running_requests, _)| *running_requests == Some(3))
+        *trace.scorer_rounds.lock().unwrap(),
+        vec![
+            ScorerRound {
+                stage: RoutingStage::Initial,
+                completed_stages: vec![],
+                pipeline_scope_id: None,
+                candidates: candidates(),
+            },
+            ScorerRound {
+                stage: RoutingStage::Prefill,
+                completed_stages: vec![ModelServerRole::Encoder],
+                pipeline_scope_id: Some("pipeline-scope-a".into()),
+                candidates: candidates(),
+            },
+            ScorerRound {
+                stage: RoutingStage::Decode,
+                completed_stages: vec![ModelServerRole::Encoder, ModelServerRole::Prefill],
+                pipeline_scope_id: Some("pipeline-scope-a".into()),
+                candidates: candidates(),
+            },
+        ]
     );
     assert_eq!(
         *trace.picker_roles.lock().unwrap(),

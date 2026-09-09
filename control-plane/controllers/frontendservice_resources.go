@@ -59,27 +59,45 @@ func frontendDesiredResources(frontend *inferencev1alpha1.FrontendService, profi
 	terminationGracePeriodSeconds := requestTimeoutSeconds + 5
 	servingConfigMap := frontendServingConfigMapName(frontend)
 	routerFilter := frontend.Spec.RouterPipeline.Filter
-	if routerFilter == "" {
-		routerFilter = inferencev1alpha1.RouterFilterAllowAll
-	}
 	routerScorer := frontend.Spec.RouterPipeline.Scorer
-	if routerScorer == "" {
-		routerScorer = inferencev1alpha1.RouterScorerKVLeastLoaded
-	}
 	routerPicker := frontend.Spec.RouterPipeline.Picker
-	if routerPicker == "" {
-		routerPicker = inferencev1alpha1.RouterPickerRoundRobin
+	if routerFilter == "" || routerScorer == "" || routerPicker == "" {
+		return nil, nil, nil, fmt.Errorf("frontend routerPipeline was not defaulted")
 	}
+	tokenizerCachePath := "/var/cache/foretoken/models"
+	cacheMountPath := "/var/cache/foretoken"
 	frontendEnv := []corev1.EnvVar{
 		{Name: "FORETOKEN_LISTEN_ADDRESS", Value: fmt.Sprintf("0.0.0.0:%d", profile.Port)},
 		{Name: "FORETOKEN_SERVING_SNAPSHOT", Value: "/etc/foretoken/serving/serving.json"},
-		{Name: "HF_HOME", Value: "/var/cache/foretoken/huggingface"},
+		{Name: "HF_HOME", Value: tokenizerCachePath},
 		{Name: "FORETOKEN_REQUEST_TIMEOUT_SECONDS", Value: strconv.FormatInt(requestTimeoutSeconds, 10)},
 		{Name: "FORETOKEN_STREAM_IDLE_SECONDS", Value: strconv.FormatInt(streamIdleSeconds, 10)},
 		{Name: "FORETOKEN_KV_INDEX_KEY_PATH", Value: kvIndexerKeyPath},
 		{Name: "FORETOKEN_ROUTER_FILTER", Value: string(routerFilter)},
 		{Name: "FORETOKEN_ROUTER_SCORER", Value: string(routerScorer)},
 		{Name: "FORETOKEN_ROUTER_PICKER", Value: string(routerPicker)},
+	}
+	cacheVolume := corev1.Volume{Name: "runtime-cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}}
+	if profile.RuntimeCache != nil {
+		tokenizerCachePath = profile.RuntimeCache.MountPath + "/models"
+		cacheMountPath = profile.RuntimeCache.MountPath
+		frontendEnv[2].Value = tokenizerCachePath
+		frontendEnv = append(frontendEnv, corev1.EnvVar{Name: "FORETOKEN_TEMPORARY_HF_CACHE_DIR", Value: "/tmp/foretoken-runtime-cache/models/hub"})
+		cacheVolume.VolumeSource = corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: profile.RuntimeCache.ClaimName}}
+	}
+	volumes := []corev1.Volume{
+		{Name: "serving", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: servingConfigMap}}}},
+		cacheVolume,
+		{Name: "kv-indexer", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: kvIndexerSecretName, Items: []corev1.KeyToPath{{Key: kvIndexerSecretKey, Path: "key"}}}}},
+	}
+	mounts := []corev1.VolumeMount{
+		{Name: "serving", MountPath: "/etc/foretoken/serving", ReadOnly: true},
+		{Name: "runtime-cache", MountPath: cacheMountPath},
+		{Name: "kv-indexer", MountPath: "/etc/foretoken/kv-indexer", ReadOnly: true},
+	}
+	if profile.RuntimeCache != nil {
+		volumes = append(volumes, corev1.Volume{Name: "runtime-cache-temporary", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}})
+		mounts = append(mounts, corev1.VolumeMount{Name: "runtime-cache-temporary", MountPath: "/tmp/foretoken-runtime-cache"})
 	}
 
 	deployment := &appsv1.Deployment{
@@ -95,16 +113,7 @@ func frontendDesiredResources(frontend *inferencev1alpha1.FrontendService, profi
 					EnableServiceLinks:            &enableServiceLinks,
 					ImagePullSecrets:              slices.Clone(profile.ImagePullSecrets),
 					TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
-					Volumes: []corev1.Volume{
-						{
-							Name: "serving",
-							VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
-								LocalObjectReference: corev1.LocalObjectReference{Name: servingConfigMap},
-							}},
-						},
-						{Name: "tokenizer-cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-						{Name: "kv-indexer", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: kvIndexerSecretName, Items: []corev1.KeyToPath{{Key: kvIndexerSecretKey, Path: "key"}}}}},
-					},
+					Volumes:                       volumes,
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   &runAsNonRoot,
 						FSGroup:        &fileSystemGroup,
@@ -116,12 +125,8 @@ func frontendDesiredResources(frontend *inferencev1alpha1.FrontendService, profi
 						ImagePullPolicy: corev1.PullIfNotPresent,
 						Ports:           []corev1.ContainerPort{{Name: "http", ContainerPort: profile.Port, Protocol: corev1.ProtocolTCP}},
 						Env:             frontendEnv,
-						VolumeMounts: []corev1.VolumeMount{
-							{Name: "serving", MountPath: "/etc/foretoken/serving", ReadOnly: true},
-							{Name: "tokenizer-cache", MountPath: "/var/cache/foretoken"},
-							{Name: "kv-indexer", MountPath: "/etc/foretoken/kv-indexer", ReadOnly: true},
-						},
-						Resources: corev1.ResourceRequirements{Requests: requests, Limits: limits},
+						VolumeMounts:    mounts,
+						Resources:       corev1.ResourceRequirements{Requests: requests, Limits: limits},
 						SecurityContext: &corev1.SecurityContext{
 							AllowPrivilegeEscalation: &allowPrivilegeEscalation,
 							ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,

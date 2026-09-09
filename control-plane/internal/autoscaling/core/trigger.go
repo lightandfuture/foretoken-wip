@@ -6,20 +6,16 @@ type TriggerDisposition string
 
 const (
 	TriggerFire             TriggerDisposition = "Fire"
-	TriggerHold             TriggerDisposition = "Hold"
 	TriggerInsufficientData TriggerDisposition = "InsufficientData"
 )
 
 type TriggerReason string
 
 const (
-	TriggerReasonPeriodic                              TriggerReason = "Periodic"
-	TriggerReasonHighWatermark                         TriggerReason = "HighWatermark"
-	TriggerReasonLowWatermark                          TriggerReason = "LowWatermark"
-	TriggerReasonWithinWatermarkBand                   TriggerReason = "WithinWatermarkBand"
-	TriggerDesiredCapacityReasonObservationUnavailable TriggerReason = "ObservationUnavailable"
-	TriggerDesiredCapacityReasonObservationStale       TriggerReason = "ObservationStale"
-	TriggerDesiredCapacityReasonObservationIncomplete  TriggerReason = "ObservationIncomplete"
+	TriggerReasonPeriodic           TriggerReason = "Periodic"
+	TriggerReasonMetricsUnavailable TriggerReason = "MetricsUnavailable"
+	TriggerReasonMetricsStale       TriggerReason = "MetricsStale"
+	TriggerReasonMetricsIncomplete  TriggerReason = "MetricsIncomplete"
 )
 
 type TriggerDecision struct {
@@ -27,27 +23,25 @@ type TriggerDecision struct {
 	Reason      TriggerReason
 	Message     string
 }
+
 type TriggerAlgorithm interface {
 	Name() string
 	Decide(ScalingSnapshot) TriggerDecision
 }
-type TriggerConfig struct {
-	LowQueuePerRoutableGroup  int64
-	HighQueuePerRoutableGroup int64
-}
 
-func ObservationTriggerDecision(snapshot ScalingSnapshot) (TriggerDecision, bool) {
-	switch snapshot.Observation.State {
-	case ObservationUnavailable:
-		return TriggerDecision{Disposition: TriggerInsufficientData, Reason: TriggerDesiredCapacityReasonObservationUnavailable, Message: "demand observations are unavailable"}, false
-	case ObservationStale:
-		return TriggerDecision{Disposition: TriggerInsufficientData, Reason: TriggerDesiredCapacityReasonObservationStale, Message: "demand observations are stale"}, false
-	case ObservationFresh:
-		if snapshot.Observation.Window.Complete {
+// MetricsTriggerDecision converts unavailable, stale, or incomplete metrics into an insufficient-data trigger result.
+func MetricsTriggerDecision(snapshot ScalingSnapshot) (TriggerDecision, bool) {
+	switch snapshot.Metrics.State {
+	case MetricsUnavailable:
+		return TriggerDecision{Disposition: TriggerInsufficientData, Reason: TriggerReasonMetricsUnavailable, Message: "scaling metrics are unavailable"}, false
+	case MetricsStale:
+		return TriggerDecision{Disposition: TriggerInsufficientData, Reason: TriggerReasonMetricsStale, Message: "scaling metrics are stale"}, false
+	case MetricsFresh:
+		if snapshot.Metrics.Window.Complete {
 			return TriggerDecision{}, true
 		}
-		return TriggerDecision{Disposition: TriggerInsufficientData, Reason: TriggerDesiredCapacityReasonObservationIncomplete, Message: "demand observation window is incomplete"}, false
+		return TriggerDecision{Disposition: TriggerInsufficientData, Reason: TriggerReasonMetricsIncomplete, Message: "scaling metrics are incomplete"}, false
 	default:
-		return TriggerDecision{Disposition: TriggerInsufficientData, Reason: TriggerDesiredCapacityReasonObservationUnavailable, Message: "demand observations are unavailable"}, false
+		return TriggerDecision{Disposition: TriggerInsufficientData, Reason: TriggerReasonMetricsUnavailable, Message: "scaling metrics are unavailable"}, false
 	}
 }

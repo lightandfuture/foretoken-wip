@@ -11,62 +11,58 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 )
 
-// modelPoolCapacity counts actual Groups only. Requested capacity is assigned by the
+// modelPoolReplicaState counts actual Groups only. Requested capacity is assigned by the
 // caller, then any not-yet-materialized requested ordinals are recorded as Pending.
-func modelPoolCapacity(service *inferencev1alpha1.ModelService, pool *inferencev1alpha1.ModelPool, groups []inferencev1alpha1.ModelGroup) core.CapacityState {
-	var capacity core.CapacityState
+func modelPoolReplicaState(service *inferencev1alpha1.ModelService, pool *inferencev1alpha1.ModelPool, groups []inferencev1alpha1.ModelGroup) core.ReplicaState {
+	var replicaState core.ReplicaState
 	if pool == nil {
-		return capacity
+		return replicaState
 	}
 	for index := range groups {
 		group := &groups[index]
 		if !modelGroupOwnedByPool(group, pool) {
 			continue
 		}
-		addGroupLifecycle(&capacity, group)
+		addGroupLifecycle(&replicaState, group)
 		if group.Spec.Revision == serviceServingRevision(service, pool) && routingGroupReady(group) {
-			capacity.RoutableGroups++
+			replicaState.RoutableReplicas++
 		}
 	}
-	return capacity
+	return replicaState
 }
 
-// epdPipelineScopeCapacity counts one unit only when its encoder, prefill, and decode
-// members form an ordinal-complete active revision triplet. This deliberately does
-// not apply to P/D: P and D retain their independent Pool scaling targets.
-func epdPipelineScopeCapacity(service *inferencev1alpha1.ModelService, pools map[string]*inferencev1alpha1.ModelPool, groups []inferencev1alpha1.ModelGroup, requested int32) core.CapacityState {
-	byRoleOrdinal := map[inferencev1alpha1.ModelRole]map[int32]*inferencev1alpha1.ModelGroup{
+// epdPipelineReplicaState reports the number of complete E/P/D executions available from
+// the three compatible role pools. Routing is free across ordinals, so usable capacity is
+// the least Ready role count rather than the number of ordinal-aligned triplets.
+func epdPipelineReplicaState(service *inferencev1alpha1.ModelService, pools map[string]*inferencev1alpha1.ModelPool, groups []inferencev1alpha1.ModelGroup, requested int32) core.ReplicaState {
+	readyOrdinals := map[inferencev1alpha1.ModelRole]map[int32]struct{}{
 		inferencev1alpha1.ModelRoleEncoder: {},
 		inferencev1alpha1.ModelRolePrefill: {},
 		inferencev1alpha1.ModelRoleDecode:  {},
 	}
+	transitioning := false
 	for index := range groups {
 		group := &groups[index]
 		pool := poolForEPDGroup(pools, group)
 		if pool == nil || group.Spec.Revision != serviceServingRevision(service, pool) || group.Spec.Ordinal >= requested {
 			continue
 		}
-		roleGroups := byRoleOrdinal[group.Spec.Role]
-		if _, found := roleGroups[group.Spec.Ordinal]; found {
-			// A duplicate ordinal cannot represent a complete, safely routeable triplet.
-			roleGroups[group.Spec.Ordinal] = nil
-			continue
+		if group.DeletionTimestamp.IsZero() && group.Status.Phase == inferencev1alpha1.ModelGroupPhaseReady && routingGroupReady(group) {
+			readyOrdinals[group.Spec.Role][group.Spec.Ordinal] = struct{}{}
+		} else {
+			transitioning = true
 		}
-		roleGroups[group.Spec.Ordinal] = group
 	}
 
-	var capacity core.CapacityState
-	for ordinal := int32(0); ordinal < requested; ordinal++ {
-		encoder := byRoleOrdinal[inferencev1alpha1.ModelRoleEncoder][ordinal]
-		prefill := byRoleOrdinal[inferencev1alpha1.ModelRolePrefill][ordinal]
-		decode := byRoleOrdinal[inferencev1alpha1.ModelRoleDecode][ordinal]
-		if encoder == nil || prefill == nil || decode == nil {
-			capacity.PendingGroups++
-			continue
-		}
-		addTripletLifecycle(&capacity, encoder, prefill, decode)
+	ready := requested
+	for _, role := range []inferencev1alpha1.ModelRole{inferencev1alpha1.ModelRoleEncoder, inferencev1alpha1.ModelRolePrefill, inferencev1alpha1.ModelRoleDecode} {
+		ready = min(ready, int32(len(readyOrdinals[role])))
 	}
-	return capacity
+	return core.ReplicaState{
+		ReadyReplicas:    ready,
+		RoutableReplicas: ready,
+		Transitioning:    transitioning || ready < requested,
+	}
 }
 
 func poolForEPDGroup(pools map[string]*inferencev1alpha1.ModelPool, group *inferencev1alpha1.ModelGroup) *inferencev1alpha1.ModelPool {
@@ -89,78 +85,44 @@ func modelGroupOwnedByPool(group *inferencev1alpha1.ModelGroup, pool *inferencev
 		routingControllerOwnerMatches(group, inferencev1alpha1.GroupVersion.String(), "ModelPool", pool.Name, pool.UID)
 }
 
-func addGroupLifecycle(capacity *core.CapacityState, group *inferencev1alpha1.ModelGroup) {
+func addGroupLifecycle(replicaState *core.ReplicaState, group *inferencev1alpha1.ModelGroup) {
 	if group.DeletionTimestamp.IsZero() && group.Status.Phase == inferencev1alpha1.ModelGroupPhaseReady && routingGroupReady(group) {
-		capacity.ReadyGroups++
+		replicaState.ReadyReplicas++
 		return
 	}
-	addLifecycle(capacity, group)
+	addLifecycle(replicaState, group)
 }
 
-func addTripletLifecycle(capacity *core.CapacityState, groups ...*inferencev1alpha1.ModelGroup) {
-	allReady := true
-	for _, group := range groups {
-		allReady = allReady && group.DeletionTimestamp.IsZero() && group.Status.Phase == inferencev1alpha1.ModelGroupPhaseReady && routingGroupReady(group)
-	}
-	if allReady {
-		capacity.ReadyGroups++
-		capacity.RoutableGroups++
-		return
-	}
-	for _, group := range groups {
-		if !group.DeletionTimestamp.IsZero() {
-			addLifecycle(capacity, group)
-			return
-		}
-	}
-	for _, group := range groups {
-		if group.Status.Phase == inferencev1alpha1.ModelGroupPhaseFailed {
-			capacity.FailedGroups++
-			capacity.Transitioning = true
-			return
-		}
-	}
-	for _, group := range groups {
-		if group.Status.Phase == inferencev1alpha1.ModelGroupPhaseProvisioning {
-			capacity.ProvisioningGroups++
-			capacity.Transitioning = true
-			return
-		}
-	}
-	capacity.PendingGroups++
-	capacity.Transitioning = true
-}
-
-func addLifecycle(capacity *core.CapacityState, group *inferencev1alpha1.ModelGroup) {
+func addLifecycle(replicaState *core.ReplicaState, group *inferencev1alpha1.ModelGroup) {
 	if !group.DeletionTimestamp.IsZero() {
 		if meta.IsStatusConditionTrue(group.Status.Conditions, conditionDrained) {
-			capacity.TerminatingGroups++
+			replicaState.TerminatingReplicas++
 		} else {
-			capacity.DrainingGroups++
+			replicaState.DrainingReplicas++
 		}
-		capacity.Transitioning = true
+		replicaState.Transitioning = true
 		return
 	}
 	switch group.Status.Phase {
 	case inferencev1alpha1.ModelGroupPhaseProvisioning:
-		capacity.ProvisioningGroups++
+		replicaState.ProvisioningReplicas++
 	case inferencev1alpha1.ModelGroupPhaseFailed:
-		capacity.FailedGroups++
+		replicaState.FailedReplicas++
 	case inferencev1alpha1.ModelGroupPhaseDraining:
-		capacity.DrainingGroups++
+		replicaState.DrainingReplicas++
 	case inferencev1alpha1.ModelGroupPhaseTerminating:
-		capacity.TerminatingGroups++
+		replicaState.TerminatingReplicas++
 	default:
 		// Empty phase is deliberately Pending; desired capacity never implies readiness.
-		capacity.PendingGroups++
+		replicaState.PendingReplicas++
 	}
-	capacity.Transitioning = true
+	replicaState.Transitioning = true
 }
 
-func finalizeCapacity(capacity *core.CapacityState) {
-	observed := capacity.ReadyGroups + capacity.PendingGroups + capacity.ProvisioningGroups + capacity.DrainingGroups + capacity.TerminatingGroups + capacity.FailedGroups
-	if observed < capacity.RequestedGroups {
-		capacity.PendingGroups += capacity.RequestedGroups - observed
-		capacity.Transitioning = true
+func finalizeReplicaState(replicaState *core.ReplicaState) {
+	observed := replicaState.ReadyReplicas + replicaState.PendingReplicas + replicaState.ProvisioningReplicas + replicaState.DrainingReplicas + replicaState.TerminatingReplicas + replicaState.FailedReplicas
+	if observed < replicaState.RequestedReplicas {
+		replicaState.PendingReplicas += replicaState.RequestedReplicas - observed
+		replicaState.Transitioning = true
 	}
 }

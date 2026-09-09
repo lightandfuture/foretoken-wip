@@ -13,12 +13,11 @@ use foretoken_kv_indexer::{
 use foretoken_model_protocol::{KvCacheLocality, KvPlacement, KvStorageTier, ModelServerRole};
 use foretoken_router::algorithm::LeastLoadedScorer;
 use foretoken_router::{
-    CandidateIndex, KvLeastLoadedScorer, PipelineRouter, RouteCandidate, RouteFilter, RoutePicker,
-    RouteScore, RouteScorer, RouteTargetId, RouteTargetStats, Router, RouterPipeline,
-    RouterRequest, ScoredCandidate,
+    KvLeastLoadedScorer, PipelineRouter, RouteCandidate, RouteScorer, RouteTargetId,
+    RouteTargetStats, Router, RoutingProgress, RoutingStage,
 };
 
-use super::support::{TestStatsReader, inventory, request, route, stats};
+use super::support::{inventory, request, route};
 
 struct PrefixFacts;
 
@@ -68,6 +67,7 @@ fn prefix(tokens: usize, tier: KvStorageTier, locality: KvCacheLocality) -> KvPr
     }
 }
 
+// Protects cache locality from requests whose cache identity cannot be shared safely.
 #[test]
 fn kv_lookup_rejects_requests_with_separate_cache_semantics() {
     let mut salted = request();
@@ -88,6 +88,14 @@ fn kv_lookup_rejects_requests_with_separate_cache_semantics() {
         disabled.kv_prefix_lookup("target", 0),
         Err(KvPrefixUnavailableReason::UnsupportedRequest)
     ));
+}
+
+fn initial_routing_progress() -> RoutingProgress<'static> {
+    RoutingProgress {
+        current_stage: RoutingStage::Initial,
+        completed_stages: &[],
+        pipeline_scope_id: None,
+    }
 }
 
 fn target_stats(running_requests: u64) -> Arc<RouteTargetStats> {
@@ -122,6 +130,7 @@ fn candidate(id: &str, role: ModelServerRole, load: u64) -> RouteCandidate {
     }
 }
 
+// Protects KV scoring order and keeps unavailable locality distinct from a confirmed miss.
 #[test]
 fn kv_scoring_is_prefix_tier_locality_load_and_keeps_unavailable_candidates() {
     let candidates = vec![
@@ -132,7 +141,13 @@ fn kv_scoring_is_prefix_tier_locality_load_and_keeps_unavailable_candidates() {
         candidate("unavailable", ModelServerRole::Aggregate, 0),
         candidate("decode", ModelServerRole::Decode, 0),
     ];
-    let scored = KvLeastLoadedScorer.score(&request(), &candidates, &PrefixFacts, &mut ());
+    let scored = KvLeastLoadedScorer.score(
+        &request(),
+        &candidates,
+        &PrefixFacts,
+        &initial_routing_progress(),
+        &mut (),
+    );
     let score = |id: &str| {
         let index = [
             "remote",
@@ -157,6 +172,7 @@ fn kv_scoring_is_prefix_tier_locality_load_and_keeps_unavailable_candidates() {
     assert_eq!(score("decode").matched_tokens, 0);
 }
 
+// Protects prefill scoring from using Decode load in another pipeline scope.
 #[test]
 fn prefill_downstream_load_is_scoped_to_its_pipeline_scope() {
     let candidates = || {
@@ -174,8 +190,20 @@ fn prefill_downstream_load_is_scoped_to_its_pipeline_scope() {
     let request = request();
     let candidates = candidates();
     let scored = [
-        LeastLoadedScorer.score(&request, &candidates, &PrefixFacts, &mut ()),
-        KvLeastLoadedScorer.score(&request, &candidates, &PrefixFacts, &mut ()),
+        LeastLoadedScorer.score(
+            &request,
+            &candidates,
+            &PrefixFacts,
+            &initial_routing_progress(),
+            &mut (),
+        ),
+        KvLeastLoadedScorer.score(
+            &request,
+            &candidates,
+            &PrefixFacts,
+            &initial_routing_progress(),
+            &mut (),
+        ),
     ];
 
     for round in scored {
@@ -191,6 +219,32 @@ fn prefill_downstream_load_is_scoped_to_its_pipeline_scope() {
         };
         assert!(score("prefill-b") > score("prefill-a"));
     }
+}
+
+// Protects load-aware routing from ignoring requests queued inside the vLLM scheduler.
+#[test]
+fn load_scoring_uses_scheduler_backlog_without_double_counting_admission() {
+    let mut idle = candidate("idle", ModelServerRole::Aggregate, 1);
+    let mut queued = candidate("queued", ModelServerRole::Aggregate, 2);
+    Arc::get_mut(idle.route_target_stats.as_mut().unwrap())
+        .unwrap()
+        .scheduler_running_requests = Some(1);
+    let queued_stats = Arc::get_mut(queued.route_target_stats.as_mut().unwrap()).unwrap();
+    queued_stats.scheduler_running_requests = Some(2);
+    queued_stats.scheduler_waiting_requests = Some(5);
+
+    let candidates = vec![idle, queued];
+    let scores = LeastLoadedScorer.score(
+        &request(),
+        &candidates,
+        &PrefixFacts,
+        &initial_routing_progress(),
+        &mut (),
+    );
+
+    assert_eq!(scores[0].load, -1);
+    assert_eq!(scores[1].load, -7);
+    assert!(scores[0] > scores[1]);
 }
 
 struct RankFacts;
@@ -210,91 +264,7 @@ impl KvPrefixIndexer for RankFacts {
     }
 }
 
-struct SnapshotFilter;
-
-impl RouteFilter for SnapshotFilter {
-    fn filter(
-        &self,
-        _: &RouterRequest,
-        candidates: &[RouteCandidate],
-        _: &dyn KvPrefixIndexer,
-        _: &mut (),
-    ) -> Vec<CandidateIndex> {
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(
-            candidates[0]
-                .route_target_stats
-                .as_ref()
-                .map(|stats| stats.running_requests),
-            Some(7)
-        );
-        assert!(Arc::ptr_eq(
-            candidates[0].route_target_stats.as_ref().unwrap(),
-            candidates[1].route_target_stats.as_ref().unwrap(),
-        ));
-        vec![CandidateIndex(0), CandidateIndex(1)]
-    }
-}
-
-struct SnapshotScorer;
-
-impl RouteScorer for SnapshotScorer {
-    fn score(
-        &self,
-        _: &RouterRequest,
-        candidates: &[RouteCandidate],
-        _: &dyn KvPrefixIndexer,
-        _: &mut (),
-    ) -> Vec<RouteScore> {
-        assert_eq!(candidates.len(), 2);
-        assert_eq!(
-            candidates[0]
-                .route_target_stats
-                .as_ref()
-                .map(|stats| stats.running_requests),
-            Some(7)
-        );
-        assert!(Arc::ptr_eq(
-            candidates[0].route_target_stats.as_ref().unwrap(),
-            candidates[1].route_target_stats.as_ref().unwrap(),
-        ));
-        vec![RouteScore::default(); candidates.len()]
-    }
-}
-
-struct FirstPicker;
-
-impl RoutePicker for FirstPicker {
-    fn pick(&self, _: &RouterRequest, _: &[ScoredCandidate], _: &mut ()) -> Option<CandidateIndex> {
-        Some(CandidateIndex(0))
-    }
-}
-
-#[test]
-fn data_parallel_candidates_share_one_target_observation_and_preserve_rank() {
-    let mut aggregate = route("dp-two", ModelServerRole::Aggregate);
-    aggregate.data_parallel_size = 2;
-    let stat_values = stats();
-    stat_values
-        .lock()
-        .unwrap()
-        .insert(RouteTargetId::new("dp-two"), (*target_stats(7)).clone());
-    let router = PipelineRouter::with_pipeline(
-        inventory(vec![aggregate]),
-        RouterPipeline::new(
-            Arc::new(SnapshotFilter),
-            Arc::new(SnapshotScorer),
-            Arc::new(FirstPicker),
-        ),
-    )
-    .with_route_target_stats_reader(Arc::new(TestStatsReader::new(stat_values)));
-
-    let selected = router.start(request()).select_initial().unwrap();
-
-    assert_eq!(selected.route_target_id, RouteTargetId::new("dp-two"));
-    assert_eq!(selected.data_parallel_rank, 0);
-}
-
+// Protects data-parallel routing from collapsing rank-specific KV locality.
 #[test]
 fn data_parallel_kv_rank_winner_is_selected_from_an_exact_rank_query() {
     let mut aggregate = route("dp-two", ModelServerRole::Aggregate);

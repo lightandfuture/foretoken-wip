@@ -76,7 +76,6 @@ fn pd_snapshot() -> ServingSnapshot {
             tokenizer: "tokenizer".into(),
             tokenizer_revision: "r1".into(),
             capabilities: ["chat".into()].into_iter().collect(),
-            max_input_tokens: None,
             admission_target_sets: vec![admission_targets],
         }],
         groups: vec![],
@@ -95,42 +94,16 @@ fn pd_snapshot() -> ServingSnapshot {
 }
 
 fn epd_component(id: &str, role: ModelServerRole) -> SnapshotEpdComponent {
-    let pd = role != ModelServerRole::Encoder;
-    let ec = role != ModelServerRole::Decode;
     SnapshotEpdComponent {
         service_uid: "service".into(),
         pool_uid: "pool".into(),
         pool_name: "pool".into(),
         route_target_id: RouteTargetId::new(id),
         role,
-        pipeline_scope_id: "epd-a".into(),
         model: "model".into(),
         revision: "r1".into(),
         tokenizer: "tokenizer".into(),
         tokenizer_revision: "r1".into(),
-        profile_name: if pd {
-            "pd-profile".into()
-        } else {
-            String::new()
-        },
-        profile_revision: if pd { "r1".into() } else { String::new() },
-        connector: if pd {
-            "MooncakeConnector".into()
-        } else {
-            String::new()
-        },
-        protocol: if pd { "rdma".into() } else { String::new() },
-        ec_profile_name: if ec {
-            "ec-profile".into()
-        } else {
-            String::new()
-        },
-        ec_profile_revision: if ec { "r1".into() } else { String::new() },
-        ec_connector: if ec {
-            "ECExampleConnector".into()
-        } else {
-            String::new()
-        },
         capabilities: ["chat".into()].into_iter().collect(),
         max_input_tokens: None,
         endpoint: "http://127.0.0.1:1".into(),
@@ -144,20 +117,36 @@ fn epd_component(id: &str, role: ModelServerRole) -> SnapshotEpdComponent {
 fn epd_snapshot() -> ServingSnapshot {
     ServingSnapshot {
         version: 1,
-        models: vec![],
+        models: vec![SnapshotModel {
+            service_uid: "service".into(),
+            model: "model".into(),
+            revision: "r1".into(),
+            tokenizer: "tokenizer".into(),
+            tokenizer_revision: "r1".into(),
+            capabilities: ["chat".into()].into_iter().collect(),
+            admission_target_sets: vec![RouteTargetSet::new(vec![ScalingTarget {
+                service_uid: "service".into(),
+                name: "epd".into(),
+                uid: "service".into(),
+                kind: ScalingTargetKind::EPDPipelineScope,
+            }])],
+        }],
         groups: vec![],
         pd_components: vec![],
         pd_pipeline_scopes: vec![],
         epd_components: vec![
-            epd_component("e", ModelServerRole::Encoder),
-            epd_component("p", ModelServerRole::Prefill),
-            epd_component("d", ModelServerRole::Decode),
+            epd_component("e0", ModelServerRole::Encoder),
+            epd_component("e1", ModelServerRole::Encoder),
+            epd_component("p0", ModelServerRole::Prefill),
+            epd_component("p1", ModelServerRole::Prefill),
+            epd_component("d0", ModelServerRole::Decode),
+            epd_component("d1", ModelServerRole::Decode),
         ],
         epd_pipeline_scopes: vec![SnapshotEpdPipelineScope {
             pipeline_scope_id: "epd-a".into(),
-            encoder_route_target_id: RouteTargetId::new("e"),
-            prefill_route_target_id: RouteTargetId::new("p"),
-            decode_route_target_id: RouteTargetId::new("d"),
+            encoder_route_target_ids: vec![RouteTargetId::new("e0"), RouteTargetId::new("e1")],
+            prefill_route_target_ids: vec![RouteTargetId::new("p0"), RouteTargetId::new("p1")],
+            decode_route_target_ids: vec![RouteTargetId::new("d0"), RouteTargetId::new("d1")],
         }],
     }
 }
@@ -264,7 +253,20 @@ async fn serve_ready_without_metadata() -> String {
 fn aggregate_snapshot(endpoint: String) -> ServingSnapshot {
     ServingSnapshot {
         version: 1,
-        models: vec![],
+        models: vec![SnapshotModel {
+            service_uid: "service".into(),
+            model: "model".into(),
+            revision: "r1".into(),
+            tokenizer: "tokenizer".into(),
+            tokenizer_revision: "r1".into(),
+            capabilities: ["chat".into(), "multimodal".into()].into_iter().collect(),
+            admission_target_sets: vec![RouteTargetSet::new(vec![ScalingTarget {
+                service_uid: "service".into(),
+                name: "pool".into(),
+                uid: "pool".into(),
+                kind: ScalingTargetKind::Pool,
+            }])],
+        }],
         groups: vec![SnapshotGroup {
             service_uid: "service".into(),
             pool_uid: "pool".into(),
@@ -287,6 +289,7 @@ fn aggregate_snapshot(endpoint: String) -> ServingSnapshot {
     }
 }
 
+// Protects frontend-owned capabilities while runtime metadata gates backend-owned capabilities.
 #[tokio::test]
 async fn aggregate_readiness_preserves_frontend_owned_capabilities() {
     let registry =
@@ -296,20 +299,17 @@ async fn aggregate_readiness_preserves_frontend_owned_capabilities() {
 
     assert!(registry.is_route_target_healthy(&RouteTargetId::new("a")));
     assert_eq!(
-        registry.metadata(&RouteTargetId::new("a")),
-        Some(runtime_metadata())
-    );
-    assert_eq!(
         registry.effective_capabilities(&RouteTargetId::new("a")),
         ["chat".into(), "multimodal".into()].into_iter().collect()
     );
     assert_eq!(registry.effective_max_model_len("model"), Some(32_768));
     assert_eq!(
-        registry.effective_model_dtype("model"),
+        registry.effective_model_dtype("model").unwrap(),
         Some(ModelDtype::BFloat16)
     );
 }
 
+// Protects routing from a process that is alive but reports missing or mismatched model metadata.
 #[tokio::test]
 async fn readiness_requires_runtime_metadata() {
     let registry =
@@ -319,8 +319,6 @@ async fn readiness_requires_runtime_metadata() {
     registry.refresh_backend_readiness().await;
 
     assert!(!registry.is_route_target_healthy(&RouteTargetId::new("a")));
-    assert_eq!(registry.metadata(&RouteTargetId::new("a")), None);
-
     let mut mismatched = aggregate_snapshot(serve_model_server().await);
     mismatched.groups[0].model = "different-model".into();
     let registry = BackendRegistry::from_snapshot(mismatched).unwrap();
@@ -328,8 +326,9 @@ async fn readiness_requires_runtime_metadata() {
     assert!(!registry.is_route_target_healthy(&RouteTargetId::new("a")));
 }
 
+// Protects rate windows and histogram reset handling while keeping current gauges available.
 #[tokio::test]
-async fn telemetry_history_derives_windows_and_rejects_counter_resets() {
+async fn telemetry_history_derives_windows_and_resets_counter_history() {
     let telemetry_state = Arc::new(Mutex::new(telemetry(1_000, 100, histogram(2, 0.2, 1))));
     let endpoint = serve_model_server_with_telemetry(telemetry_state.clone()).await;
     let registry = BackendRegistry::from_snapshot(aggregate_snapshot(endpoint)).unwrap();
@@ -347,14 +346,18 @@ async fn telemetry_history_derives_windows_and_rejects_counter_resets() {
 
     *telemetry_state.lock().unwrap() = telemetry(302_000, 10, histogram(1, 0.1, 1));
     registry.refresh_backend_readiness().await;
-    assert!(registry.stats(&target, Duration::from_secs(150)).is_none());
+    let stats = registry.stats(&target, Duration::from_secs(150)).unwrap();
+    assert_eq!(stats.observed_window, Duration::ZERO);
+    assert_eq!(stats.scheduler_running_requests, Some(0));
+    assert_eq!(stats.prompt_tokens_per_second, None);
+    assert_eq!(stats.ttft, None);
 
     telemetry_state.lock().unwrap().accepting = false;
     registry.refresh_backend_readiness().await;
     assert!(!registry.is_route_target_healthy(&target));
-    assert!(registry.metadata(&target).is_none());
 }
 
+// Protects one P/D snapshot projection across routing, readiness, admission, and KV bindings.
 #[tokio::test]
 async fn pd_snapshot_projects_routing_readiness_and_kv_contracts() {
     let mut partial = pd_snapshot();
@@ -369,35 +372,17 @@ async fn pd_snapshot_projects_routing_readiness_and_kv_contracts() {
     snapshot.pd_components[0].endpoint = serve_model_server().await;
     snapshot.pd_components[0].prefill_bootstrap_endpoint =
         Some(snapshot.pd_components[0].endpoint.clone());
-    snapshot.pd_components[0].max_input_tokens = Some(4096);
     snapshot.pd_components[1].endpoint = serve_model_server().await;
-    snapshot.pd_components[1].max_input_tokens = Some(8192);
     let build = BackendRegistryBuild::from_snapshot(snapshot).unwrap();
     let registry = build.registry;
     registry.refresh_backend_readiness().await;
 
-    let routes = registry.route_table().routes();
+    let routes = registry.model_routes().routes();
     assert_eq!(routes.len(), 2);
     assert!(
         routes
             .iter()
             .all(|route| route.admission_targets.targets().len() == 2)
-    );
-    assert_eq!(
-        routes
-            .iter()
-            .find(|route| route.role == ModelServerRole::Prefill)
-            .unwrap()
-            .max_input_tokens,
-        Some(4096)
-    );
-    assert_eq!(
-        routes
-            .iter()
-            .find(|route| route.role == ModelServerRole::Decode)
-            .unwrap()
-            .max_input_tokens,
-        Some(8192)
     );
     assert!(registry.is_ready());
     assert_eq!(registry.healthy_models(), vec!["model"]);
@@ -430,11 +415,12 @@ async fn pd_snapshot_projects_routing_readiness_and_kv_contracts() {
     );
 }
 
+// Protects cross-group E/P/D compatibility-scope projection and prefill-only KV event ownership.
 #[test]
-fn epd_snapshot_projects_one_static_triplet_and_prefill_kv_source() {
+fn epd_snapshot_projects_all_compatible_routes_and_prefill_kv_sources() {
     let build = BackendRegistryBuild::from_snapshot(epd_snapshot()).unwrap();
-    let routes = build.registry.route_table().routes();
-    assert_eq!(routes.len(), 3);
+    let routes = build.registry.model_routes().routes();
+    assert_eq!(routes.len(), 6);
     assert!(
         routes
             .iter()
@@ -445,11 +431,13 @@ fn epd_snapshot_projects_one_static_triplet_and_prefill_kv_source() {
             route.admission_targets.targets() == std::slice::from_ref(&route.target)
         })
     );
-    assert_eq!(build.kv_runtime_config.route_bindings.len(), 1);
-    assert_eq!(build.kv_runtime_config.event_sources.len(), 1);
-    assert!(build.kv_runtime_config.route_bindings.contains_key("p"));
+    assert_eq!(build.kv_runtime_config.route_bindings.len(), 2);
+    assert_eq!(build.kv_runtime_config.event_sources.len(), 2);
+    assert!(build.kv_runtime_config.route_bindings.contains_key("p0"));
+    assert!(build.kv_runtime_config.route_bindings.contains_key("p1"));
 }
 
+// Protects atomic route withdrawal when the controller publishes an empty snapshot.
 #[test]
 fn empty_snapshot_withdraws_all_routes() {
     let build = BackendRegistryBuild::from_snapshot(ServingSnapshot {
@@ -463,10 +451,11 @@ fn empty_snapshot_withdraws_all_routes() {
     })
     .unwrap();
 
-    assert!(build.registry.route_table().routes().is_empty());
+    assert!(build.registry.model_routes().routes().is_empty());
     assert!(build.registry.configured_models().is_empty());
 }
 
+// Protects snapshot rejection for incomplete ownership and cross-component pipeline identities.
 #[test]
 fn invalid_scaling_identity_or_pipeline_scope_is_rejected() {
     let mut pd = pd_snapshot();
@@ -477,7 +466,7 @@ fn invalid_scaling_identity_or_pipeline_scope_is_rejected() {
     ));
 
     let mut epd = epd_snapshot();
-    epd.epd_pipeline_scopes[0].decode_route_target_id = RouteTargetId::new("other");
+    epd.epd_pipeline_scopes[0].decode_route_target_ids = vec![RouteTargetId::new("other")];
     assert!(matches!(
         BackendRegistry::from_snapshot(epd),
         Err(SnapshotError::InvalidEpdPipelineScope(_))

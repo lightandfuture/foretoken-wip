@@ -4,7 +4,7 @@
 //! vLLM text lowering reused by the Foretoken routing data path.
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use foretoken_chat::{
@@ -13,7 +13,7 @@ use foretoken_chat::{
 use foretoken_model_protocol::ModelDtype;
 use foretoken_tokenizer::DynTokenizer;
 use hf_hub::api::tokio::ApiBuilder;
-use hf_hub::{Repo, RepoType, api::Siblings};
+use hf_hub::{Cache, Repo, RepoType, api::Siblings};
 use thiserror::Error;
 use vllm_text::backend::hf::HfTextBackend;
 
@@ -28,23 +28,33 @@ pub struct HfSnapshotRuntime {
 }
 
 const HF_TOKEN_ENV: &str = "HF_TOKEN";
+const HF_HUB_OFFLINE_ENV: &str = "HF_HUB_OFFLINE";
+const TEMPORARY_HF_CACHE_DIR_ENV: &str = "FORETOKEN_TEMPORARY_HF_CACHE_DIR";
 const MODEL_FILES: &[&str] = &[
+    "added_tokens.json",
     "chat_template.json",
     "config.json",
     "generation_config.json",
+    "merges.txt",
     "preprocessor_config.json",
     "processor_config.json",
+    "sentencepiece.bpe.model",
+    "special_tokens_map.json",
+    "spiece.model",
     "tekken.json",
     "tiktoken.model",
     "tokenizer.json",
+    "tokenizer.model",
     "tokenizer_config.json",
     "video_preprocessor_config.json",
+    "vocab.json",
+    "vocab.txt",
 ];
 
 /// Loads a local tokenizer directory or downloads a pinned Hub revision into the HF cache.
 ///
-/// Remote files are placed in the standard `HF_HOME` cache and then loaded through vLLM's
-/// local resolver so tokenizer selection remains upstream-owned.
+/// Remote files use the standard `HF_HOME` cache, or the controller-projected Pod cache when
+/// persistent storage is offline, and are then loaded through vLLM's local resolver.
 pub async fn load_hf_text_backend(
     model_id: &str,
     revision: &str,
@@ -57,8 +67,25 @@ pub async fn load_hf_text_backend(
             .await
             .map_err(|_| TextBackendLoadError::LocalModel);
     }
+    if let Some(snapshot) = cached_model_snapshot(model_id, revision) {
+        let snapshot = snapshot
+            .to_str()
+            .ok_or(TextBackendLoadError::NonUtf8CachePath)?;
+        return HfTextBackend::from_model(snapshot)
+            .await
+            .map_err(|_| TextBackendLoadError::CachedModel);
+    }
+    if std::env::var(HF_HUB_OFFLINE_ENV).is_ok_and(|value| value == "1") {
+        return Err(TextBackendLoadError::OfflineCacheMiss);
+    }
 
     let mut builder = ApiBuilder::from_env().with_progress(false);
+    if let Some(cache_dir) = std::env::var(TEMPORARY_HF_CACHE_DIR_ENV)
+        .ok()
+        .filter(|path| !path.is_empty())
+    {
+        builder = builder.with_cache_dir(PathBuf::from(cache_dir));
+    }
     if let Ok(token) = std::env::var(HF_TOKEN_ENV)
         && !token.is_empty()
     {
@@ -115,7 +142,8 @@ pub async fn load_hf_snapshot_runtime(
         tokenizer.clone(),
     )
     .map_err(|_| TextBackendLoadError::CachedModel)?;
-    let supports_multimodal = chat_backend.multimodal_model_info().is_some();
+    let supports_multimodal =
+        chat_backend.multimodal_model_info().is_some() && model_dtype.is_some();
     let text_backend: DynTextBackend = Arc::new(text_backend);
     let chat_backend: DynChatBackend = Arc::new(chat_backend);
     let chat_processor = match model_dtype {
@@ -136,6 +164,19 @@ fn to_vllm_dtype(dtype: ModelDtype) -> foretoken_engine_core_client::protocol::d
         ModelDtype::BFloat16 => foretoken_engine_core_client::protocol::dtype::ModelDtype::BFloat16,
         ModelDtype::Float32 => foretoken_engine_core_client::protocol::dtype::ModelDtype::Float32,
     }
+}
+
+fn cached_model_snapshot(model_id: &str, revision: &str) -> Option<std::path::PathBuf> {
+    let repo = Cache::from_env().repo(Repo::with_revision(
+        model_id.to_owned(),
+        RepoType::Model,
+        revision.to_owned(),
+    ));
+    MODEL_FILES
+        .iter()
+        .find_map(|file| repo.get(file))?
+        .parent()
+        .map(Path::to_path_buf)
 }
 
 fn files_for_local_hf_resolver(siblings: &[Siblings]) -> Vec<String> {
@@ -169,6 +210,8 @@ pub enum TextBackendLoadError {
     LocalModel,
     #[error("could not initialize the Hugging Face client")]
     HubClient,
+    #[error("Hugging Face snapshot is not available in the offline cache")]
+    OfflineCacheMiss,
     #[error("could not retrieve Hugging Face repository metadata")]
     RepositoryInfo,
     #[error("could not download required tokenizer artifact {file}")]

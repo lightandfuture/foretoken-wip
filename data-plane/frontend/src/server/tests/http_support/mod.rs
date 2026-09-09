@@ -12,10 +12,13 @@ use foretoken_model_protocol::ModelServerRole;
 use foretoken_router::{RouteDecision, RouteTargetId, RouteTargetSet};
 use foretoken_server::{
     Generated, GeneratedChat, Generation, GenerationError, GenerationRequest, KvIndexDiagnostics,
-    RoutedGenerate, RoutedRequest, RuntimeDiagnostics, Tokenization, token_stream,
+    RoutedGenerate, RoutedRequest, RuntimeDiagnostics, Tokenization,
 };
 use foretoken_text::Prompt;
-use foretoken_tokenizer::{DynTokenizer, Result as TokenizerResult, Tokenizer};
+use foretoken_tokenizer::DynTokenizer;
+use futures::stream;
+
+use crate::test_tokenizer::TestTokenizer;
 use vllm_llm::{FinishReason, GenerateOutput, GeneratePromptInfo, GenerateRequest};
 
 pub type CapturedTextRequest = (
@@ -133,30 +136,6 @@ impl Generation for RecordingGeneration {
     }
 }
 
-struct ByteTokenizer;
-
-impl Tokenizer for ByteTokenizer {
-    fn encode(&self, text: &str, _: bool) -> TokenizerResult<Vec<u32>> {
-        Ok(text.bytes().map(u32::from).collect())
-    }
-
-    fn encode_ordinary(&self, text: &str) -> TokenizerResult<Vec<u32>> {
-        self.encode(text, false)
-    }
-
-    fn decode(&self, ids: &[u32], _: bool) -> TokenizerResult<String> {
-        Ok(ids.iter().filter_map(|&id| char::from_u32(id)).collect())
-    }
-
-    fn token_to_id(&self, _: &str) -> Option<u32> {
-        None
-    }
-
-    fn id_to_token(&self, id: u32) -> Option<String> {
-        char::from_u32(id).map(|value| value.to_string())
-    }
-}
-
 fn generated(request: GenerationRequest, tokenizer: DynTokenizer) -> Generated {
     let request_id = request.request_id;
     let model = request.model;
@@ -187,7 +166,7 @@ fn generated(request: GenerationRequest, tokenizer: DynTokenizer) -> Generated {
                     extensions: Default::default(),
                 },
             },
-            stream: token_stream(vec![
+            stream: Box::pin(stream::iter(vec![
                 Ok(GenerateOutput {
                     request_id: request_id.clone(),
                     prompt_info: Some(GeneratePromptInfo {
@@ -211,7 +190,7 @@ fn generated(request: GenerationRequest, tokenizer: DynTokenizer) -> Generated {
                     kv_transfer_params: None,
                     ec_transfer_params: None,
                 }),
-            ]),
+            ])),
         },
         tokenizer,
         decode_options: request.decode_options,
@@ -223,7 +202,7 @@ pub struct SuccessfulGeneration;
 #[async_trait]
 impl Generation for SuccessfulGeneration {
     async fn generate(&self, request: GenerationRequest) -> Result<Generated, GenerationError> {
-        Ok(generated(request, Arc::new(ByteTokenizer)))
+        Ok(generated(request, Arc::new(TestTokenizer)))
     }
 
     async fn generate_chat(
@@ -232,7 +211,7 @@ impl Generation for SuccessfulGeneration {
         mut chat: ChatRequest,
         include_reasoning: bool,
     ) -> Result<GeneratedChat, GenerationError> {
-        let tokenizer: DynTokenizer = Arc::new(ByteTokenizer);
+        let tokenizer: DynTokenizer = Arc::new(TestTokenizer);
         let tool_call_parser = ParserSelection::Auto;
         let reasoning_parser = ParserSelection::Auto;
         let output_processor: DynChatOutputProcessor = Box::new(

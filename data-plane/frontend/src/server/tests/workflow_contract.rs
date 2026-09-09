@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
 
 mod support;
+#[path = "support/test_tokenizer.rs"]
+mod test_tokenizer;
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -86,7 +88,9 @@ impl LlmFacade for StageFacade {
                 .targets
                 .iter()
                 .any(|target| {
-                    target.target.target_id == self.target_id && target.queued_requests == 1
+                    target.target.target_id == self.target_id
+                        && target.runtime_queued_requests == 0
+                        && target.dispatch_queued_requests == 1
                 }),
             "{} generation must run while admitted to its scaling target",
             self.stage
@@ -213,6 +217,7 @@ async fn bootstrap_endpoint() -> (String, tokio::task::JoinHandle<()>) {
     )
 }
 
+// Protects multi-stage cleanup when Decode admission fails after earlier stages start.
 #[tokio::test]
 async fn runtime_workflow_aborts_every_started_stage_after_decode_admission_fails() {
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -289,7 +294,9 @@ async fn runtime_workflow_aborts_every_started_stage_after_decode_admission_fail
             .targets
             .iter()
             .any(|target| {
-                target.target.target_id == "workflow-service" && target.queued_requests == 0
+                target.target.target_id == "workflow-service"
+                    && target.runtime_queued_requests == 0
+                    && target.dispatch_queued_requests == 0
             })
     );
     bootstrap_task.abort();

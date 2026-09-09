@@ -1,98 +1,65 @@
-# Benchmarks
+# 评测
 
 [English](README.md) | 简体中文
 
-`benchmarks/` 是 Foretoken 的评测模块。
+使用 `foretoken bench` 测量 Foretoken 部署或现有 OpenAI 兼容端点的延迟和吞吐量。
 
-它对已部署的推理服务发请求、测性能、比配置，并检查回答质量是否达标。目标是用可复现的实验，回答「这个服务能不能稳住延迟和吞吐，质量够不够好」。
+## 开始前
 
-## 什么时候需要它
+从仓库根目录使用 Python 3.10 或更高版本运行评测命令：
 
-- 想知道当前服务在某个并发或到达率下的延迟和吞吐。
-- 想对比不同并发、请求量、生成参数或服务端配置谁更好。
-- 想确认模型不只是快，回答和工具调用也对。
-- 想在给定延迟/吞吐要求下，找合适的负载点或容量方案。
+```bash
+pip install 'foretoken[bench]'
 
-如果只是临时手动调一下接口，通常不需要走完整评测流程。
+# 如果使用源码安装：
+# pip install -e .
+# pip install -e '.[bench]'
+```
 
-## 主要功能
+评测 Foretoken 部署时，先安装平台，再评测 Kustomize 配置：
 
-| 功能 | 说明 |
-|---|---|
-| 性能压测 | 对推理服务加压，测量延迟、吞吐、首包时间等 |
-| 负载扫描 | 在多个并发、请求数或到达率上扫一遍，看性能怎么变化 |
-| 参数扫描 | 组合不同服务端参数和压测参数，批量对比配置 |
-| 正确性评测 | 检查回答对不对、工具调用行不行，不只看速度 |
-| SLO 评测 | 按延迟和质量目标做搜索或仿真，辅助定容量和扩缩容 |
+```bash
+foretoken install
+foretoken bench examples/quickstart
+```
 
-## 会产出什么
+快速开始服务已运行时，命令会直接复用；否则会部署渲染后的资源，并在评测结束后只删除本次创建的资源。
 
-- 控制台可读的汇总结果
-- 本地保存的配置、原始结果和指标，方便事后复查
-- 可选的 Weights & Biases（W&B）实验记录与图表，方便跨 run 对比和选配置
-<<<<<<< HEAD
-
-## 示例
-
-固定 prompt：
+评测现有端点时，不需要 Foretoken 或 Kubernetes 平台：
 
 ```bash
 foretoken bench \
   --url http://127.0.0.1:8008/v1/chat/completions \
-  --model Qwen3.6-27B \
-  --prompt "hello" \
+  --model Qwen/Qwen3-0.6B \
+  --prompt "你好" \
   --parallel 2 \
   --number 20
 ```
 
-本地数据集文件：
+## 结果与输出
 
-```bash
-foretoken bench \
-  --url http://127.0.0.1:8008/v1/chat/completions \
-  --model Qwen3.6-27B \
-  --dataset foretoken/conversation.jsonl \
-  --parallel 4 \
-  --number 20 \
-  --wandb
-```
+不指定 `--output` 时，评测会打印汇总、在 `results/` 下保存本地产物，并尝试上传 W&B。W&B 不可用时，本地结果仍会保留。
 
-随机数据压测（需指定 tokenizer）：
+`--output` 会替换默认输出选项：
 
-```bash
-foretoken bench \
-  --url http://127.0.0.1:8008/v1/chat/completions \
-  --model Qwen3.6-27B \
-  --dataset random \
-  --tokenizer-path Qwen/Qwen3.6-27B \
-  --min-prompt-length 128 --max-prompt-length 512 \
-  --parallel 4 --number 20 --max-tokens 64 \
-  --rate 5 \
-  --wandb
-```
+| 目标 | `--output` 值 |
+| --- | --- |
+| 默认控制台、本地产物和 W&B | 不传 `--output` |
+| 仅保存本地产物 | `local` |
+| 保存本地产物但不输出控制台 | `local,quiet` |
+| 保存本地产物并上传 W&B，但不输出控制台 | `local,wandb,quiet` |
+| 仅上传 W&B | `wandb` |
 
-HuggingFace 数据集（行格式：`messages` / `prompt` / `user`[+`system`]）：
+如需关闭控制台输出但保留结果，请将 `quiet` 与 `local`、`wandb` 或两者组合。使用 `--output-dir PATH` 修改本地产物目录。
 
-```bash
-foretoken bench \
-  --url http://127.0.0.1:8008/v1/chat/completions \
-  --model Qwen3.6-27B \
-  --dataset r0b0tlab/qwen3.8-max-distillation-50k:train \
-  --parallel 4 \
-  --number 20 \
-  --wandb
-```
+## 指标
 
-多个 JSONL / HuggingFace 数据源（逗号分隔）。`--number` 是**所有数据集的合计**
-请求数（尽量均分）；各数据源顺序压测，再合并 raw 并重算指标。开启 `--wandb` 时，
-一次实验对应一个 W&B **group**，每个数据集各自一个 **run**：
+汇总结果包括请求延迟、首个 token 时延（TTFT）、每输出 token 时延（TPOT）、失败率、输入/输出 token 数和输出吞吐量。
 
-```bash
-foretoken bench \
-  --url http://127.0.0.1:8008/v1/chat/completions \
-  --model Qwen3.6-27B \
-  --dataset /path/a.jsonl,org/name:train,/path/b.jsonl \
-  --parallel 4 \
-  --number 30 \
-  --wandb
-```
+参数扫描中的 `token/s/user` 表示输出吞吐量除以配置的 closed-loop `--parallel` 值，不表示真实用户数或活跃会话数。open-loop（`--rate`）的分母固定为一，因此它等于总输出吞吐量。`token/s/GPU` 表示输出吞吐量除以该负载点配置的 GPU 数。
+
+扫描会保存每个有效负载点；只有至少有两个有效负载点时，才会生成 `pareto/PARETO.png`。
+
+## 下一步
+
+数据集、随机提示词、轨迹回放、前缀复用、多数据集和参数扫描的配方见[评测示例](docs/examples_zh.md)。命令参数和结果格式可通过 `foretoken bench --help` 及本地产物查看。
