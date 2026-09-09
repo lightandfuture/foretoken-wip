@@ -80,8 +80,14 @@ impl VllmProcess {
         self.client()
             .ready_responses()
             .into_iter()
-            .try_fold(0_u64, |total, ready| total.checked_add(ready.max_num_seqs))
-            .ok_or_else(|| std::io::Error::other("EngineCore max_num_seqs sum overflowed"))
+            .try_fold(0_u64, |total, ready| {
+                let max = ready
+                    .max_num_seqs
+                    .ok_or_else(|| std::io::Error::other("EngineCore max_num_seqs unavailable"))?;
+                total
+                    .checked_add(max)
+                    .ok_or_else(|| std::io::Error::other("EngineCore max_num_seqs sum overflowed"))
+            })
     }
 
     /// Shuts the engine child down within the remaining drain budget.
