@@ -55,7 +55,7 @@ image-model-server: vllm-source
 	@test -n "$(INFERENCE_ENGINE_IMAGE)" || \
 		(printf '%s\n' 'Set INFERENCE_ENGINE_IMAGE to a compatible inference engine image.' >&2; exit 1)
 	docker build --build-arg INFERENCE_ENGINE_IMAGE="$(INFERENCE_ENGINE_IMAGE)" \
-		-build-arg FORETOKEN_VLLM_PYTHON \
+		--build-arg FORETOKEN_VLLM_PYTHON \
 		--build-arg ENGINE_FEATURES="$(ENGINE_FEATURES)" \
 		-f data-plane/model-server/Dockerfile \
 		-t foretoken-model-server-$(ENGINE_FEATURES:backend-%=%):dev .
@@ -69,7 +69,7 @@ image-model-server-sglang:
 
 image-model-server-metax: image-vllm-metax
 	$(MAKE) image-model-server \
-		INFERENCE_ENGINE_IMAGE="$(VLLM_METAX_IMAGE)"
+		INFERENCE_ENGINE_IMAGE="$(VLLM_METAX_IMAGE)" \
 		ENGINE_FEATURES=backend-vllm
 
 image-benchmark:
