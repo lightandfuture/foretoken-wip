@@ -231,22 +231,21 @@ func compileSglang(template inferencev1alpha1.NormalizedPoolTemplate, profile Ru
 	if profile.SglangImage == "" {
 		return compiledEngine{}, fmt.Errorf("sglang inference engine image is not configured")
 	}
-	effective, err := sglangconfig.Compile(template)
-	if err != nil {
+	if err := sglangconfig.Validate(template); err != nil {
 		return compiledEngine{}, err
 	}
 	return compiledEngine{
 		artifacts: inferencev1alpha1.ModelGroupArtifacts{
-			Model:             effective.Model,
-			ModelRevision:     effective.Revision,
-			Tokenizer:         effective.Model,
-			TokenizerRevision: effective.Revision,
+			Model:             template.Model,
+			ModelRevision:     template.ModelRevision,
+			Tokenizer:         template.Model,
+			TokenizerRevision: template.ModelRevision,
 			Cache:             template.RuntimeCache.DeepCopy(),
 			SourceAccess:      template.SourceAccess.DeepCopy(),
 		},
-		args: effective.ExtraArgs,
+		args: append([]inferencev1alpha1.BackendArg(nil), template.ExtraArgs...),
 		parallelism: inferencev1alpha1.CompiledParallelism{
-			TP: effective.TP, PP: 1, DP: effective.DP, PCP: 1, DCP: 1,
+			TP: template.Parallelism.TP, PP: 1, DP: template.Parallelism.DP, PCP: 1, DCP: 1,
 		},
 		image: profile.SglangImage,
 	}, nil

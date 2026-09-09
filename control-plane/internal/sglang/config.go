@@ -22,15 +22,6 @@ const sglangLoopbackPort = 30000
 
 const maxKubernetesInt32Seconds = int64(1<<31 - 1)
 
-// SglangEffectiveConfig contains typed SGLang values and approved backend arguments.
-type SglangEffectiveConfig struct {
-	Model     string
-	Revision  string
-	TP        int32
-	DP        int32
-	ExtraArgs []inferencev1alpha1.BackendArg
-}
-
 // SglangLaunchPlanV1 is the versioned, private Go-to-Rust launch contract. Rust is
 // the only component that renders this contract into SGLang command-line flags.
 type SglangLaunchPlanV1 struct {
@@ -46,9 +37,7 @@ type SglangLaunchPlanV1 struct {
 	InternalGenerateRequestBodyLimitBytes int64    `json:"internalGenerateRequestBodyLimitBytes"`
 }
 
-// sglangValueArgs are approved `--flag=value` arguments and sglangBoolArgs are
-// approved boolean flags. They mirror the Rust SGLang adapter allowlist so the
-// two sides reject the same unsafe extraArgs.
+// sglangValueArgs and sglangBoolArgs define the controller-owned extraArgs policy.
 var sglangValueArgs = map[string]bool{
 	"--max-total-tokens":     true,
 	"--context-length":       true,
@@ -62,37 +51,30 @@ var sglangBoolArgs = map[string]bool{
 	"--enable-torch-compile": true,
 }
 
-// Compile validates extraArgs without permitting them to override source-of-
-// truth artifacts or topology from the normalized template.
-func Compile(template inferencev1alpha1.NormalizedPoolTemplate) (SglangEffectiveConfig, error) {
+// Validate checks whether a normalized Pool template can run on SGLang.
+func Validate(template inferencev1alpha1.NormalizedPoolTemplate) error {
 	if template.Backend != "sglang" {
-		return SglangEffectiveConfig{}, fmt.Errorf("SGLang compile requires backend sglang")
+		return fmt.Errorf("SGLang validation requires backend sglang")
 	}
 	if template.Role != inferencev1alpha1.ModelRoleAggregate {
-		return SglangEffectiveConfig{}, fmt.Errorf("SGLang Groups currently require aggregate role")
+		return fmt.Errorf("SGLang Groups currently require aggregate role")
 	}
 	if template.NodeCount != 1 || template.MemberCount != 1 {
-		return SglangEffectiveConfig{}, fmt.Errorf("SGLang Groups currently require a single member and node")
+		return fmt.Errorf("SGLang Groups currently require a single member and node")
 	}
 	parallelism := template.Parallelism
 	if err := validateParallelism(parallelism); err != nil {
-		return SglangEffectiveConfig{}, err
+		return err
 	}
 	if err := validateExtraArgs(template.ExtraArgs); err != nil {
-		return SglangEffectiveConfig{}, err
+		return err
 	}
 	capacity := int64(template.NodeCount) * int64(template.Resources.Requests.GPU.Count)
 	ranks := int64(parallelism.TP) * int64(parallelism.DP)
 	if capacity != ranks {
-		return SglangEffectiveConfig{}, fmt.Errorf("SGLang topology requires %d workers but the Pool provides %d accelerators", ranks, capacity)
+		return fmt.Errorf("SGLang topology requires %d workers but the Pool provides %d accelerators", ranks, capacity)
 	}
-	return SglangEffectiveConfig{
-		Model:     template.Model,
-		Revision:  template.ModelRevision,
-		TP:        parallelism.TP,
-		DP:        parallelism.DP,
-		ExtraArgs: append([]inferencev1alpha1.BackendArg(nil), template.ExtraArgs...),
-	}, nil
+	return nil
 }
 
 // BuildLaunchPlan projects a verified ModelGroupSpec into the private launch wire contract.

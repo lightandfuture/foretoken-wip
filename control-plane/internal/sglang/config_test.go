@@ -10,17 +10,13 @@ import (
 	inferencev1alpha1 "github.com/shiweijiezero/foretoken/control-plane/api/v1alpha1"
 )
 
-func TestCompileAcceptsAggregateTemplate(t *testing.T) {
-	config, err := Compile(testTemplate())
-	if err != nil {
+func TestValidateAcceptsAggregateTemplate(t *testing.T) {
+	if err := Validate(testTemplate()); err != nil {
 		t.Fatalf("valid aggregate template was rejected: %v", err)
-	}
-	if config.Model != "model" || config.Revision != "main" || config.TP != 1 || config.DP != 2 {
-		t.Fatalf("unexpected effective config: %#v", config)
 	}
 }
 
-func TestCompileRejectsUnsupportedTopologies(t *testing.T) {
+func TestValidateRejectsUnsupportedTopologies(t *testing.T) {
 	for name, mutate := range map[string]func(*inferencev1alpha1.NormalizedPoolTemplate){
 		"non-sglang backend": func(template *inferencev1alpha1.NormalizedPoolTemplate) { template.Backend = "vllm" },
 		"non-aggregate role": func(template *inferencev1alpha1.NormalizedPoolTemplate) {
@@ -37,18 +33,18 @@ func TestCompileRejectsUnsupportedTopologies(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			template := testTemplate()
 			mutate(&template)
-			if _, err := Compile(template); err == nil {
+			if err := Validate(template); err == nil {
 				t.Fatalf("unsupported template %q was accepted", name)
 			}
 		})
 	}
 }
 
-func TestCompileExtraArgsBoundary(t *testing.T) {
+func TestValidateExtraArgsBoundary(t *testing.T) {
 	template := testTemplate()
 	template.ExtraArgs = []inferencev1alpha1.BackendArg{"--max-total-tokens=8192", "--disable-radix-cache", "--context-length=32768"}
-	if config, err := Compile(template); err != nil || len(config.ExtraArgs) != 3 {
-		t.Fatalf("valid extraArgs = %#v, err = %v", config.ExtraArgs, err)
+	if err := Validate(template); err != nil {
+		t.Fatalf("valid extraArgs were rejected: %v", err)
 	}
 	for _, args := range [][]inferencev1alpha1.BackendArg{
 		{"--model=other"},
@@ -60,7 +56,7 @@ func TestCompileExtraArgsBoundary(t *testing.T) {
 		{"--max-model-len=32768"},
 	} {
 		template.ExtraArgs = args
-		if _, err := Compile(template); err == nil {
+		if err := Validate(template); err == nil {
 			t.Fatalf("unsafe extraArgs %v were accepted", args)
 		}
 	}
