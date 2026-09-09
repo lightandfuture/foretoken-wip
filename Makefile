@@ -18,10 +18,15 @@ SGLANG_ENGINE_IMAGE ?=
 	image-frontend image-vllm-metax image-model-server \
 	image-model-server-sglang image-model-server-metax image-benchmark
 
+# Patch list mirrors [workspace.metadata.foretoken].vllm_patches in
+# data-plane/Cargo.toml; `cargo xtask` applies the same set for check/build.
 vllm-source:
 	@test -f data-plane/third_party/vllm/rust/Cargo.toml || \
 		git submodule update --init data-plane/third_party/vllm
-	cd data-plane && cargo xtask prepare-vllm
+	@for patch in vllm-chat-request-processor vllm-engine-core-version-compatibility vllm-managed-engine-environment vllm-llm vllm-text; do \
+		git -C data-plane/third_party/vllm apply --reverse --check "../../patches/$$patch.patch" >/dev/null 2>&1 || \
+			git -C data-plane/third_party/vllm apply "../../patches/$$patch.patch" || exit 1; \
+	done
 
 build-data-plane: vllm-source
 	cd data-plane && cargo xtask build
