@@ -17,7 +17,7 @@ pub struct SglangProcess {
 impl SglangProcess {
     /// Spawns SGLang from the launch plan.
     pub fn spawn(plan: &SglangLaunchPlan) -> Result<Self, std::io::Error> {
-        let args = plan.render_args().map_err(std::io::Error::other)?;
+        let args = plan.render_args();
         let (program, rest) = args
             .split_first()
             .ok_or_else(|| std::io::Error::other("sglang launch argv is empty"))?;

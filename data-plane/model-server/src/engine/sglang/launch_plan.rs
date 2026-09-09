@@ -93,8 +93,7 @@ impl SglangLaunchPlan {
     }
 
     /// Renders the SGLang launch command arguments.
-    pub fn render_args(&self) -> Result<Vec<String>, String> {
-        self.validate()?;
+    pub fn render_args(&self) -> Vec<String> {
         let mut args = vec![
             "python3".to_string(),
             "-m".to_string(),
@@ -109,7 +108,7 @@ impl SglangLaunchPlan {
             args.push(format!("--revision={revision}"));
         }
         args.extend(self.extra_args.iter().cloned());
-        Ok(args)
+        args
     }
 }
 
