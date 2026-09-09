@@ -56,21 +56,14 @@ func Validate(template inferencev1alpha1.NormalizedPoolTemplate) error {
 	if template.Backend != "sglang" {
 		return fmt.Errorf("SGLang validation requires backend sglang")
 	}
-	if template.Role != inferencev1alpha1.ModelRoleAggregate {
-		return fmt.Errorf("SGLang Groups currently require aggregate role")
-	}
-	if template.NodeCount != 1 || template.MemberCount != 1 {
-		return fmt.Errorf("SGLang Groups currently require a single member and node")
-	}
-	parallelism := template.Parallelism
-	if err := validateParallelism(parallelism); err != nil {
+	if err := validateTopology(template.NodeCount, template.MemberCount, template.Role, template.Parallelism); err != nil {
 		return err
 	}
 	if err := validateExtraArgs(template.ExtraArgs); err != nil {
 		return err
 	}
 	capacity := int64(template.NodeCount) * int64(template.Resources.Requests.GPU.Count)
-	ranks := int64(parallelism.TP) * int64(parallelism.DP)
+	ranks := int64(template.Parallelism.TP) * int64(template.Parallelism.DP)
 	if capacity != ranks {
 		return fmt.Errorf("SGLang topology requires %d workers but the Pool provides %d accelerators", ranks, capacity)
 	}
@@ -79,17 +72,11 @@ func Validate(template inferencev1alpha1.NormalizedPoolTemplate) error {
 
 // BuildLaunchPlan projects a verified ModelGroupSpec into the private launch wire contract.
 func BuildLaunchPlan(group inferencev1alpha1.ModelGroupSpec) (SglangLaunchPlanV1, error) {
-	if group.NodeCount != 1 || group.MemberCount != 1 {
-		return SglangLaunchPlanV1{}, fmt.Errorf("model-server launch plan currently supports exactly one node")
-	}
-	if group.Role != inferencev1alpha1.ModelRoleAggregate {
-		return SglangLaunchPlanV1{}, fmt.Errorf("SGLang Groups currently require aggregate role")
+	if err := validateTopology(group.NodeCount, group.MemberCount, group.Role, group.Parallelism); err != nil {
+		return SglangLaunchPlanV1{}, err
 	}
 	if group.Artifacts.Model == "" {
 		return SglangLaunchPlanV1{}, fmt.Errorf("SGLang artifacts.model must be nonempty")
-	}
-	if err := validateParallelism(group.Parallelism); err != nil {
-		return SglangLaunchPlanV1{}, err
 	}
 	if err := validateExtraArgs(group.Runtime.Args); err != nil {
 		return SglangLaunchPlanV1{}, err
@@ -130,7 +117,13 @@ func (plan SglangLaunchPlanV1) JSON() (string, error) {
 	return string(bytes), err
 }
 
-func validateParallelism(parallelism inferencev1alpha1.CompiledParallelism) error {
+func validateTopology(nodeCount, memberCount int32, role inferencev1alpha1.ModelRole, parallelism inferencev1alpha1.CompiledParallelism) error {
+	if nodeCount != 1 || memberCount != 1 {
+		return fmt.Errorf("SGLang Groups currently require a single member and node")
+	}
+	if role != inferencev1alpha1.ModelRoleAggregate {
+		return fmt.Errorf("SGLang Groups currently require aggregate role")
+	}
 	if parallelism.TP < 1 || parallelism.DP < 1 {
 		return fmt.Errorf("SGLang topology values must be positive")
 	}
