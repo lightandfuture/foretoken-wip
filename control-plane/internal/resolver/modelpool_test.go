@@ -24,7 +24,7 @@ func TestResolveModelPoolSglang(t *testing.T) {
 	if resolved.PDRuntime != nil || resolved.ECRuntime != nil || resolved.KVRuntime != nil {
 		t.Fatalf("SGLang must not resolve P/D/EC/KV runtimes: %#v", resolved)
 	}
-	if resolved.Artifacts.Model != "model" || resolved.Artifacts.ModelRevision != "main" {
+	if resolved.Artifacts.Model != "model" || resolved.Artifacts.ModelRevision != "main" || resolved.Artifacts.Tokenizer != "tokenizer" || resolved.Artifacts.TokenizerRevision != "tokenizer-rev" {
 		t.Fatalf("artifacts = %#v", resolved.Artifacts)
 	}
 	if resolved.Parallelism.TP != 1 || resolved.Parallelism.DP != 2 || resolved.Parallelism.PP != 1 {
@@ -63,7 +63,7 @@ func testProfile() RuntimeProfile {
 
 func testSglangTemplate() inferencev1alpha1.NormalizedPoolTemplate {
 	return inferencev1alpha1.NormalizedPoolTemplate{
-		Model: "model", ModelRevision: "main",
+		Model: "model", ModelRevision: "main", Tokenizer: "tokenizer", TokenizerRevision: "tokenizer-rev",
 		Backend: "sglang", Role: inferencev1alpha1.ModelRoleAggregate, NodeCount: 1, MemberCount: 1,
 		Resources:                             inferencev1alpha1.ModelResources{Requests: inferencev1alpha1.ModelResourceRequests{GPU: inferencev1alpha1.GPURequest{Count: 2}}},
 		Parallelism:                           inferencev1alpha1.CompiledParallelism{TP: 1, PP: 1, DP: 2, PCP: 1, DCP: 1},

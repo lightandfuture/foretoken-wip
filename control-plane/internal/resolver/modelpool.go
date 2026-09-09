@@ -238,8 +238,8 @@ func compileSglang(template inferencev1alpha1.NormalizedPoolTemplate, profile Ru
 		artifacts: inferencev1alpha1.ModelGroupArtifacts{
 			Model:             template.Model,
 			ModelRevision:     template.ModelRevision,
-			Tokenizer:         template.Model,
-			TokenizerRevision: template.ModelRevision,
+			Tokenizer:         template.Tokenizer,
+			TokenizerRevision: template.TokenizerRevision,
 			Cache:             template.RuntimeCache.DeepCopy(),
 			SourceAccess:      template.SourceAccess.DeepCopy(),
 		},
