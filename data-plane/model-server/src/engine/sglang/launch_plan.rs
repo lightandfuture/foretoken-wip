@@ -36,9 +36,6 @@ pub struct SglangLaunchPlan {
     /// Data-parallel size.
     #[serde(default = "default_dp")]
     pub dp: usize,
-    /// GPU memory fraction.
-    #[serde(rename = "memFraction", default)]
-    pub mem_fraction: Option<f64>,
     /// SGLang HTTP port.
     pub port: u16,
     /// Startup timeout in seconds.
@@ -82,11 +79,6 @@ impl SglangLaunchPlan {
         if self.startup_seconds == 0 || self.drain_seconds == 0 {
             return Err("launch plan lifecycle seconds must be positive".into());
         }
-        if let Some(fraction) = self.mem_fraction
-            && !(0.0..=1.0).contains(&fraction)
-        {
-            return Err("launch plan memFraction must be within 0.0 and 1.0".into());
-        }
         validate_extra_args_shape(&self.extra_args)
     }
 
@@ -115,9 +107,6 @@ impl SglangLaunchPlan {
         ];
         if let Some(revision) = &self.revision {
             args.push(format!("--revision={revision}"));
-        }
-        if let Some(fraction) = self.mem_fraction {
-            args.push(format!("--mem-fraction-static={fraction}"));
         }
         args.extend(self.extra_args.iter().cloned());
         Ok(args)

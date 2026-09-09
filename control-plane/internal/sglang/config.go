@@ -24,12 +24,11 @@ const maxKubernetesInt32Seconds = int64(1<<31 - 1)
 
 // SglangEffectiveConfig contains typed SGLang values and approved backend arguments.
 type SglangEffectiveConfig struct {
-	Model       string
-	Revision    string
-	TP          int32
-	DP          int32
-	MemFraction *float64
-	ExtraArgs   []inferencev1alpha1.BackendArg
+	Model     string
+	Revision  string
+	TP        int32
+	DP        int32
+	ExtraArgs []inferencev1alpha1.BackendArg
 }
 
 // SglangLaunchPlanV1 is the versioned, private Go-to-Rust launch contract. Rust is
@@ -40,7 +39,6 @@ type SglangLaunchPlanV1 struct {
 	Revision                              string   `json:"revision,omitempty"`
 	TP                                    int32    `json:"tp"`
 	DP                                    int32    `json:"dp"`
-	MemFraction                           *float64 `json:"memFraction,omitempty"`
 	Port                                  int32    `json:"port"`
 	StartupSeconds                        int64    `json:"startupSeconds"`
 	DrainSeconds                          int64    `json:"drainSeconds"`
