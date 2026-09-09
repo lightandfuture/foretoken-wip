@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
 
-//! SGLang adapter backed by the engine's loopback HTTP `/generate` endpoint.
+//! SGLang adapter using the loopback HTTP API.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -40,12 +40,7 @@ impl SglangBackend {
         format!("{}{path}", self.endpoint)
     }
 
-    /// Builds the engine-neutral token stream from SGLang's streaming
-    /// `/generate` response bytes.
-    ///
-    /// The first output carries the request's prompt token ids: the frontend's
-    /// streaming decoder requires them on the first output to initialize
-    /// incremental decoding.
+    /// Converts SGLang's streaming response into the engine-neutral token stream.
     fn token_stream(
         request_id: String,
         prompt_token_ids: Vec<u32>,

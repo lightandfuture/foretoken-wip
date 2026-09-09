@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
 
-//! Managed SGLang server process lifecycle.
-//!
-//! Spawns `python3 -m sglang.launch_server` on loopback, waits for its HTTP
-//! health endpoint, and shuts the child down on request. The HTTP server and
-//! drain orchestration stay in the binary entrypoint.
+//! Lifecycle wrapper for the managed SGLang server process.
 
 use std::time::Duration;
 
@@ -13,13 +9,13 @@ use tokio::process::{Child, Command};
 
 use super::launch_plan::SglangLaunchPlan;
 
-/// A spawned SGLang server child.
+/// Managed SGLang server child.
 pub struct SglangProcess {
     child: Child,
 }
 
 impl SglangProcess {
-    /// Spawns the SGLang server child.
+    /// Spawns SGLang from the launch plan.
     pub fn spawn(plan: &SglangLaunchPlan) -> Result<Self, std::io::Error> {
         let args = plan.render_args().map_err(std::io::Error::other)?;
         let (program, rest) = args
@@ -29,12 +25,12 @@ impl SglangProcess {
         Ok(Self { child })
     }
 
-    /// Waits for the child to exit, returning its exit status.
+    /// Waits for the child to exit.
     pub async fn wait_for_exit(&mut self) -> std::io::Result<std::process::ExitStatus> {
         self.child.wait().await
     }
 
-    /// Terminates the child, then waits for it to exit.
+    /// Terminates the child and waits up to the grace period.
     pub async fn shutdown(&mut self, grace: Duration) -> std::io::Result<()> {
         if self.child.try_wait()?.is_some() {
             return Ok(());

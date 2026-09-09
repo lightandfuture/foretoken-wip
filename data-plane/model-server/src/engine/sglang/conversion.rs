@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
 
-//! SGLang request/response conversion.
-//!
-//! Translates vLLM's request and response types to SGLang's native
-//! `/generate` wire: [`SglangRequest`] is built from a vLLM `GenerateRequest`
-//! via `TryFrom`, and [`SglangResponseDecoder`] turns streamed
-//! [`SglangChunk`]s into per-step output fields. Sampling params SGLang
-//! cannot honor are rejected before they leave this module.
+//! Converts vLLM request and response types to SGLang's native HTTP format.
 
 use std::collections::BTreeMap;
 
@@ -55,8 +49,7 @@ impl TryFrom<&GenerateRequest> for SglangRequest {
     }
 }
 
-/// SGLang logprob triple: `[logprob, token_id, token_text]`. Token text is
-/// null unless the request set `return_text_in_logprobs`.
+/// SGLang logprob triple: `[logprob, token_id, token_text]`.
 type LogprobTriple = (f32, u32, Option<String>);
 
 /// One streamed token chunk from SGLang.
@@ -69,26 +62,18 @@ pub(super) struct SglangChunk {
 
 #[derive(Debug, Deserialize)]
 struct SglangChunkMeta {
-    /// SGLang reports finish reasons as objects (`{"type":"stop",...}`,
-    /// `{"type":"length","length":N}`, ...), so keep the raw value and
-    /// extract the reason kind from its `type` field.
+    /// SGLang finish reason object.
     #[serde(default)]
     finish_reason: Option<serde_json::Value>,
-    /// Cumulative per-generated-token logprobs, aligned with `output_ids`;
-    /// empty when the request did not ask for logprobs.
+    /// Cumulative per-token logprobs aligned with `output_ids`.
     #[serde(default)]
     output_token_logprobs: Vec<LogprobTriple>,
-    /// Cumulative top-k alternatives per generated token.
+    /// Cumulative top-k alternatives per token.
     #[serde(default)]
     output_top_logprobs: Vec<Vec<LogprobTriple>>,
 }
 
-/// Parses one line of SGLang's streaming `/generate` response (Server-Sent
-/// Events) into a chunk.
-///
-/// Each payload line looks like `data: {json}`. Lines that carry no payload
-/// (blank lines, comment/heartbeat lines, and the `[DONE]` terminator) yield
-/// `Ok(None)`; a malformed `data:` payload yields `Err(())`.
+/// Parses one SGLang streaming response line into a chunk.
 pub(super) fn parse_sse_chunk(line: &[u8]) -> Result<Option<SglangChunk>, ()> {
     let line = std::str::from_utf8(line).map_err(|_| ())?.trim();
     if line.is_empty() || line.starts_with(':') || line == "[DONE]" {
@@ -109,12 +94,7 @@ fn parse_sglang_finish_reason(reason: &serde_json::Value) -> FinishReason {
     }
 }
 
-/// Windows one chunk's cumulative logprobs to its token delta and converts
-/// them into vLLM's per-output [`Logprobs`].
-///
-/// SGLang streams these arrays cumulatively, aligned with the cumulative
-/// `output_ids`, so the same previous-length cut applies. SGLang reports no
-/// vocab ranks; entries use their 1-based position in the returned list.
+/// Converts cumulative SGLang logprobs into the current token delta.
 fn chunk_logprobs(
     best: &[LogprobTriple],
     top: &[Vec<LogprobTriple>],
@@ -162,11 +142,7 @@ pub(super) struct DecodedStep {
     pub(super) finish_reason: Option<FinishReason>,
 }
 
-/// Decodes SGLang's streamed chunks into per-step vLLM output fields.
-///
-/// SGLang streams cumulative `output_ids` (and cumulative logprobs), so the
-/// decoder tracks how much has been emitted and cuts each chunk down to its
-/// delta.
+/// Decodes cumulative SGLang chunks into per-step output fields.
 #[derive(Default)]
 pub(super) struct SglangResponseDecoder {
     previous_output_len: usize,
@@ -203,13 +179,7 @@ impl SglangResponseDecoder {
     }
 }
 
-/// Builds SGLang's native sampling dict from vLLM's sampling params.
-///
-/// Forwarded keys are within sglang v0.5.18 verify() domains, enforced
-/// upstream ([`find_rejected_field`]). Keys needing translation:
-/// - `top_k` 0 ("all tokens") is omitted; sglang defaults to -1.
-/// - `seed` -> `sampling_seed`; the vLLM key name raises TypeError.
-/// - `min_tokens` -> `min_new_tokens`; `logit_bias` u32 keys -> strings.
+/// Builds SGLang sampling parameters and applies required field mappings.
 fn to_sglang_sampling(params: &EngineCoreSamplingParams) -> serde_json::Value {
     let mut json = serde_json::json!({
         "temperature": params.temperature,
@@ -240,20 +210,16 @@ fn to_sglang_sampling(params: &EngineCoreSamplingParams) -> serde_json::Value {
                 .collect(),
         );
     }
-    // `thinking_token_budget` is intentionally unmapped: SGLang's
-    // `max_thinking_tokens` (strict-thinking only) is not equivalent.
+    // SGLang's strict-thinking limit is not equivalent to this field.
     json
 }
 
-/// sglang v0.5.18 verify() domain bounds.
+// SGLang v0.5.18 sampling bounds.
 const TOP_P_MAX: f32 = 1.0; // top_p in (0, 1]
 const MIN_P_MAX: f32 = 1.0; // min_p in [0, 1]
 const PENALTY_MAX: f32 = 2.0; // freq/presence [-2, 2]; repetition (0, 2]
 
-/// Name of the first field making a request invalid for SGLang: unsupported,
-/// outside a verify() domain, or a logprobs mode it cannot honor over the
-/// stream. Guarded so the caller gets a clean 400 instead of SGLang failing
-/// mid-request.
+/// Returns the first request field SGLang cannot honor.
 fn find_rejected_field(params: &EngineCoreSamplingParams) -> Option<&'static str> {
     if params.allowed_token_ids.is_some() {
         return Some("allowed_token_ids");
@@ -270,7 +236,7 @@ fn find_rejected_field(params: &EngineCoreSamplingParams) -> Option<&'static str
     if params.skip_reading_prefix_cache.is_some() {
         return Some("skip_reading_prefix_cache");
     }
-    // NaN fails these comparisons and is rejected too.
+    // These comparisons also reject NaN.
     if params.temperature < 0.0 || !params.temperature.is_finite() {
         return Some("temperature");
     }
@@ -289,7 +255,7 @@ fn find_rejected_field(params: &EngineCoreSamplingParams) -> Option<&'static str
     if !(params.repetition_penalty > 0.0 && params.repetition_penalty <= PENALTY_MAX) {
         return Some("repetition_penalty");
     }
-    // Logprobs modes SGLang cannot honor over the stream.
+    // SGLang cannot honor these logprob modes in the stream.
     if params.prompt_logprobs.is_some() {
         return Some("prompt_logprobs");
     }
@@ -302,9 +268,7 @@ fn find_rejected_field(params: &EngineCoreSamplingParams) -> Option<&'static str
     None
 }
 
-/// SglangRequest's own top-level fields. An extension key matching one of
-/// these would be flattened over the mapped field, silently replacing it, so
-/// such keys are rejected rather than let passthrough corrupt the body.
+/// Fields reserved by [`SglangRequest`] and unavailable to extensions.
 const RESERVED_EXTENSION_KEYS: [&str; 5] = [
     "input_ids",
     "sampling_params",
@@ -323,12 +287,7 @@ fn find_reserved_extension_key(
         .find(|key| extensions.contains_key(*key))
 }
 
-/// SGLang request-level logprob knobs for a vLLM sampling request.
-///
-/// vLLM's `logprobs` counts the chosen token plus its alternatives; SGLang
-/// splits that into `return_logprob` (on/off) and `top_logprobs_num`
-/// (alternatives). `None` and `0` both disable logprobs; negatives are
-/// rejected upstream by [`find_rejected_field`].
+/// Maps vLLM's logprob count to SGLang's request-level options.
 fn to_sglang_logprobs(params: &EngineCoreSamplingParams) -> (Option<bool>, Option<u32>) {
     match params.logprobs {
         None | Some(0) => (None, None),

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
 
-//! SGLang engine adapter.
-//!
-//! SGLang has no Rust engine client, so this adapter spawns the server as a
-//! loopback child process and talks to its native HTTP `/generate` endpoint.
-//! The engine-neutral core only sees the [`crate::engine::Engine`] trait.
+//! SGLang adapter backed by a loopback child process and HTTP API.
 
 mod backend;
 mod conversion;

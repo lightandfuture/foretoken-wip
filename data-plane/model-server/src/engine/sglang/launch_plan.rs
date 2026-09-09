@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
 
-//! Private versioned launch contract for the SGLang adapter.
-//!
-//! SGLang has no Rust engine client; the adapter spawns
-//! `python3 -m sglang.launch_server` on loopback and talks to its native HTTP
-//! `/generate` endpoint. This module renders the typed plan into those argv.
+//! Versioned launch contract for the SGLang adapter.
 
 use std::collections::HashSet;
 
@@ -29,9 +25,9 @@ fn default_body_limit() -> usize {
 #[serde(deny_unknown_fields)]
 pub struct SglangLaunchPlan {
     pub version: u8,
-    /// Model repository or path served by SGLang.
+    /// Model path served by SGLang.
     pub model: String,
-    /// Optional model revision, forwarded to `--revision`.
+    /// Optional model revision.
     #[serde(default)]
     pub revision: Option<String>,
     /// Tensor-parallel size.
@@ -40,21 +36,21 @@ pub struct SglangLaunchPlan {
     /// Data-parallel size.
     #[serde(default = "default_dp")]
     pub dp: usize,
-    /// GPU memory fraction, forwarded to `--mem-fraction-static`.
+    /// GPU memory fraction.
     #[serde(rename = "memFraction", default)]
     pub mem_fraction: Option<f64>,
-    /// Loopback HTTP port for the SGLang server.
+    /// SGLang HTTP port.
     pub port: u16,
-    /// Startup budget in seconds.
+    /// Startup timeout in seconds.
     #[serde(rename = "startupSeconds")]
     pub startup_seconds: u64,
-    /// Drain budget in seconds.
+    /// Drain timeout in seconds.
     #[serde(rename = "drainSeconds")]
     pub drain_seconds: u64,
-    /// Additional `--long-name` arguments forwarded verbatim.
+    /// Additional validated SGLang arguments.
     #[serde(rename = "extraArgs", default)]
     pub extra_args: Vec<String>,
-    /// Group-local generate request body limit.
+    /// Group-local generate body limit.
     #[serde(
         rename = "internalGenerateRequestBodyLimitBytes",
         default = "default_body_limit"
@@ -104,7 +100,7 @@ impl SglangLaunchPlan {
         std::time::Duration::from_secs(self.drain_seconds)
     }
 
-    /// Renders the SGLang launch-server argv, including the Python entrypoint.
+    /// Renders the SGLang launch command arguments.
     pub fn render_args(&self) -> Result<Vec<String>, String> {
         self.validate()?;
         let mut args = vec![
@@ -128,11 +124,9 @@ impl SglangLaunchPlan {
     }
 }
 
-/// Restricts `extraArgs` to a known allowlist of value/boolean flags.
+/// Validates the supported `extraArgs` flags.
 fn validate_extra_args(args: &[String]) -> Result<(), String> {
-    // Keep in sync with control-plane/internal/sglang/config.go
-    // (`sglangValueArgs`/`sglangBoolArgs`): the control-plane validates the
-    // same allowlist before deploying.
+    // Keep this allowlist synchronized with the control plane.
     const VALUE_FLAGS: &[&str] = &[
         "--max-total-tokens",
         "--context-length",

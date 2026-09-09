@@ -288,24 +288,21 @@ async fn run_sglang(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Err
 
     let mut process = SglangProcess::spawn(&plan)?;
 
-    // Wait for the SGLang HTTP server to become healthy within the startup budget.
+    // Wait for SGLang readiness before publishing the model server.
     if let Err(reason) = wait_for_sglang_health(&plan, plan.startup_seconds).await {
         health.set_process_alive(false);
         let _ = process.shutdown(plan.drain_timeout()).await;
         return Err(std::io::Error::other(reason).into());
     }
 
-    // Report the engine's real context limit so the frontend can tokenize and
-    // validate requests. Fall back to the previous hardcoded value (and a
-    // warning) if the metadata query fails. The dtype stays unknown (`None`):
-    // SGLang's `/get_server_info` reports `dtype` as `auto` and does not expose
-    // the resolved precision, so the frontend falls back to a render-only
-    // (text, non-multimodal) processor.
+    // Publish the context limit required by frontend request validation.
     let reported_len = match sglang_context_len(plan.port).await {
         Ok(len) => len,
         Err(error) => {
-            warn!(%error, "could not query SGLang model info; using fallback metadata");
-            0
+            warn!(%error, "could not query SGLang model info during startup");
+            health.set_process_alive(false);
+            let _ = process.shutdown(plan.drain_timeout()).await;
+            return Err(std::io::Error::other(error).into());
         }
     };
 
@@ -316,7 +313,7 @@ async fn run_sglang(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Err
             revision: plan.revision.clone().unwrap_or_default(),
         },
         model_dtype: None,
-        effective_max_model_len: u32::try_from(reported_len).unwrap_or(0),
+        effective_max_model_len: reported_len,
         ec_transfer: None,
         capabilities: Default::default(),
     };
@@ -392,8 +389,7 @@ async fn run_sglang(config: RuntimeConfig) -> Result<(), Box<dyn std::error::Err
     }
 }
 
-/// Polls the SGLang `/health` endpoint until it reports healthy or the budget
-/// expires.
+/// Waits for SGLang's `/health` endpoint within the startup budget.
 #[cfg(feature = "backend-sglang")]
 async fn wait_for_sglang_health(
     plan: &SglangLaunchPlan,
@@ -415,10 +411,9 @@ async fn wait_for_sglang_health(
     }
 }
 
-/// Queries the SGLang server's `/get_server_info` for its effective context
-/// length.
+/// Gets SGLang's effective context length from `/get_server_info`.
 #[cfg(feature = "backend-sglang")]
-async fn sglang_context_len(port: u16) -> Result<i64, String> {
+async fn sglang_context_len(port: u16) -> Result<u32, String> {
     let url = format!("http://{LOOPBACK_HOST}:{port}/get_server_info");
     let info: serde_json::Value = reqwest::Client::new()
         .get(&url)
@@ -431,14 +426,13 @@ async fn sglang_context_len(port: u16) -> Result<i64, String> {
         .await
         .map_err(|error| format!("sglang get_server_info response is not valid JSON: {error}"))?;
 
-    // Prefer the configured context length; fall back to the scheduler's
-    // resolved max input length when `--context-length` was not set.
+    // Prefer the configured value, then the scheduler's resolved input limit.
     if let Some(len) = info
         .get("context_length")
         .and_then(serde_json::Value::as_i64)
     {
         if len > 0 {
-            return Ok(len);
+            return u32::try_from(len).map_err(|_| "sglang context length exceeds u32::MAX".into());
         }
     }
     if let Some(len) = info
@@ -446,7 +440,7 @@ async fn sglang_context_len(port: u16) -> Result<i64, String> {
         .and_then(serde_json::Value::as_i64)
     {
         if len > 0 {
-            return Ok(len);
+            return u32::try_from(len).map_err(|_| "sglang context length exceeds u32::MAX".into());
         }
     }
     Err("sglang get_server_info has no context length".into())
