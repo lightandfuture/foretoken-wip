@@ -138,6 +138,43 @@ async fn generate_reports_backend_error_on_non_success() {
     assert!(result.is_err());
 }
 
+/// Protects the cancellation contract: each Foretoken request ID is forwarded
+/// to SGLang's native abort endpoint instead of being acknowledged locally.
+#[tokio::test]
+async fn abort_forwards_request_ids_to_sglang() {
+    let seen: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let app = Router::new().route(
+        "/abort_request",
+        post(move |Json(body): Json<Value>| {
+            let captured = captured.clone();
+            async move {
+                captured.lock().unwrap().push(body);
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let backend = SglangBackend::new(format!("http://{addr}"));
+    backend
+        .abort(&["request-1".into(), "request-2".into()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![
+            json!({"rid": "request-1", "abort_all": false}),
+            json!({"rid": "request-2", "abort_all": false}),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn cleanup_succeeds() {
     let backend = SglangBackend::new("http://127.0.0.1:1".to_owned());
