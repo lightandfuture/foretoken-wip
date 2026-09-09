@@ -3,13 +3,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
 
 # Build from the repository root so Cargo uses the data-plane workspace and
-its engine adapters. ENGINE_FEATURES selects the inference backend compiled
-into the binary (backend-vllm or backend-sglang); INFERENCE_ENGINE_IMAGE must
-provide the Python environment required by that adapter. FORETOKEN_VLLM_PYTHON
-may select an image-specific Python executable; model-server otherwise uses
-the image default.
+# its engine adapters. ENGINE_FEATURES selects the inference backend compiled
+# into the binary (backend-vllm or backend-sglang); INFERENCE_ENGINE_IMAGE must
+# provide the Python environment required by that adapter. FORETOKEN_VLLM_PYTHON
+# may select an image-specific Python executable; model-server otherwise uses
+# the image default.
 
-ARG RUST_BUILDER_IMAGE=docker.io/library/rust:1.97.1-slim-bullseye
+ARG RUST_BUILDER_IMAGE=docker.io/library/rust:1.97.1-slim-bookworm
 ARG INFERENCE_ENGINE_IMAGE=ghcr.io/shiweijiezero/foretoken/model-server:0.0.1
 ARG FORETOKEN_VLLM_PYTHON
 
