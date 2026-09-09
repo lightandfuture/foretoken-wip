@@ -243,11 +243,9 @@ func compileSglang(template inferencev1alpha1.NormalizedPoolTemplate, profile Ru
 			Cache:             template.RuntimeCache.DeepCopy(),
 			SourceAccess:      template.SourceAccess.DeepCopy(),
 		},
-		args: append([]inferencev1alpha1.BackendArg(nil), template.ExtraArgs...),
-		parallelism: inferencev1alpha1.CompiledParallelism{
-			TP: template.Parallelism.TP, PP: 1, DP: template.Parallelism.DP, PCP: 1, DCP: 1,
-		},
-		image: profile.SglangImage,
+		args:        append([]inferencev1alpha1.BackendArg(nil), template.ExtraArgs...),
+		parallelism: template.Parallelism,
+		image:       profile.SglangImage,
 	}, nil
 }
 
