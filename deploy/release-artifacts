@@ -37,6 +37,7 @@ Options:
 
 Build inputs:
   INFERENCE_ENGINE_IMAGE        Compatible NVIDIA inference runtime image.
+  FORETOKEN_ENABLE_AFD            Set to 1 to install AFD in the NVIDIA image (requires vLLM 0.26.0).
   METAX_INFERENCE_ENGINE_IMAGE  Compatible MetaX inference runtime image.
 
 Optional inputs such as FORETOKEN_VLLM_PYTHON, METAX_VLLM_PYTHON, registry
@@ -285,7 +286,7 @@ if [[ "$MODE" == build ]]; then
   if selected model-server-metax; then
     if [[ "$DRY_RUN" == true ]]; then
       (
-        unset FORETOKEN_VLLM_PYTHON
+        unset FORETOKEN_VLLM_PYTHON FORETOKEN_ENABLE_AFD
         build_model_server \
           "$MODEL_SERVER_METAX_IMAGE" \
           "${METAX_INFERENCE_ENGINE_IMAGE:-METAX_INFERENCE_ENGINE_IMAGE}" \
@@ -297,7 +298,7 @@ if [[ "$MODE" == build ]]; then
         exit 2
       }
       (
-        unset FORETOKEN_VLLM_PYTHON
+        unset FORETOKEN_VLLM_PYTHON FORETOKEN_ENABLE_AFD
         build_model_server \
           "$MODEL_SERVER_METAX_IMAGE" \
           "$METAX_INFERENCE_ENGINE_IMAGE" \

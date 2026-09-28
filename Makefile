@@ -93,6 +93,7 @@ image-model-server: vllm-source
 		$(if $(OCI_REGISTRY),--build-arg UV_IMAGE_REGISTRY="$(OCI_REGISTRY)",) \
 		$(if $(UV_IMAGE),--build-arg UV_IMAGE="$(UV_IMAGE)",) \
 		--build-arg FORETOKEN_VLLM_PYTHON \
+		$(if $(FORETOKEN_ENABLE_AFD),--build-arg FORETOKEN_ENABLE_AFD="$(FORETOKEN_ENABLE_AFD)",) \
 		--build-arg FORETOKEN_GITHUB_MIRROR \
 		--build-arg FORETOKEN_CARGO_REGISTRY \
 		--build-arg CARGO_NET_GIT_FETCH_WITH_CLI \
@@ -103,7 +104,7 @@ image-model-server: vllm-source
 
 image-model-server-metax: image-vllm-metax
 	$(MAKE) image-model-server \
-		INFERENCE_ENGINE_IMAGE="$(VLLM_METAX_IMAGE)"
+		INFERENCE_ENGINE_IMAGE="$(VLLM_METAX_IMAGE)" FORETOKEN_ENABLE_AFD=0
 
 image-benchmark:
 	docker build -f benchmarks/Dockerfile -t foretoken-benchmark:dev .

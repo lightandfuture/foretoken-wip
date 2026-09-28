@@ -99,6 +99,8 @@ deploy/release-artifacts build --registry "$REGISTRY"
 
 The release uses one shared version for the control-plane, frontend, model-server images, and Helm Chart. The MetaX model-server image adds the `-metax` suffix.
 
+Set `FORETOKEN_ENABLE_AFD=1` to install AFD dependencies in the NVIDIA release image.
+
 After validating the artifacts, log in to the registry and push them:
 
 ```bash

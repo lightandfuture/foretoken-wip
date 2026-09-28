@@ -188,3 +188,14 @@ REGISTRY="$REGISTRY" \
 IMAGE_PULL_SECRET=foretoken-registry \
 make dev-deploy
 ```
+
+## 构建实验性 AFD 镜像
+
+基础镜像需包含 NVIDIA CUDA、vLLM `0.26.0` 和 Python 3.10–3.13。在仓库根目录执行，将 `<image>@sha256:<digest>` 替换为实际镜像引用：
+
+```bash
+make image-model-server \
+  INFERENCE_ENGINE_IMAGE='<image>@sha256:<digest>' \
+  FORETOKEN_ENABLE_AFD=1 \
+  MODEL_SERVER_IMAGE=foretoken-model-server:afd-dev
+```
