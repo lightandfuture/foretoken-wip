@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use foretoken_engine_core_client::protocol::dtype::ModelDtype;
 use foretoken_llm_facade::{HttpFacade, LlmFacade, LlmFacadeResolver, RouteStage};
-use foretoken_model_protocol::{RuntimeMetadataResponse, TelemetryResponse};
+use foretoken_model_protocol::{PreparedTokenizer, RuntimeMetadataResponse, TelemetryResponse};
 
 use foretoken_model_protocol::ModelServerRole;
 use foretoken_router::{
@@ -176,6 +176,43 @@ impl BackendRegistry {
         Ok(effective.filter(|_| !unknown))
     }
 
+    /// Returns the exact tokenizer selected by healthy engines for frontend preparation.
+    /// A candidate generation cannot combine different resolved tokenizer file revisions.
+    pub fn prepared_tokenizer(&self, model: &str) -> Result<Option<PreparedTokenizer>, String> {
+        let mut selected: Option<PreparedTokenizer> = None;
+        let mut unprepared = false;
+        for route in self.model_routes.routes().iter().filter(|route| {
+            route.model == model && self.is_route_target_healthy(&route.route_target_id)
+        }) {
+            let tokenizer = self
+                .metadata(&route.route_target_id)
+                .and_then(|metadata| metadata.prepared_tokenizer);
+            match tokenizer {
+                Some(tokenizer) => {
+                    if let Some(previous) = &selected {
+                        if previous.model != tokenizer.model
+                            || previous.revision != tokenizer.revision
+                            || previous.files != tokenizer.files
+                        {
+                            return Err(format!(
+                                "conflicting prepared tokenizer revisions for model {model}"
+                            ));
+                        }
+                    } else {
+                        selected = Some(tokenizer);
+                    }
+                }
+                None => unprepared = true,
+            }
+        }
+        if unprepared && selected.is_some() {
+            return Err(format!(
+                "incomplete prepared tokenizer metadata for model {model}"
+            ));
+        }
+        Ok(selected)
+    }
+
     /// Reports whether one logical model currently has an executable backend path.
     pub fn is_model_ready(&self, model: &str) -> bool {
         self.healthy_models().iter().any(|healthy| healthy == model)
@@ -302,6 +339,16 @@ impl LlmFacadeResolver for BackendRegistry {
     }
 }
 impl RouteInventory for BackendRegistry {
+    fn http_endpoint(&self, decision: &RouteDecision) -> Option<String> {
+        if decision.role != foretoken_model_protocol::ModelServerRole::Aggregate {
+            return None;
+        }
+        match self.components.get(&decision.route_target_id)? {
+            Component::Aggregate { endpoint, .. } => Some(endpoint.clone()),
+            _ => None,
+        }
+    }
+
     fn model_routes(&self) -> &ModelRouteTable {
         &self.model_routes
     }
@@ -347,7 +394,7 @@ impl RouteTargetStatsReader for BackendRegistry {
 }
 
 fn requires_runtime_observation(capability: &str) -> bool {
-    matches!(capability, "lora")
+    matches!(capability, "lora" | "video")
 }
 
 async fn metadata(client: &reqwest::Client, endpoint: &str) -> Option<RuntimeMetadataResponse> {

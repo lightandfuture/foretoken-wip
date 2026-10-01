@@ -22,7 +22,9 @@ use foretoken_text::{Prompt, SamplingParams, TextDecodeOptions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+mod async_video;
 mod output;
+mod video;
 
 use self::output::{
     CompletionResponseOptions, chat_collected, chat_stream_with_options, text_collected_many,
@@ -45,6 +47,8 @@ pub(super) fn router() -> Router<ApiState> {
         .route("/v1/generate", post(completions))
         .route("/v1/completions", post(completions))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/videos/sync", post(video::generate))
+        .merge(async_video::router())
 }
 
 fn model_card(id: String) -> Value {

@@ -33,7 +33,11 @@ pub struct PipelineRouter<C: Send + 'static = ()> {
 }
 impl<C: Send + 'static> PipelineRouter<C> {
     /// Creates a Router with no-op KV-prefix and route-target statistics readers.
-    pub fn with_pipeline(inventory: Arc<dyn RouteInventory>, pipeline: RouterPipeline<C>) -> Self {
+    pub fn with_pipeline(
+        inventory: Arc<dyn RouteInventory>,
+        pipeline: impl Into<Arc<RouterPipeline<C>>>,
+    ) -> Self {
+        let pipeline = pipeline.into();
         let metrics = Arc::new(crate::metrics::RouterMetricsScope::new(
             inventory.as_ref(),
             pipeline.algorithm_names,
@@ -42,7 +46,7 @@ impl<C: Send + 'static> PipelineRouter<C> {
             inventory,
             kv_prefix_indexer: Arc::new(NoopKvPrefixIndexer),
             route_target_stats_reader: Arc::new(NoopRouteTargetStatsReader),
-            pipeline: Arc::new(pipeline),
+            pipeline,
             routing_load: Arc::new(Mutex::new(RoutingReservations::default())),
             metrics,
         }
@@ -120,6 +124,7 @@ impl<C: Send + 'static> PipelineRouter<C> {
                     route_target_stats: stats.clone(),
                     local_load: reservations
                         .snapshot(&(route.route_target_id.clone(), data_parallel_rank)),
+                    stage_eligible: false,
                 })
             })
             .collect()
@@ -132,7 +137,7 @@ impl<C: Send + 'static> PipelineRouter<C> {
         request: &RouterRequest,
         routing_progress: &RoutingProgress<'_>,
         customized_context: &mut C,
-        eligible: impl Fn(&RouteCandidate, &[ScoredCandidate]) -> bool,
+        eligible: impl Fn(&RouteCandidate, &[RouteCandidate]) -> bool,
         error: RouteError,
     ) -> Result<RouteCandidate, RouteError> {
         let started = Instant::now();
@@ -167,7 +172,7 @@ impl<C: Send + 'static> PipelineRouter<C> {
                 stage_started.elapsed(),
             );
             let mut seen_indexes = BTreeSet::new();
-            let filtered = filtered_indexes
+            let mut filtered = filtered_indexes
                 .into_iter()
                 .map(|index| {
                     if !seen_indexes.insert(index) {
@@ -179,9 +184,19 @@ impl<C: Send + 'static> PipelineRouter<C> {
                         .ok_or(RouteError::InvalidFilterIndex { index: index.0 })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let eligibility = filtered
+                .iter()
+                .map(|candidate| eligible(candidate, &filtered))
+                .collect::<Vec<_>>();
+            for (candidate, eligible) in filtered.iter_mut().zip(eligibility) {
+                candidate.stage_eligible = eligible;
+            }
             metrics.candidates(&request.model, round, "filtered", filtered.len());
             let stage_started = Instant::now();
-            let scores = self.pipeline.scorer.score(
+            let crate::algorithm::ScoringOutcome {
+                scores,
+                on_selected,
+            } = self.pipeline.scorer.score_for_selection(
                 request,
                 &filtered,
                 self.kv_prefix_indexer.as_ref(),
@@ -208,7 +223,7 @@ impl<C: Send + 'static> PipelineRouter<C> {
                 .collect::<Vec<_>>();
             let selectable = scored
                 .iter()
-                .filter(|candidate| eligible(&candidate.candidate, &scored))
+                .filter(|candidate| candidate.candidate.stage_eligible)
                 .cloned()
                 .collect::<Vec<_>>();
             metrics.candidates(&request.model, round, "selectable", selectable.len());
@@ -247,12 +262,15 @@ impl<C: Send + 'static> PipelineRouter<C> {
                         |lookup| self.kv_prefix_indexer.prefix_matches(lookup),
                     );
                 tracing::debug!(
-                    request_id = %request.generate_request.request_id,
+                    request_id = %request.request_id(),
                     route_target_id = %candidate.route_target_id.as_str(),
                     data_parallel_rank = candidate.data_parallel_rank,
                     cache_observation = ?observation,
                     "KV routing observation"
                 );
+            }
+            if let Some(on_selected) = on_selected {
+                on_selected(&candidate);
             }
             reservations.reserve(request, &candidate, self.kv_prefix_indexer.as_ref());
             Ok(candidate)
@@ -261,11 +279,10 @@ impl<C: Send + 'static> PipelineRouter<C> {
         result
     }
 
-    fn future_stages_available(candidate: &RouteCandidate, scored: &[ScoredCandidate]) -> bool {
+    fn future_stages_available(candidate: &RouteCandidate, candidates: &[RouteCandidate]) -> bool {
         candidate.future_stages().iter().all(|role| {
-            scored.iter().any(|other| {
-                other.candidate.role == *role
-                    && other.candidate.pipeline_scope_id == candidate.pipeline_scope_id
+            candidates.iter().any(|other| {
+                other.role == *role && other.pipeline_scope_id == candidate.pipeline_scope_id
             })
         })
     }
@@ -291,7 +308,7 @@ impl<C: Send + 'static> PipelineRouter<C> {
             request,
             routing_progress,
             context,
-            |candidate, scored| match candidate.role {
+            |candidate, candidates| match candidate.role {
                 ModelServerRole::Aggregate => true,
                 ModelServerRole::Prefill => {
                     candidate
@@ -299,12 +316,12 @@ impl<C: Send + 'static> PipelineRouter<C> {
                         .as_ref()
                         .is_some_and(|pipeline_scope_id| {
                             !self.pipeline_scope_has_encoder(request, pipeline_scope_id)
-                                && Self::future_stages_available(candidate, scored)
+                                && Self::future_stages_available(candidate, candidates)
                         })
                 }
                 ModelServerRole::Encoder => {
                     candidate.pipeline_scope_id.is_some()
-                        && Self::future_stages_available(candidate, scored)
+                        && Self::future_stages_available(candidate, candidates)
                 }
                 ModelServerRole::Decode => false,
             },
@@ -327,10 +344,10 @@ impl<C: Send + 'static> PipelineRouter<C> {
             request,
             routing_progress,
             context,
-            |candidate, scored| {
+            |candidate, candidates| {
                 candidate.role == ModelServerRole::Prefill
                     && candidate.pipeline_scope_id.as_deref() == Some(pipeline_scope_id)
-                    && Self::future_stages_available(candidate, scored)
+                    && Self::future_stages_available(candidate, candidates)
             },
             RouteError::NoMatchingRouteTarget {
                 model: request.model.clone(),
@@ -406,7 +423,7 @@ impl<C: Send + 'static> RouteSession for Session<C> {
             .lock()
             .expect("routing load lock poisoned");
         for key in &self.selected {
-            reservations.release_prompt_load(key, &self.request.generate_request.request_id);
+            reservations.release_prompt_load(key, self.request.request_id());
         }
     }
 
@@ -420,7 +437,7 @@ impl<C: Send + 'static> RouteSession for Session<C> {
             .lock()
             .expect("routing load lock poisoned");
         for key in self.selected.drain(..) {
-            reservations.release(&key, &self.request.generate_request.request_id);
+            reservations.release(&key, self.request.request_id());
         }
     }
 
@@ -533,7 +550,9 @@ impl<C: Send + 'static> Router for PipelineRouter<C> {
                     .filter(|candidate| {
                         matches!(
                             candidate.role,
-                            ModelServerRole::Aggregate | ModelServerRole::Prefill
+                            ModelServerRole::Aggregate
+                                | ModelServerRole::Prefill
+                                | ModelServerRole::Decode
                         )
                     })
                     .filter_map(|candidate| {

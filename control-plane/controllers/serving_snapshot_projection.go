@@ -120,7 +120,7 @@ func (reconciler *FrontendServiceReconciler) projectScalingModels(ctx context.Co
 	models := make([]servingSnapshotModel, 0, len(services.Items))
 	for index := range services.Items {
 		service := &services.Items[index]
-		if !modelServiceConfigured(service) {
+		if (service.Spec.Backend != "vllm" && service.Spec.Backend != "vllm-omni") || !modelServiceConfigured(service) {
 			continue
 		}
 		servicePools := ownedRoutingPools(service, pools.Items)
@@ -148,7 +148,8 @@ func (reconciler *FrontendServiceReconciler) projectScalingModels(ctx context.Co
 				revision := serviceServingRevision(service, pool)
 				for groupIndex := range groups.Items {
 					group := &groups.Items[groupIndex]
-					if routingGroupOwnedBy(group, pool) && group.Spec.Revision == revision && routingGroupReady(group) {
+					// Model identity survives engine restart; readiness filters executable routes separately.
+					if routingGroupOwnedBy(group, pool) && group.Spec.Revision == revision {
 						selected = group
 						break
 					}
@@ -167,6 +168,10 @@ func (reconciler *FrontendServiceReconciler) projectScalingModels(ctx context.Co
 				features.Multimodal = nil
 			}
 		}
+		capabilities := routingCapabilities(features)
+		if service.Spec.Backend == "vllm-omni" {
+			capabilities = []string{"video"}
+		}
 		models = append(models, servingSnapshotModel{
 			ServiceUID:          string(service.UID),
 			Model:               model,
@@ -175,7 +180,7 @@ func (reconciler *FrontendServiceReconciler) projectScalingModels(ctx context.Co
 			Tokenizer:           tokenizer,
 			TokenizerRevision:   tokenizerRevision,
 			MaxInputTokens:      maxInputTokens,
-			Capabilities:        routingCapabilities(features),
+			Capabilities:        capabilities,
 			AdmissionTargetSets: admissionTargetSets,
 		})
 	}
@@ -265,7 +270,7 @@ func (reconciler *FrontendServiceReconciler) projectableRouting(ctx context.Cont
 	var projectionErr error
 	for serviceIndex := range services.Items {
 		service := &services.Items[serviceIndex]
-		if !modelServiceReady(service) {
+		if (service.Spec.Backend != "vllm" && service.Spec.Backend != "vllm-omni") || !modelServiceReady(service) {
 			continue
 		}
 		servicePools := ownedRoutingPools(service, pools.Items)
@@ -670,6 +675,9 @@ func routingGroup(group *inferencev1alpha1.ModelGroup) servingSnapshotGroup {
 }
 func routingGroupForService(service *inferencev1alpha1.ModelService, pool *inferencev1alpha1.ModelPool, group *inferencev1alpha1.ModelGroup) servingSnapshotGroup {
 	route := routingGroup(group)
+	if service.Spec.Backend == "vllm-omni" {
+		route.Capabilities = []string{"video"}
+	}
 	route.ServiceUID, route.PoolUID, route.PoolName = string(service.UID), group.Spec.ModelPoolRef.UID, pool.Spec.PoolName
 	return route
 }

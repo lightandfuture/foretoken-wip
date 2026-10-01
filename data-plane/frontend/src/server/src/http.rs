@@ -23,10 +23,12 @@ pub fn router(
     generation: Arc<dyn Generation>,
     models: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     stream_idle: Duration,
-) -> Router {
-    Router::new()
+) -> Result<Router, Box<dyn std::error::Error>> {
+    let video_tasks = crate::video_task::VideoTaskClient::from_service_account()?;
+    Ok(Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/health", get(readyz))
         .route("/statusz", get(statusz))
         .route("/metrics", get(metrics))
         .route(
@@ -38,9 +40,10 @@ pub fn router(
             generation,
             models,
             stream_idle,
+            video_tasks,
         })
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
-        .layer(middleware::from_fn(foretoken_metrics::track_http_metrics))
+        .layer(middleware::from_fn(foretoken_metrics::track_http_metrics)))
 }
 
 async fn healthz() -> StatusCode {
