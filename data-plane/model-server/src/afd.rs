@@ -45,14 +45,23 @@ impl AfdPlan {
         if self == &Self::default() {
             return Ok(());
         }
-        if self.role.is_none()
-            || self.connector.is_empty()
-            || self.rendezvous_host.is_empty()
-            || self.num_attention_ranks == 0
-            || self.num_ffn_ranks == 0
-            || self.connector_port == 0
-        {
-            return Err("AFD config must be either absent or complete".into());
+        if self.role.is_none() {
+            return Err("AFD role is required".into());
+        }
+        if self.connector.is_empty() {
+            return Err("AFD connector is required".into());
+        }
+        if self.rendezvous_host.is_empty() {
+            return Err("AFD rendezvousHost is required".into());
+        }
+        if self.num_attention_ranks == 0 {
+            return Err("AFD numAttentionRanks must be positive".into());
+        }
+        if self.num_ffn_ranks == 0 {
+            return Err("AFD numFfnRanks must be positive".into());
+        }
+        if self.connector_port == 0 {
+            return Err("AFD connectorPort must be non-zero".into());
         }
         if self.connector != "P2pNcclAFDConnector" {
             return Err("AFD connector must be P2pNcclAFDConnector".into());
