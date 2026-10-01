@@ -463,6 +463,9 @@ impl LaunchPlanV1 {
         // The controller has already normalized native option names.
         // Keep argument values intact: this command never goes through a shell.
         for (name, value) in &self.engine_args {
+            if self.afd.enabled() && name == "additional-config" {
+                continue;
+            }
             if matches!(self.ec.role, Some(EcRole::Producer))
                 && matches!(name.as_str(), "mm-encoder-only" | "enforce-eager")
             {
@@ -476,6 +479,17 @@ impl LaunchPlanV1 {
                 "--enforce-eager".into(),
                 "--no-enable-prefix-caching".into(),
             ]);
+        }
+        if let Some(afd) = self.afd.config() {
+            // Validation guarantees an object. The typed plan owns AFD; unrelated native keys
+            // survive unchanged and the generic loop skips this option to avoid duplicate flags.
+            let mut config = self
+                .engine_args
+                .get("additional-config")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            config["afd"] = afd;
+            args.push(format!("--additional-config={config}"));
         }
         if self.kv.events() {
             args.push(format!("--kv-events-config={}", json!({"publisher":"zmq","endpoint":kv_event_endpoint(member.map_or(LOOPBACK_HOST, |member| member.leader_address.as_str()), 0),"topic":KV_EVENT_TOPIC,"enable_kv_cache_events":true,"hwm":4096,"max_queue_size":4096})));

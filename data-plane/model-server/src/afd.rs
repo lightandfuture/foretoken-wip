@@ -4,6 +4,7 @@
 //! Private controller-projected AFD configuration and connector constraints.
 
 use serde::Deserialize;
+use serde_json::{Value, json};
 
 /// Role of one execution group in the paired Attention/FFN topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -38,6 +39,24 @@ impl AfdPlan {
     /// Reports whether a validated launch plan configures an AFD role.
     pub fn enabled(&self) -> bool {
         self.role.is_some()
+    }
+
+    /// Builds the pinned plugin's `additional-config.afd` object for argv rendering.
+    ///
+    /// The caller has already validated the launch plan; absent AFD produces no object, while a
+    /// populated plan owns every connector field passed to the child process.
+    pub(crate) fn config(&self) -> Option<Value> {
+        Some(json!({
+            "role": match self.role? {
+                AfdRole::Attention => "attention",
+                AfdRole::Ffn => "ffn",
+            },
+            "connector": self.connector,
+            "host": self.rendezvous_host,
+            "port": self.connector_port,
+            "num_attention_ranks": self.num_attention_ranks,
+            "num_ffn_ranks": self.num_ffn_ranks,
+        }))
     }
 
     /// Rejects incomplete controller projections before launch-plan validation continues.
