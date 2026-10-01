@@ -514,6 +514,10 @@ async fn spawn_engine_attempt(
     } else {
         Vec::new()
     };
+    // The pinned AFD plugin requires the v1 model runner for both roles.
+    if config.launch.afd.enabled() {
+        environment.push(("VLLM_USE_V2_MODEL_RUNNER".into(), "0".into()));
+    }
     if mode == runtime_cache::Mode::Persistent
         && let Some(profile) = profiling
     {
