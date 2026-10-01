@@ -101,7 +101,6 @@ build_dev_images() {
     "${model_image_args[@]}" \
     --build-arg INFERENCE_ENGINE_IMAGE \
     --build-arg FORETOKEN_VLLM_PYTHON \
-    --build-arg FORETOKEN_ENABLE_AFD \
     "${cargo_args[@]}" \
     "${model_args[@]}" \
     -f data-plane/model-server/Dockerfile \

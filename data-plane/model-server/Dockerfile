@@ -107,47 +107,19 @@ ARG UV_DEFAULT_INDEX=https://pypi.org/simple
 # Engine images may provide a Python virtual environment without pip.
 # MACA also exposes torch.version.cuda, so select dependencies from the engine build.
 RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=type=bind,source=data-plane/model-server/pyproject.toml,target=/tmp/foretoken-runtime/pyproject.toml \
     python_path=$("${FORETOKEN_VLLM_PYTHON:-python}" -c \
       'import sys; print(sys.executable)') \
     && backend=$("$python_path" -c \
       'import torch; print("maca" if getattr(torch.version, "maca", None) else "cuda" if torch.version.cuda else "other")') \
-    && set -- modelscope==1.35.3 \
-    && case "$backend" in cuda) set -- "$@" bitsandbytes==0.49.2 ;; esac \
-    && uv pip install --no-cache --python "$python_path" \
-      --default-index "${UV_DEFAULT_INDEX}" "$@"
-
-# AFD is an opt-in image capability; its version constraints apply only to this build.
-ARG FORETOKEN_ENABLE_AFD=0
-RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
-    case "$FORETOKEN_ENABLE_AFD" in \
-      0) exit 0 ;; \
-      1) ;; \
-      *) printf '%s\n' 'FORETOKEN_ENABLE_AFD must be 0 or 1' >&2; exit 1 ;; \
-    esac \
-    && python_path=$("${FORETOKEN_VLLM_PYTHON:-python}" -c \
-      'import sys; print(sys.executable)') \
-    && "$python_path" -c \
-      'import sys; supported = (3, 10) <= sys.version_info[:2] < (3, 14); supported or sys.exit(f"AFD requires Python 3.10-3.13, found {sys.version.split()[0]}")' \
-    && "$python_path" -c \
-      'import sys, torch; (torch.version.cuda and not getattr(torch.version, "maca", None)) or sys.exit("AFD requires an NVIDIA CUDA runtime")' \
-    && vllm_version=$("$python_path" -c \
-      'from importlib.metadata import version; print(version("vllm"))') \
-    && { [ "$vllm_version" = 0.26.0 ] || { \
-         printf 'AFD requires vLLM 0.26.0; the selected INFERENCE_ENGINE_IMAGE contains %s\n' "$vllm_version" >&2; \
-         exit 1; \
-       }; } \
-    && afd_plugin_version=0.26.0rc1 \
-    && afd_plugin_source='vllm-afd-plugin @ https://github.com/vllm-project/afd-plugin/archive/85e826ed8239dd9d8032375bb84a56116e24f0e0.tar.gz#sha256=4757f42b529c107c129568e8691fbf978a12a316397b6c27fbf776840c49c715' \
-    && SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_AFD_PLUGIN="$afd_plugin_version" \
-      uv pip install --no-cache --python "$python_path" --no-deps \
-        --default-index "${UV_DEFAULT_INDEX}" "$afd_plugin_source" \
-    && installed_version=$("$python_path" -c \
-      'from importlib.metadata import version; print(version("vllm-afd-plugin"))') \
-    && { [ "$installed_version" = "$afd_plugin_version" ] || { \
-         printf 'AFD %s is required, found %s\n' "$afd_plugin_version" "$installed_version" >&2; \
-         exit 1; \
-       }; } \
-    && "$python_path" -c 'import afd_plugin; print(afd_plugin.__file__)'
+    && set -- \
+    && case "$backend" in cuda) set -- --extra cuda ;; esac \
+    && "$python_path" -c 'from importlib.metadata import version; print("torch==" + version("torch")); print("vllm==" + version("vllm"))' > /tmp/foretoken-engine-constraints.txt \
+    && uv pip install --directory /tmp/foretoken-runtime --no-cache --python "$python_path" \
+      --constraint /tmp/foretoken-engine-constraints.txt \
+      --requirements /tmp/foretoken-runtime/pyproject.toml \
+      --default-index "${UV_DEFAULT_INDEX}" "$@" \
+    && rm /tmp/foretoken-engine-constraints.txt
 
 FROM engine-runtime AS runtime
 
