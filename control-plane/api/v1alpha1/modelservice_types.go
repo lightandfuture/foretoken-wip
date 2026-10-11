@@ -86,6 +86,7 @@ type ECProfileReference struct {
 // ModelPoolTemplate defines one user-owned execution Pool: a homogeneous set
 // of ModelGroups sharing the same role, network, resources, and parallelism.
 // The controller instantiates it as a ModelPool owned by the ModelService.
+// +kubebuilder:validation:XValidation:rule="has(self.afd) ? !has(self.resources) && !has(self.nodes) && (!has(self.role) || self.role == 'aggregate') : has(self.resources)",message="AFD requires aggregate role and per-role resources/nodes; ordinary Pools require resources"
 type ModelPoolTemplate struct {
 	// Name is the stable identity of this Pool within one ModelService.
 	// +kubebuilder:validation:MinLength=1
@@ -103,9 +104,8 @@ type ModelPoolTemplate struct {
 	// +kubebuilder:validation:Minimum=0
 	Replicas *int32 `json:"replicas,omitempty"`
 
-	// Nodes is the number of distinct Kubernetes Nodes used by each ModelGroup.
+	// Nodes selects ordinary Group nodes; the compiler defaults it to one.
 	// +optional
-	// +kubebuilder:default=1
 	// +kubebuilder:validation:Minimum=1
 	Nodes *int32 `json:"nodes,omitempty"`
 
@@ -115,7 +115,12 @@ type ModelPoolTemplate struct {
 	// +kubebuilder:validation:Pattern="^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$"
 	Network string `json:"network,omitempty"`
 
-	Resources ModelResources `json:"resources"`
+	// +optional
+	Resources *ModelResources `json:"resources,omitempty"`
+
+	// AFD selects a complete Attention/FFN execution topology.
+	// +optional
+	AFD *AFDPool `json:"afd,omitempty"`
 
 	// NodeSelector constrains this Pool's member Pods to matching Kubernetes nodes.
 	// +optional

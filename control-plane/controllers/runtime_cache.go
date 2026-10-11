@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	inferencev1alpha1 "github.com/shiweijiezero/foretoken/control-plane/api/v1alpha1"
+	"github.com/shiweijiezero/foretoken/control-plane/internal/runtimeconfig"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,19 +25,12 @@ const (
 	directoryOwnerAnnotation       = "inference.foretoken.io/directory-owner"
 )
 
-func runtimeCacheObservationPort(runtimePort int32) int32 {
-	if runtimePort < 65535 {
-		return runtimePort + 1
-	}
-	return runtimePort - 1
-}
-
 // runtimeCacheObserverEnv gives preparation and serving processes the same filesystem observer identity.
 func runtimeCacheObserverEnv(cache inferencev1alpha1.RuntimeCacheBinding, runtimePort int32) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{Name: "FORETOKEN_CACHE_MOUNT_PATH", Value: cache.MountPath},
 		{Name: runtimeCacheClaimEnv, Value: cache.ClaimName},
-		{Name: "FORETOKEN_CACHE_OBSERVATION_PORT", Value: strconv.Itoa(int(runtimeCacheObservationPort(runtimePort)))},
+		{Name: "FORETOKEN_CACHE_OBSERVATION_PORT", Value: strconv.Itoa(int(runtimeconfig.CacheObservationPort(runtimePort)))},
 		{Name: "FORETOKEN_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
 	}
 }

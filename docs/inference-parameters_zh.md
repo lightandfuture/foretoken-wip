@@ -70,6 +70,12 @@ P/D 和 E/P/D 各 Pool 可以在模型和引擎支持的组合内分别配置并
 
 开启 EP 后，attention 可以按 TP × DP 执行，路由专家则分布在对应的 EP 组中。共享专家不会让 attention 的 KV Cache 在 DP ranks 之间共享。
 
+### Attention/FFN Pool 配置
+
+Aggregate vLLM Pool 的 `modelPools[].afd` 包含 `attention` 和 `ffn` 两侧。每侧分别填写 `nodes`、每成员 `resources` 和 `parallelism.dp`／`parallelism.tp`；节点数 × 每成员 GPU 数须等于 DP × TP。Pool 的 `replicas` 表示完整 Attention/FFN Group 的数量。填写 `afd` 后，不再填写 Pool 顶层的 `nodes` 或 `resources`，也不能用引擎参数覆盖角色拓扑或 `additional-config.afd`。
+
+当前 adapter 仅接受两侧各一个单 GPU 成员（DP=TP=1）。控制器可以编译该配置，但会在创建服务 Pod 前明确拒绝 AFD Group 工作负载，因此 AFD 目前尚不能作为可部署的服务模式使用。
+
 ## 推测解码
 
 将完整的原生字典写在一起：

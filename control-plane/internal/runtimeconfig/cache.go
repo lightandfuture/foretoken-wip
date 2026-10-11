@@ -25,6 +25,15 @@ const (
 	SourceDirectoryEnv = "FORETOKEN_SOURCE_DIRECTORY"
 )
 
+// CacheObservationPort selects the filesystem observer port beside a model-server.
+// Workload projection and runtime profile validation share this reservation.
+func CacheObservationPort(runtimePort int32) int32 {
+	if runtimePort < 65535 {
+		return runtimePort + 1
+	}
+	return runtimePort - 1
+}
+
 // SourceRevision resolves new service source selections according to the platform source mode.
 // Absence requests no source override; a present annotation identifies one directory segment.
 func SourceRevision(annotations map[string]string, sourceMode bool) (string, error) {

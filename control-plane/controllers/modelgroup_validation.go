@@ -10,6 +10,7 @@ import (
 
 	inferencev1alpha1 "github.com/shiweijiezero/foretoken/control-plane/api/v1alpha1"
 	resourcevalidation "github.com/shiweijiezero/foretoken/control-plane/internal/resources"
+	"github.com/shiweijiezero/foretoken/control-plane/internal/runtimeconfig"
 )
 
 func validateGroupProfile(group *inferencev1alpha1.ModelGroup) error {
@@ -23,10 +24,13 @@ func validateGroupProfile(group *inferencev1alpha1.ModelGroup) error {
 }
 
 func validateGroupRuntime(group *inferencev1alpha1.ModelGroup) error {
+	if group.Spec.AFD != nil {
+		return fmt.Errorf("AFD Group workloads are not supported by this controller")
+	}
 	if group.Spec.Runtime.SourceRevision != "" && group.Spec.Runtime.Backend != "vllm" {
 		return fmt.Errorf("source bundles support the vLLM model-server only")
 	}
-	if group.Spec.NodeCount < 1 || group.Spec.MemberCount != group.Spec.NodeCount {
+	if group.Spec.NodeCount < 1 || group.Spec.MemberCount != group.Spec.NodeCount || group.Spec.Resources == nil || group.Spec.Parallelism == nil {
 		return fmt.Errorf("model Groups require one member per node")
 	}
 	if group.Spec.Runtime.Backend == "vllm-omni" {
@@ -54,7 +58,7 @@ func validateGroupRuntime(group *inferencev1alpha1.ModelGroup) error {
 		if group.Spec.PDRuntime.BootstrapPort == group.Spec.Runtime.Port {
 			return fmt.Errorf("Mooncake bootstrap port conflicts with the model-server port")
 		}
-		if group.Spec.Artifacts.Cache != nil && group.Spec.PDRuntime.BootstrapPort == runtimeCacheObservationPort(group.Spec.Runtime.Port) {
+		if group.Spec.Artifacts.Cache != nil && group.Spec.PDRuntime.BootstrapPort == runtimeconfig.CacheObservationPort(group.Spec.Runtime.Port) {
 			return fmt.Errorf("Mooncake bootstrap port conflicts with the runtime cache observation port")
 		}
 	}
@@ -86,7 +90,7 @@ func validateMooncakeStoreRuntime(group *inferencev1alpha1.ModelGroup, store *in
 		return fmt.Errorf("managed Mooncake Store requester buffer is incomplete")
 	}
 	if store.RequesterBufferBytes > 0 {
-		if err := resourcevalidation.ValidateRequesterBufferBudget(group.Spec.Resources, store.RequesterBufferBytes); err != nil {
+		if err := resourcevalidation.ValidateRequesterBufferBudget(*group.Spec.Resources, store.RequesterBufferBytes); err != nil {
 			return fmt.Errorf("managed Mooncake Store requester buffer: %w", err)
 		}
 	}

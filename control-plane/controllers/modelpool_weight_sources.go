@@ -13,6 +13,7 @@ import (
 
 	inferencev1alpha1 "github.com/shiweijiezero/foretoken/control-plane/api/v1alpha1"
 	"github.com/shiweijiezero/foretoken/control-plane/internal/resolver"
+	"github.com/shiweijiezero/foretoken/control-plane/internal/runtimeconfig"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,7 +34,7 @@ const (
 func modelExpressSourcesEnabled(spec inferencev1alpha1.ModelGroupSpec) bool {
 	var loader string
 	argument := spec.Runtime.EngineArgs["load-format"]
-	return json.Unmarshal(argument.Raw, &loader) == nil && loader == "modelexpress" && spec.RDMA != nil &&
+	return spec.AFD == nil && spec.Parallelism != nil && spec.Resources != nil && json.Unmarshal(argument.Raw, &loader) == nil && loader == "modelexpress" && spec.RDMA != nil &&
 		spec.Accelerator.DeviceResourceName == "nvidia.com/gpu" && spec.Artifacts.Cache != nil &&
 		spec.Artifacts.Source != inferencev1alpha1.ModelSourceLocal && spec.Parallelism.DP == 1 &&
 		(spec.Parallelism.EP == nil || !spec.Parallelism.EP.EPLB)
@@ -50,7 +51,7 @@ func configureWeightSources(spec inferencev1alpha1.ModelGroupSpec, pod *corev1.P
 		return nil
 	}
 	gpuCount := spec.Resources.Requests.GPU.Count
-	reservedPorts := []int32{spec.Runtime.Port, runtimeCacheObservationPort(spec.Runtime.Port)}
+	reservedPorts := []int32{spec.Runtime.Port, runtimeconfig.CacheObservationPort(spec.Runtime.Port)}
 	if spec.PDRuntime != nil {
 		reservedPorts = append(reservedPorts, spec.PDRuntime.BootstrapPort)
 	}

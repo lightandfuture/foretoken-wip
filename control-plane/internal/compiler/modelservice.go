@@ -7,6 +7,7 @@ package compiler
 
 import (
 	"fmt"
+	"math"
 	"path"
 	"sort"
 	"time"
@@ -60,7 +61,7 @@ func CompileModelService(spec inferencev1alpha1.ModelServiceSpec) ([]ModelPool, 
 	if len(spec.ModelPools) == 0 {
 		replicas := valueOrDefault(spec.Replicas, 1)
 		nodes := valueOrDefault(spec.Nodes, 1)
-		pool, err := compilePool(spec, source, artifactRevision, defaultPoolName, inferencev1alpha1.ModelRoleAggregate, replicas, nodes, "", "", *spec.Resources, spec.NodeSelector, spec.EngineArgs, spec.MaxInputTokens, internalGenerateRequestBodyLimitBytes, spec.KVCache, spec.Features, timeouts)
+		pool, err := compilePool(spec, source, artifactRevision, defaultPoolName, inferencev1alpha1.ModelRoleAggregate, replicas, nodes, "", "", spec.Resources, nil, spec.NodeSelector, spec.EngineArgs, spec.MaxInputTokens, internalGenerateRequestBodyLimitBytes, spec.KVCache, spec.Features, timeouts)
 		if err != nil {
 			return nil, err
 		}
@@ -92,7 +93,10 @@ func CompileModelService(spec inferencev1alpha1.ModelServiceSpec) ([]ModelPool, 
 		if entry.NodeSelector != nil {
 			nodeSelector = entry.NodeSelector
 		}
-		pool, err := compilePool(spec, source, artifactRevision, entry.Name, role, replicas, nodes, entry.Network, ecProfileForRole(spec.ECProfile, role), entry.Resources, nodeSelector, engineArgs, entry.MaxInputTokens, internalGenerateRequestBodyLimitBytes, entry.KVCache, entry.Features, timeouts)
+		if entry.AFD != nil && entry.Nodes != nil {
+			return nil, fmt.Errorf("modelPools %q: afd and nodes are mutually exclusive", entry.Name)
+		}
+		pool, err := compilePool(spec, source, artifactRevision, entry.Name, role, replicas, nodes, entry.Network, ecProfileForRole(spec.ECProfile, role), entry.Resources, entry.AFD, nodeSelector, engineArgs, entry.MaxInputTokens, internalGenerateRequestBodyLimitBytes, entry.KVCache, entry.Features, timeouts)
 		if err != nil {
 			return nil, fmt.Errorf("modelPools %q: %w", entry.Name, err)
 		}
@@ -134,13 +138,39 @@ func validateModelPoolRoles(pools []inferencev1alpha1.ModelPoolTemplate) error {
 	return nil
 }
 
-func compilePool(spec inferencev1alpha1.ModelServiceSpec, source inferencev1alpha1.ModelSource, artifactRevision, name string, role inferencev1alpha1.ModelRole, replicas, nodes int32, network, ecProfile string, resources inferencev1alpha1.ModelResources, nodeSelector map[string]string, engineArgs inferencev1alpha1.EngineArguments, maxInputTokens *int32, internalGenerateRequestBodyLimitBytes int64, kvCache *inferencev1alpha1.KVCache, features *inferencev1alpha1.ModelFeatures, timeouts inferencev1alpha1.ModelTimeouts) (ModelPool, error) {
+func compilePool(spec inferencev1alpha1.ModelServiceSpec, source inferencev1alpha1.ModelSource, artifactRevision, name string, role inferencev1alpha1.ModelRole, replicas, nodes int32, network, ecProfile string, resources *inferencev1alpha1.ModelResources, afd *inferencev1alpha1.AFDPool, nodeSelector map[string]string, engineArgs inferencev1alpha1.EngineArguments, maxInputTokens *int32, internalGenerateRequestBodyLimitBytes int64, kvCache *inferencev1alpha1.KVCache, features *inferencev1alpha1.ModelFeatures, timeouts inferencev1alpha1.ModelTimeouts) (ModelPool, error) {
 	if nodes < 1 {
 		return ModelPool{}, fmt.Errorf("nodes must be positive")
 	}
-	normalizedResources, err := normalizeResources(resources)
-	if err != nil {
-		return ModelPool{}, err
+	var normalizedResources *inferencev1alpha1.ModelResources
+	var topology *inferencev1alpha1.AFDTopology
+	members := nodes
+	if afd != nil {
+		if resources != nil || role != inferencev1alpha1.ModelRoleAggregate || spec.Backend != "vllm" || kvCache != nil || ecProfile != "" {
+			return ModelPool{}, fmt.Errorf("AFD requires aggregate vLLM with per-role resources and no KV/EC transfer")
+		}
+		attention, err := compileAFDRole(afd.Attention)
+		if err != nil {
+			return ModelPool{}, fmt.Errorf("afd.attention: %w", err)
+		}
+		ffn, err := compileAFDRole(afd.FFN)
+		if err != nil {
+			return ModelPool{}, fmt.Errorf("afd.ffn: %w", err)
+		}
+		if int64(attention.MemberCount)+int64(ffn.MemberCount) > math.MaxInt32 {
+			return ModelPool{}, fmt.Errorf("AFD member count exceeds supported resource capacity")
+		}
+		topology = &inferencev1alpha1.AFDTopology{Attention: attention, FFN: ffn}
+		nodes, members = 0, attention.MemberCount+ffn.MemberCount
+	} else {
+		if resources == nil {
+			return ModelPool{}, fmt.Errorf("ordinary Pool resources are required")
+		}
+		value, err := normalizeResources(*resources)
+		if err != nil {
+			return ModelPool{}, err
+		}
+		normalizedResources = &value
 	}
 	normalizedKVCache, err := normalizeKVCache(kvCache)
 	if err != nil {
@@ -175,7 +205,8 @@ func compilePool(spec inferencev1alpha1.ModelServiceSpec, source inferencev1alph
 			Backend:                               spec.Backend,
 			Role:                                  role,
 			NodeCount:                             nodes,
-			MemberCount:                           nodes,
+			MemberCount:                           members,
+			AFD:                                   topology,
 			Resources:                             normalizedResources,
 			NodeSelector:                          normalizedNodeSelector,
 			MaxInputTokens:                        copyInt32(maxInputTokens),
@@ -394,4 +425,19 @@ func hasEncoderRole(pools []inferencev1alpha1.ModelPoolTemplate) bool {
 		}
 	}
 	return false
+}
+
+// compileAFDRole normalizes one role for the Pool compiler and verifies its resource identity.
+func compileAFDRole(input inferencev1alpha1.AFDPoolRole) (inferencev1alpha1.AFDMemberSpec, error) {
+	if input.Nodes < 1 || input.Parallelism.DP < 1 || input.Parallelism.TP < 1 {
+		return inferencev1alpha1.AFDMemberSpec{}, fmt.Errorf("nodes, DP and TP must be positive")
+	}
+	resources, err := normalizeResources(input.Resources)
+	if err != nil {
+		return inferencev1alpha1.AFDMemberSpec{}, err
+	}
+	if int64(input.Nodes)*int64(resources.Requests.GPU.Count) != int64(input.Parallelism.DP)*int64(input.Parallelism.TP) {
+		return inferencev1alpha1.AFDMemberSpec{}, fmt.Errorf("nodes times GPUs per member must equal DP times TP")
+	}
+	return inferencev1alpha1.AFDMemberSpec{MemberCount: input.Nodes, Resources: resources, Parallelism: input.Parallelism}, nil
 }

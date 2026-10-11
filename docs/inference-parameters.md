@@ -70,6 +70,12 @@ P/D and E/P/D Pools can select their own parallelism settings within the model a
 
 With EP enabled, attention can use TP × DP while routed experts span the corresponding EP group. Sharing experts does not share attention KV caches between DP ranks.
 
+### Attention/FFN Pool configuration
+
+For an aggregate vLLM Pool, `modelPools[].afd` contains `attention` and `ffn` roles. Each role specifies `nodes`, per-member `resources`, and `parallelism.dp`/`parallelism.tp`; its node count × GPUs per member must equal DP × TP. The Pool's `replicas` counts complete Attention/FFN Groups. A Pool with `afd` cannot also set ordinary Pool-level `nodes` or `resources`, and its engine arguments cannot override the role topology or `additional-config.afd`.
+
+The current adapter accepts only one single-GPU member per role (DP=TP=1). The controller compiles that configuration but explicitly rejects AFD Group workloads before creating serving Pods. AFD is therefore not yet a deployable service mode.
+
 ## Speculative decoding
 
 Keep the complete native dictionary together:

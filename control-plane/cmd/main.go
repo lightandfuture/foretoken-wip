@@ -60,6 +60,8 @@ func main() {
 	var inferenceEngineImage string
 	var omniInferenceEngineImage string
 	var nsightImage string
+	var afdInferenceEngineImage string
+	var afdConnectorPort int
 	var modelServerPort int
 	var gpuResourceName string
 	var runtimeClassName string
@@ -140,6 +142,8 @@ func main() {
 	flag.StringVar(&inferenceEngineImage, "inference-engine-image", "", "Inference engine image containing the Foretoken model-server adapter.")
 	flag.StringVar(&omniInferenceEngineImage, "omni-inference-engine-image", "", "Optional vLLM-Omni image containing the Foretoken Omni adapter.")
 	flag.StringVar(&nsightImage, "nsight-image", "", "Optional NVIDIA model-server image prepared for Nsight Systems.")
+	flag.StringVar(&afdInferenceEngineImage, "afd-inference-engine-image", "", "Optional pinned CUDA AFD model-server image.")
+	flag.IntVar(&afdConnectorPort, "afd-connector-port", 6239, "Platform-owned AFD rendezvous port.")
 	flag.IntVar(&modelServerPort, "model-server-port", 9000, "Internal model-server HTTP port.")
 	flag.StringVar(&gpuResourceName, "gpu-resource-name", "nvidia.com/gpu", "Kubernetes extended resource used for accelerator devices.")
 	flag.StringVar(&runtimeClassName, "runtime-class-name", "", "Optional RuntimeClass for inference engine Pods.")
@@ -175,6 +179,11 @@ func main() {
 	huggingFaceAccessProfile := controllers.HuggingFaceAccessProfile{Endpoint: modelSourceEndpoint, TokenSecretName: modelSourceTokenSecretName, TokenSecretKey: modelSourceTokenSecretKey}
 	modelDistributionProfile := runtimeconfig.ModelDistributionProfile{DragonflySocketPath: dragonflySocketPath}
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&logOptions)))
+	if afdConnectorPort < 1 || afdConnectorPort > 65535 {
+		ctrl.Log.Error(errors.New("AFD connector port must be between 1 and 65535"), "invalid AFD runtime profile")
+		os.Exit(1)
+	}
+	afdProfile := &resolver.AFDProfile{Image: afdInferenceEngineImage, Port: int32(afdConnectorPort)}
 	var applicationFiles runtimeconfig.ApplicationFiles
 	if err := json.Unmarshal([]byte(applicationFilesJSON), &applicationFiles); err != nil {
 		ctrl.Log.Error(err, "invalid application file configuration")
@@ -404,7 +413,7 @@ func main() {
 		Client:                   manager.GetClient(),
 		CacheProfile:             cacheProfile,
 		SourceMode:               sourceMode,
-		RuntimeProfile:           resolver.RuntimeProfile{Image: inferenceEngineImage, OmniImage: omniInferenceEngineImage, NsightImage: nsightImage},
+		RuntimeProfile:           resolver.RuntimeProfile{Image: inferenceEngineImage, OmniImage: omniInferenceEngineImage, NsightImage: nsightImage, AFD: afdProfile},
 		ApplicationFiles:         applicationFiles,
 		ApplicationURL:           modelServerApplicationURL,
 		HuggingFaceAccessProfile: huggingFaceAccessProfile,
@@ -436,6 +445,7 @@ func main() {
 			Image:              inferenceEngineImage,
 			OmniImage:          omniInferenceEngineImage,
 			NsightImage:        nsightImage,
+			AFD:                afdProfile,
 			ModelExpress:       modelExpress,
 			ModelServerPort:    int32(modelServerPort),
 			DeviceResourceName: gpuResourceName,

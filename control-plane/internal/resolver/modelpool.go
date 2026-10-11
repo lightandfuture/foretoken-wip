@@ -47,11 +47,22 @@ type ECProfile struct {
 	SharedStoragePath  string
 }
 
+// AFDImageProfile separates CUDA AFD application selection from ordinary vLLM.
+const AFDImageProfile = "vllm-afd"
+
+// AFDProfile identifies the default CUDA image and reserved connector port.
+// An existing application selection may retain its image when the default changes.
+type AFDProfile struct {
+	Image string
+	Port  int32
+}
+
 // RuntimeProfile contains platform-owned values for the initial vLLM runtime profile.
 type RuntimeProfile struct {
 	Image              string
 	OmniImage          string
 	NsightImage        string
+	AFD                *AFDProfile
 	ModelExpress       bool
 	ModelServerPort    int32
 	DeviceResourceName string
@@ -85,11 +96,12 @@ type ModelGroupTemplate struct {
 	RDMA           *inferencev1alpha1.RDMAAllocation
 	ECRuntime      *inferencev1alpha1.ModelGroupECRuntimeConfig
 	KVRuntime      *inferencev1alpha1.ModelGroupKVRuntimeConfig
-	Resources      inferencev1alpha1.ModelResources
+	Resources      *inferencev1alpha1.ModelResources
+	AFD            *inferencev1alpha1.ModelGroupAFD
 	Timeouts       inferencev1alpha1.ModelTimeouts
 	NodeCount      int32
 	MemberCount    int32
-	Parallelism    inferencev1alpha1.CompiledParallelism
+	Parallelism    *inferencev1alpha1.CompiledParallelism
 	MaxInputTokens *int32
 	Features       inferencev1alpha1.ModelFeatures
 	Accelerator    inferencev1alpha1.ModelGroupAccelerator
@@ -124,7 +136,10 @@ func ResolveModelPool(template inferencev1alpha1.NormalizedPoolTemplate, profile
 	if template.Role != inferencev1alpha1.ModelRoleAggregate && template.Role != inferencev1alpha1.ModelRoleEncoder && template.Role != inferencev1alpha1.ModelRolePrefill && template.Role != inferencev1alpha1.ModelRoleDecode {
 		return ModelGroupTemplate{}, fmt.Errorf("ModelPool role %q is not supported", template.Role)
 	}
-	if template.NodeCount < 1 || template.MemberCount != template.NodeCount {
+	if template.AFD != nil {
+		return resolveAFDPool(template, profile)
+	}
+	if template.NodeCount < 1 || template.MemberCount != template.NodeCount || template.Resources == nil {
 		return ModelGroupTemplate{}, fmt.Errorf("vLLM Groups require one member per node")
 	}
 	image := profile.Image
@@ -288,6 +303,10 @@ func projectModelGroupTemplate(template inferencev1alpha1.NormalizedPoolTemplate
 	if template.Application != nil {
 		applicationURL = template.Application.ApplicationURL
 	}
+	var parallelism *inferencev1alpha1.CompiledParallelism
+	if template.AFD == nil {
+		parallelism = &runtime.Parallelism
+	}
 	return ModelGroupTemplate{
 		Role: template.Role,
 		Artifacts: inferencev1alpha1.ModelGroupArtifacts{
@@ -304,9 +323,9 @@ func projectModelGroupTemplate(template inferencev1alpha1.NormalizedPoolTemplate
 			Profiling:                             template.Profiling.DeepCopy(),
 			InternalGenerateRequestBodyLimitBytes: template.InternalGenerateRequestBodyLimitBytes,
 		},
-		Resources: *template.Resources.DeepCopy(), Timeouts: template.Timeouts,
+		Resources: template.Resources.DeepCopy(), Timeouts: template.Timeouts,
 		NodeCount: template.NodeCount, MemberCount: template.MemberCount,
-		Parallelism: runtime.Parallelism, MaxInputTokens: copyInt32(template.MaxInputTokens),
+		Parallelism: parallelism, MaxInputTokens: copyInt32(template.MaxInputTokens),
 		Features: *template.Features.DeepCopy(),
 		Accelerator: inferencev1alpha1.ModelGroupAccelerator{
 			DeviceResourceName: profile.DeviceResourceName,
@@ -341,7 +360,7 @@ func resolveKVRuntime(template inferencev1alpha1.NormalizedPoolTemplate, profile
 		if binding.Name == "" || binding.UID == "" || binding.BindingRevision == "" || binding.ConfigMapName == "" || binding.ConfigMapKey == "" || binding.RequesterBufferBytes < 1 {
 			return nil, fmt.Errorf("managed Mooncake Store binding is incomplete")
 		}
-		if err := resourcevalidation.ValidateRequesterBufferBudget(template.Resources, binding.RequesterBufferBytes); err != nil {
+		if err := resourcevalidation.ValidateRequesterBufferBudget(*template.Resources, binding.RequesterBufferBytes); err != nil {
 			return nil, fmt.Errorf("managed Mooncake Store requester buffer: %w", err)
 		}
 		return &inferencev1alpha1.ModelGroupKVRuntimeConfig{MooncakeStore: &inferencev1alpha1.ModelGroupMooncakeStoreRuntime{ProfileName: "kvservice:" + binding.Name, KVServiceUID: binding.UID, ProfileRevision: binding.BindingRevision, ConfigMapName: binding.ConfigMapName, ConfigMapKey: binding.ConfigMapKey, PythonHashSeed: "0", RequesterBufferBytes: binding.RequesterBufferBytes}}, nil
@@ -434,6 +453,7 @@ func (template ModelGroupTemplate) Spec(pool *inferencev1alpha1.ModelPool, ordin
 		ECRuntime:      ecRuntime,
 		KVRuntime:      template.KVRuntime,
 		Resources:      template.Resources,
+		AFD:            template.AFD,
 		Timeouts:       template.Timeouts,
 		NodeCount:      template.NodeCount,
 		MemberCount:    template.MemberCount,
@@ -451,4 +471,57 @@ func copyInt32(value *int32) *int32 {
 	}
 	copied := *value
 	return &copied
+}
+
+// resolveAFDPool selects the platform CUDA environment and stores static transport state.
+// Member identity and rendezvous addresses are supplied later by Group materialization.
+func resolveAFDPool(template inferencev1alpha1.NormalizedPoolTemplate, profile RuntimeProfile) (ModelGroupTemplate, error) {
+	if profile.AFD == nil || profile.AFD.Port < 1 || profile.AFD.Port > 65535 {
+		return ModelGroupTemplate{}, fmt.Errorf("CUDA AFD runtime profile requires a connector port")
+	}
+	if profile.DeviceResourceName != "nvidia.com/gpu" {
+		return ModelGroupTemplate{}, fmt.Errorf("CUDA AFD requires nvidia.com/gpu devices")
+	}
+	if err := validateRuntimeProfile(profile, 65535); err != nil {
+		return ModelGroupTemplate{}, err
+	}
+	if profile.AFD.Port == profile.ModelServerPort {
+		return ModelGroupTemplate{}, fmt.Errorf("AFD connector port conflicts with the model-server port")
+	}
+	if template.RuntimeCache != nil && profile.AFD.Port == runtimeconfig.CacheObservationPort(profile.ModelServerPort) {
+		return ModelGroupTemplate{}, fmt.Errorf("AFD connector port conflicts with the runtime cache observation port")
+	}
+	effective, err := vllmconfig.Compile(template)
+	if err != nil {
+		return ModelGroupTemplate{}, err
+	}
+	if effective.Revision == "" {
+		return ModelGroupTemplate{}, fmt.Errorf("vLLM --revision is required before ModelGroup creation")
+	}
+	selector, err := mergeNodeSelectors(template.NodeSelector, profile)
+	if err != nil {
+		return ModelGroupTemplate{}, err
+	}
+	image := profile.AFD.Image
+	if template.Application != nil {
+		if template.Application.ImageProfile != AFDImageProfile {
+			return ModelGroupTemplate{}, fmt.Errorf("AFD application selection requires the CUDA AFD image profile")
+		}
+		image = template.Application.Image
+	}
+	if image == "" {
+		return ModelGroupTemplate{}, fmt.Errorf("CUDA AFD runtime image is not configured")
+	}
+	group := projectModelGroupTemplate(template, profile, selector, resolvedModelRuntime{
+		Image: image, Model: effective.Model, Source: effective.Source, Revision: effective.Revision,
+		Tokenizer: effective.Tokenizer, TokenizerRevision: effective.TokenizerRevision,
+		EngineArgs: effective.EngineArgs,
+	})
+	group.Runtime.PreparationVersion = 1
+	group.AFD = &inferencev1alpha1.ModelGroupAFD{
+		AFDTopology: *template.AFD.DeepCopy(),
+		Connector:   vllmconfig.AFDConnector,
+		Port:        profile.AFD.Port,
+	}
+	return group, nil
 }

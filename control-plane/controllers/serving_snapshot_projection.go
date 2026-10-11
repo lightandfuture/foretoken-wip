@@ -834,6 +834,9 @@ func routingControllerOwnerMatches(object metav1.Object, apiVersion, kind, name 
 }
 
 func routingGroupReady(group *inferencev1alpha1.ModelGroup) bool {
+	if group.Spec.AFD != nil {
+		return false
+	}
 	if !group.DeletionTimestamp.IsZero() {
 		return false
 	}

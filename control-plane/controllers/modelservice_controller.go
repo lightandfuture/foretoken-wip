@@ -361,7 +361,14 @@ func (reconciler *ModelServiceReconciler) selectPoolApplication(ctx context.Cont
 	deployment := service.Spec.DeploymentRevision
 	image := reconciler.RuntimeProfile.Image
 	imageProfile := template.Backend
-	if template.Backend == "vllm-omni" {
+	if template.AFD != nil {
+		imageProfile = resolver.AFDImageProfile
+		if reconciler.RuntimeProfile.AFD != nil {
+			image = reconciler.RuntimeProfile.AFD.Image
+		} else {
+			image = ""
+		}
+	} else if template.Backend == "vllm-omni" {
 		image = reconciler.RuntimeProfile.OmniImage
 	} else if template.Profiling != nil && template.Profiling.Engine == "nsight" {
 		image = reconciler.RuntimeProfile.NsightImage
@@ -384,7 +391,8 @@ func (reconciler *ModelServiceReconciler) selectPoolApplication(ctx context.Cont
 			return nil, err
 		}
 		for index := range pools {
-			if pools[index].Spec.Template.SourceRevision == template.SourceRevision && pools[index].Spec.Template.Backend == template.Backend {
+			candidate := pools[index].Spec.Template
+			if candidate.SourceRevision == template.SourceRevision && candidate.Backend == template.Backend && (candidate.AFD != nil) == (template.AFD != nil) {
 				previous = &pools[index]
 				break
 			}
@@ -393,7 +401,9 @@ func (reconciler *ModelServiceReconciler) selectPoolApplication(ctx context.Cont
 	selection := &inferencev1alpha1.ApplicationSelection{Image: image, ImageProfile: imageProfile, SourceRevision: template.SourceRevision, DeploymentRevision: deployment}
 	if previous != nil && previous.Spec.Template.Backend == template.Backend && previous.Spec.Template.SourceRevision == template.SourceRevision {
 		previousProfile := previous.Spec.Template.Backend
-		if previous.Spec.Template.Profiling != nil && previous.Spec.Template.Profiling.Engine == "nsight" {
+		if previous.Spec.Template.AFD != nil {
+			previousProfile = resolver.AFDImageProfile
+		} else if previous.Spec.Template.Profiling != nil && previous.Spec.Template.Profiling.Engine == "nsight" {
 			previousProfile = "nsight"
 		}
 		if selected := previous.Spec.Template.Application; selected != nil && selected.DeploymentRevision == deployment && previousProfile == imageProfile {
@@ -428,6 +438,9 @@ func (reconciler *ModelServiceReconciler) selectPoolApplication(ctx context.Cont
 		if template.SourceRevision != "" {
 			selection.ApplicationURL = reconciler.ApplicationFiles.Ref("model-server", template.SourceRevision)
 		}
+	}
+	if template.AFD != nil && selection.Image == "" {
+		return nil, fmt.Errorf("CUDA AFD runtime image is not configured; set --afd-inference-engine-image")
 	}
 	return selection, nil
 }
@@ -715,7 +728,10 @@ func (reconciler *ModelServiceReconciler) resolveManagedKVBindings(ctx context.C
 		if err != nil {
 			return fmt.Errorf("KVService %q requester buffer: %w", kv.Name, err)
 		}
-		if err := resourcevalidation.ValidateRequesterBufferBudget(pools[i].Template.Resources, bufferBytes); err != nil {
+		if pools[i].Template.Resources == nil {
+			return fmt.Errorf("managed Mooncake Store requires ordinary Pool resources")
+		}
+		if err := resourcevalidation.ValidateRequesterBufferBudget(*pools[i].Template.Resources, bufferBytes); err != nil {
 			return fmt.Errorf("modelPool %q requester buffer budget: %w", pools[i].Name, err)
 		}
 		pools[i].Template.KVCache.MooncakeStore = &inferencev1alpha1.NormalizedMooncakeStore{ManagedBinding: &inferencev1alpha1.ManagedMooncakeStoreBinding{Name: kv.Name, UID: string(kv.UID), BindingRevision: kv.Status.Binding.Revision, ConfigMapName: kv.Status.Binding.ConfigMapName, ConfigMapKey: kv.Status.Binding.ConfigMapKey, RequesterBufferBytes: bufferBytes}}

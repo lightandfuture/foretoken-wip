@@ -90,6 +90,257 @@ spec:
                 required:
                 - deviceResourceName
                 type: object
+              afd:
+                description: ModelGroupAFD pins static transport settings; UID and
+                  endpoints belong to materialization.
+                properties:
+                  attention:
+                    description: AFDMemberSpec fixes resource and rank ownership for
+                      all members of one role.
+                    properties:
+                      memberCount:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      parallelism:
+                        description: AFDParallelism is the authoritative role-local
+                          rank layout, independent of replicas.
+                        properties:
+                          dp:
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          tp:
+                            format: int32
+                            minimum: 1
+                            type: integer
+                        required:
+                        - dp
+                        - tp
+                        type: object
+                      resources:
+                        description: ModelResources defines resources for one runtime
+                          member Pod.
+                        properties:
+                          limits:
+                            description: ComputeResourceLimits defines optional CPU
+                              and memory limits for one Pod.
+                            properties:
+                              cpu:
+                                description: CPU is the maximum Kubernetes CPU quantity.
+                                maxLength: 64
+                                minLength: 1
+                                type: string
+                                x-kubernetes-validations:
+                                - message: must be a valid non-negative Kubernetes
+                                    resource quantity
+                                  rule: isQuantity(self) && quantity(self).compareTo(quantity('0'))
+                                    >= 0
+                              memory:
+                                description: Memory is the maximum Kubernetes memory
+                                  quantity.
+                                maxLength: 64
+                                minLength: 1
+                                type: string
+                                x-kubernetes-validations:
+                                - message: must be a valid non-negative Kubernetes
+                                    resource quantity
+                                  rule: isQuantity(self) && quantity(self).compareTo(quantity('0'))
+                                    >= 0
+                            type: object
+                          requests:
+                            description: ModelResourceRequests defines resources requested
+                              by one runtime member Pod.
+                            properties:
+                              cpu:
+                                description: CPU is the requested Kubernetes CPU quantity.
+                                maxLength: 64
+                                minLength: 1
+                                type: string
+                                x-kubernetes-validations:
+                                - message: must be a valid non-negative Kubernetes
+                                    resource quantity
+                                  rule: isQuantity(self) && quantity(self).compareTo(quantity('0'))
+                                    >= 0
+                              gpu:
+                                description: GPURequest defines the accelerator request
+                                  for one runtime member Pod.
+                                properties:
+                                  count:
+                                    default: 1
+                                    description: Count is the number of accelerator
+                                      devices requested by one runtime member Pod.
+                                    format: int32
+                                    minimum: 1
+                                    type: integer
+                                type: object
+                              memory:
+                                description: Memory is the requested Kubernetes memory
+                                  quantity.
+                                maxLength: 64
+                                minLength: 1
+                                type: string
+                                x-kubernetes-validations:
+                                - message: must be a valid non-negative Kubernetes
+                                    resource quantity
+                                  rule: isQuantity(self) && quantity(self).compareTo(quantity('0'))
+                                    >= 0
+                            required:
+                            - cpu
+                            - gpu
+                            - memory
+                            type: object
+                        required:
+                        - requests
+                        type: object
+                        x-kubernetes-validations:
+                        - message: resources.requests.cpu must not exceed resources.limits.cpu
+                          rule: '!has(self.limits) || !has(self.limits.cpu) || quantity(self.requests.cpu).compareTo(quantity(self.limits.cpu))
+                            <= 0'
+                        - message: resources.requests.memory must not exceed resources.limits.memory
+                          rule: '!has(self.limits) || !has(self.limits.memory) ||
+                            quantity(self.requests.memory).compareTo(quantity(self.limits.memory))
+                            <= 0'
+                    required:
+                    - memberCount
+                    - parallelism
+                    - resources
+                    type: object
+                    x-kubernetes-validations:
+                    - message: role accelerator capacity must equal DP times TP
+                      rule: self.memberCount * self.resources.requests.gpu.count ==
+                        self.parallelism.dp * self.parallelism.tp
+                  connector:
+                    enum:
+                    - P2pNcclAFDConnector
+                    type: string
+                  ffn:
+                    description: AFDMemberSpec fixes resource and rank ownership for
+                      all members of one role.
+                    properties:
+                      memberCount:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      parallelism:
+                        description: AFDParallelism is the authoritative role-local
+                          rank layout, independent of replicas.
+                        properties:
+                          dp:
+                            format: int32
+                            minimum: 1
+                            type: integer
+                          tp:
+                            format: int32
+                            minimum: 1
+                            type: integer
+                        required:
+                        - dp
+                        - tp
+                        type: object
+                      resources:
+                        description: ModelResources defines resources for one runtime
+                          member Pod.
+                        properties:
+                          limits:
+                            description: ComputeResourceLimits defines optional CPU
+                              and memory limits for one Pod.
+                            properties:
+                              cpu:
+                                description: CPU is the maximum Kubernetes CPU quantity.
+                                maxLength: 64
+                                minLength: 1
+                                type: string
+                                x-kubernetes-validations:
+                                - message: must be a valid non-negative Kubernetes
+                                    resource quantity
+                                  rule: isQuantity(self) && quantity(self).compareTo(quantity('0'))
+                                    >= 0
+                              memory:
+                                description: Memory is the maximum Kubernetes memory
+                                  quantity.
+                                maxLength: 64
+                                minLength: 1
+                                type: string
+                                x-kubernetes-validations:
+                                - message: must be a valid non-negative Kubernetes
+                                    resource quantity
+                                  rule: isQuantity(self) && quantity(self).compareTo(quantity('0'))
+                                    >= 0
+                            type: object
+                          requests:
+                            description: ModelResourceRequests defines resources requested
+                              by one runtime member Pod.
+                            properties:
+                              cpu:
+                                description: CPU is the requested Kubernetes CPU quantity.
+                                maxLength: 64
+                                minLength: 1
+                                type: string
+                                x-kubernetes-validations:
+                                - message: must be a valid non-negative Kubernetes
+                                    resource quantity
+                                  rule: isQuantity(self) && quantity(self).compareTo(quantity('0'))
+                                    >= 0
+                              gpu:
+                                description: GPURequest defines the accelerator request
+                                  for one runtime member Pod.
+                                properties:
+                                  count:
+                                    default: 1
+                                    description: Count is the number of accelerator
+                                      devices requested by one runtime member Pod.
+                                    format: int32
+                                    minimum: 1
+                                    type: integer
+                                type: object
+                              memory:
+                                description: Memory is the requested Kubernetes memory
+                                  quantity.
+                                maxLength: 64
+                                minLength: 1
+                                type: string
+                                x-kubernetes-validations:
+                                - message: must be a valid non-negative Kubernetes
+                                    resource quantity
+                                  rule: isQuantity(self) && quantity(self).compareTo(quantity('0'))
+                                    >= 0
+                            required:
+                            - cpu
+                            - gpu
+                            - memory
+                            type: object
+                        required:
+                        - requests
+                        type: object
+                        x-kubernetes-validations:
+                        - message: resources.requests.cpu must not exceed resources.limits.cpu
+                          rule: '!has(self.limits) || !has(self.limits.cpu) || quantity(self.requests.cpu).compareTo(quantity(self.limits.cpu))
+                            <= 0'
+                        - message: resources.requests.memory must not exceed resources.limits.memory
+                          rule: '!has(self.limits) || !has(self.limits.memory) ||
+                            quantity(self.requests.memory).compareTo(quantity(self.limits.memory))
+                            <= 0'
+                    required:
+                    - memberCount
+                    - parallelism
+                    - resources
+                    type: object
+                    x-kubernetes-validations:
+                    - message: role accelerator capacity must equal DP times TP
+                      rule: self.memberCount * self.resources.requests.gpu.count ==
+                        self.parallelism.dp * self.parallelism.tp
+                  port:
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                required:
+                - attention
+                - connector
+                - ffn
+                - port
+                type: object
               artifacts:
                 description: ModelGroupArtifacts identifies immutable model and tokenizer
                   inputs.
@@ -684,10 +935,7 @@ spec:
             - features
             - memberCount
             - modelPoolRef
-            - nodeCount
             - ordinal
-            - parallelism
-            - resources
             - revision
             - role
             - runtime
@@ -696,11 +944,18 @@ spec:
             x-kubernetes-validations:
             - message: ModelGroup spec is immutable
               rule: self == oldSelf
-            - message: memberCount must equal nodeCount in v1alpha1
-              rule: self.memberCount == self.nodeCount
+            - message: ordinary and AFD resource layouts are mutually exclusive; member
+                counts must match topology
+              rule: 'has(self.afd) ? !has(self.nodeCount) && !has(self.resources)
+                && self.role == ''aggregate'' && self.memberCount == self.afd.attention.memberCount
+                + self.afd.ffn.memberCount : has(self.nodeCount) && has(self.resources)
+                && self.memberCount == self.nodeCount'
             - message: accelerator capacity must equal the compiled worker rank count
-              rule: self.nodeCount * self.resources.requests.gpu.count == self.parallelism.pp
-                * self.parallelism.tp * self.parallelism.pcp * self.parallelism.dp
+              rule: 'has(self.afd) ? !has(self.parallelism) && !has(self.kvRuntime)
+                && self.runtime.backend == ''vllm'' : has(self.parallelism) && has(self.nodeCount)
+                && has(self.resources) && self.nodeCount * self.resources.requests.gpu.count
+                == self.parallelism.pp * self.parallelism.tp * self.parallelism.pcp
+                * self.parallelism.dp'
             - message: aggregate, encoder, prefill, and decode ModelGroups require
                 their fixed runtime configurations
               rule: 'self.role == ''aggregate'' ? !has(self.pdRuntime) && !has(self.ecRuntime)

@@ -234,8 +234,8 @@ type ModelGroupRuntime struct {
 
 // ModelGroupSpec is an immutable execution specification compiled by the Pool controller.
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="ModelGroup spec is immutable"
-// +kubebuilder:validation:XValidation:rule="self.memberCount == self.nodeCount",message="memberCount must equal nodeCount in v1alpha1"
-// +kubebuilder:validation:XValidation:rule="self.nodeCount * self.resources.requests.gpu.count == self.parallelism.pp * self.parallelism.tp * self.parallelism.pcp * self.parallelism.dp",message="accelerator capacity must equal the compiled worker rank count"
+// +kubebuilder:validation:XValidation:rule="has(self.afd) ? !has(self.nodeCount) && !has(self.resources) && self.role == 'aggregate' && self.memberCount == self.afd.attention.memberCount + self.afd.ffn.memberCount : has(self.nodeCount) && has(self.resources) && self.memberCount == self.nodeCount",message="ordinary and AFD resource layouts are mutually exclusive; member counts must match topology"
+// +kubebuilder:validation:XValidation:rule="has(self.afd) ? !has(self.parallelism) && !has(self.kvRuntime) && self.runtime.backend == 'vllm' : has(self.parallelism) && has(self.nodeCount) && has(self.resources) && self.nodeCount * self.resources.requests.gpu.count == self.parallelism.pp * self.parallelism.tp * self.parallelism.pcp * self.parallelism.dp",message="accelerator capacity must equal the compiled worker rank count"
 // +kubebuilder:validation:XValidation:rule="self.role == 'aggregate' ? !has(self.pdRuntime) && !has(self.ecRuntime) : self.role == 'encoder' ? !has(self.pdRuntime) && has(self.ecRuntime) && self.ecRuntime.role == 'producer' : self.role == 'prefill' ? has(self.pdRuntime) && (!has(self.ecRuntime) || self.ecRuntime.role == 'consumer') : self.role == 'decode' ? has(self.pdRuntime) && !has(self.ecRuntime) : false",message="aggregate, encoder, prefill, and decode ModelGroups require their fixed runtime configurations"
 type ModelGroupSpec struct {
 	ModelPoolRef LocalObjectReference `json:"modelPoolRef"`
@@ -271,18 +271,25 @@ type ModelGroupSpec struct {
 	// +optional
 	KVRuntime *ModelGroupKVRuntimeConfig `json:"kvRuntime,omitempty"`
 
-	Resources ModelResources `json:"resources"`
-	Timeouts  ModelTimeouts  `json:"timeouts"`
+	// +optional
+	Resources *ModelResources `json:"resources,omitempty"`
+
+	// +optional
+	AFD *ModelGroupAFD `json:"afd,omitempty"`
+
+	Timeouts ModelTimeouts `json:"timeouts"`
 
 	// NodeCount is the number of distinct Kubernetes Nodes used by this Group.
+	// +optional
 	// +kubebuilder:validation:Minimum=1
-	NodeCount int32 `json:"nodeCount"`
+	NodeCount int32 `json:"nodeCount,omitempty"`
 
 	// MemberCount is the number of runtime member Pods in this Group.
 	// +kubebuilder:validation:Minimum=1
 	MemberCount int32 `json:"memberCount"`
 
-	Parallelism CompiledParallelism `json:"parallelism"`
+	// +optional
+	Parallelism *CompiledParallelism `json:"parallelism,omitempty"`
 
 	// MaxInputTokens is the prompt admission limit advertised to routing clients.
 	// +optional

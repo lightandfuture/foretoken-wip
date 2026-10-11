@@ -64,7 +64,7 @@ func kvScopeID(group *inferencev1alpha1.ModelGroup) string {
 	payload := struct {
 		Model, Revision, Tokenizer, TokenizerRevision string
 		Source                                        inferencev1alpha1.ModelSource
-		Parallelism                                   inferencev1alpha1.CompiledParallelism
+		Parallelism                                   *inferencev1alpha1.CompiledParallelism
 		EngineArgs                                    inferencev1alpha1.EngineArguments
 		KVRuntime                                     *inferencev1alpha1.ModelGroupKVRuntimeConfig
 	}{

@@ -31,11 +31,12 @@ type EffectiveConfig struct {
 	EngineArgs        inferencev1alpha1.EngineArguments
 }
 
-// LaunchPlanV1 is the versioned, private Go-to-Rust launch contract. Rust is
+// LaunchPlan is the versioned, private Go-to-Rust launch contract. Rust is
 // the only component that renders this contract into vLLM command-line flags.
-type LaunchPlanV1 struct {
+type LaunchPlan struct {
 	Version                               int                                `json:"version"`
-	NodeCount                             int32                              `json:"nodeCount"`
+	NodeCount                             int32                              `json:"nodeCount,omitempty"`
+	AFD                                   *LaunchAFDPlan                     `json:"afd,omitempty"`
 	Artifacts                             LaunchArtifacts                    `json:"artifacts"`
 	Parallelism                           LaunchParallelism                  `json:"parallelism"`
 	KV                                    LaunchKVPlan                       `json:"kv"`
@@ -123,6 +124,16 @@ func Compile(template inferencev1alpha1.NormalizedPoolTemplate) (EffectiveConfig
 	if err != nil {
 		return EffectiveConfig{}, err
 	}
+	if template.AFD != nil {
+		if err := validateAFD(template, args); err != nil {
+			return EffectiveConfig{}, err
+		}
+		effective.EngineArgs = args
+		return effective, nil
+	}
+	if template.Resources == nil {
+		return EffectiveConfig{}, fmt.Errorf("ordinary vLLM Pool resources are required")
+	}
 	effective.Parallelism, err = extractParallelism(args)
 	if err != nil {
 		return EffectiveConfig{}, err
@@ -141,51 +152,78 @@ func Compile(template inferencev1alpha1.NormalizedPoolTemplate) (EffectiveConfig
 	return effective, nil
 }
 
-// BuildLaunchPlan projects a verified ModelGroupSpec into the private launch wire contract.
-func BuildLaunchPlan(group inferencev1alpha1.ModelGroupSpec) (LaunchPlanV1, error) {
-	if group.NodeCount < 1 {
-		return LaunchPlanV1{}, fmt.Errorf("model-server launch plan requires a positive node count")
+// BuildLaunchPlan projects an ordinary Group for the controller's V1 model-server launch.
+func BuildLaunchPlan(group inferencev1alpha1.ModelGroupSpec) (LaunchPlan, error) {
+	if group.AFD != nil || group.NodeCount < 1 || group.Parallelism == nil {
+		return LaunchPlan{}, fmt.Errorf("ordinary model-server launch plan requires a positive node count and parallelism")
 	}
+	plan, err := buildLaunchPlan(group, *group.Parallelism)
+	if err != nil {
+		return LaunchPlan{}, err
+	}
+	plan.Version = 1
+	plan.NodeCount = group.NodeCount
+	return plan, nil
+}
+
+// buildLaunchPlan projects shared artifacts and lifecycle for either protocol version.
+func buildLaunchPlan(group inferencev1alpha1.ModelGroupSpec, topology inferencev1alpha1.CompiledParallelism) (LaunchPlan, error) {
 	startup, err := runtimeconfig.PositiveDurationSeconds(group.Timeouts.Startup, "vLLM startup")
 	if err != nil {
-		return LaunchPlanV1{}, err
+		return LaunchPlan{}, err
 	}
 	drain, err := runtimeconfig.PositiveDurationSeconds(group.Timeouts.Drain, "vLLM drain")
 	if err != nil {
-		return LaunchPlanV1{}, err
+		return LaunchPlan{}, err
 	}
 	if group.Artifacts.Model == "" || group.Artifacts.Source == "" || group.Artifacts.ModelRevision == "" || group.Artifacts.Tokenizer == "" || group.Artifacts.TokenizerRevision == "" {
-		return LaunchPlanV1{}, fmt.Errorf("vLLM artifacts must be nonempty")
+		return LaunchPlan{}, fmt.Errorf("vLLM artifacts must be nonempty")
 	}
-	if err := validateParallelism(group.Parallelism); err != nil {
-		return LaunchPlanV1{}, err
+	if err := validateParallelism(topology); err != nil {
+		return LaunchPlan{}, err
 	}
 	if group.Runtime.InternalGenerateRequestBodyLimitBytes < inferencev1alpha1.MinInternalGenerateRequestBodyLimitBytes || group.Runtime.InternalGenerateRequestBodyLimitBytes > inferencev1alpha1.MaxInternalGenerateRequestBodyLimitBytes {
-		return LaunchPlanV1{}, fmt.Errorf("vLLM internal generate request body limit must be between %d and %d", inferencev1alpha1.MinInternalGenerateRequestBodyLimitBytes, inferencev1alpha1.MaxInternalGenerateRequestBodyLimitBytes)
+		return LaunchPlan{}, fmt.Errorf("vLLM internal generate request body limit must be between %d and %d", inferencev1alpha1.MinInternalGenerateRequestBodyLimitBytes, inferencev1alpha1.MaxInternalGenerateRequestBodyLimitBytes)
 	}
-	parallelism := LaunchParallelism{TP: group.Parallelism.TP, PP: group.Parallelism.PP, DP: group.Parallelism.DP, PCP: group.Parallelism.PCP, DCP: group.Parallelism.DCP}
-	if group.Parallelism.EP != nil {
-		parallelism.EP = &LaunchExpertPlan{Backend: group.Parallelism.EP.Backend, EPLB: group.Parallelism.EP.EPLB}
+	parallelism := LaunchParallelism{TP: topology.TP, PP: topology.PP, DP: topology.DP, PCP: topology.PCP, DCP: topology.DCP}
+	if topology.EP != nil {
+		parallelism.EP = &LaunchExpertPlan{Backend: topology.EP.Backend, EPLB: topology.EP.EPLB}
 	}
 	kv, err := buildKVPlan(group)
 	if err != nil {
-		return LaunchPlanV1{}, err
+		return LaunchPlan{}, err
 	}
 	ec, err := buildECPlan(group)
 	if err != nil {
-		return LaunchPlanV1{}, err
+		return LaunchPlan{}, err
 	}
-	return LaunchPlanV1{Version: 1, NodeCount: group.NodeCount, Artifacts: LaunchArtifacts{Model: group.Artifacts.Model, Source: group.Artifacts.Source, Revision: group.Artifacts.ModelRevision, Tokenizer: group.Artifacts.Tokenizer, TokenizerRevision: group.Artifacts.TokenizerRevision}, Parallelism: parallelism, KV: kv, EC: ec, Lifecycle: LaunchLifecycle{StartupSeconds: startup, DrainSeconds: drain}, InternalGenerateRequestBodyLimitBytes: group.Runtime.InternalGenerateRequestBodyLimitBytes, EngineArgs: group.Runtime.EngineArgs.DeepCopy(), Profiling: group.Runtime.Profiling.DeepCopy()}, nil
+	return LaunchPlan{
+		Artifacts: LaunchArtifacts{
+			Model: group.Artifacts.Model, Source: group.Artifacts.Source,
+			Revision: group.Artifacts.ModelRevision, Tokenizer: group.Artifacts.Tokenizer,
+			TokenizerRevision: group.Artifacts.TokenizerRevision,
+		},
+		Parallelism:                           parallelism,
+		KV:                                    kv,
+		EC:                                    ec,
+		Lifecycle:                             LaunchLifecycle{StartupSeconds: startup, DrainSeconds: drain},
+		InternalGenerateRequestBodyLimitBytes: group.Runtime.InternalGenerateRequestBodyLimitBytes,
+		EngineArgs:                            group.Runtime.EngineArgs.DeepCopy(),
+		Profiling:                             group.Runtime.Profiling.DeepCopy(),
+	}, nil
 }
 
-// JSON returns deterministic output because LaunchPlanV1 uses only ordered structs and slices.
-func (plan LaunchPlanV1) JSON() (string, error) {
+// JSON serializes the plan for model-server startup with deterministic map key ordering.
+func (plan LaunchPlan) JSON() (string, error) {
 	bytes, err := json.Marshal(plan)
 	return string(bytes), err
 }
 
 // buildKVPlan projects the ModelGroup cache runtime into the closed vLLM KV launch plan.
 func buildKVPlan(group inferencev1alpha1.ModelGroupSpec) (LaunchKVPlan, error) {
+	if group.AFD != nil {
+		return LaunchKVPlan{Kind: kvNone, Events: false}, nil
+	}
 	role := "kv_both"
 	if group.Role == inferencev1alpha1.ModelRolePrefill {
 		role = "kv_producer"
@@ -299,7 +337,7 @@ func extractParallelism(args inferencev1alpha1.EngineArguments) (inferencev1alph
 // CompatibleKVTransfer reports whether controller-selected Groups can exchange Mooncake KV.
 // Worker and scheduler sizing may differ; model interpretation and cache representation may not.
 func CompatibleKVTransfer(left, right inferencev1alpha1.ModelGroupSpec) bool {
-	if left.Runtime.Backend != right.Runtime.Backend || left.Runtime.Image != right.Runtime.Image {
+	if left.AFD != nil || right.AFD != nil || left.Parallelism == nil || right.Parallelism == nil || left.Runtime.Backend != right.Runtime.Backend || left.Runtime.Image != right.Runtime.Image {
 		return false
 	}
 	leftTP, rightTP := left.Parallelism.TP, right.Parallelism.TP
@@ -390,6 +428,11 @@ func compileEngineArgs(input inferencev1alpha1.EngineArguments) (inferencev1alph
 			return nil, fmt.Errorf("engineArgs repeats option %q with different spellings", key)
 		}
 		value := input[name]
+		if strings.HasPrefix("additional-config", key) {
+			if err := validateAdditionalConfig(value.Raw, false); err != nil {
+				return nil, err
+			}
+		}
 		args[key] = *value.DeepCopy()
 	}
 

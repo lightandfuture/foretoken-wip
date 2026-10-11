@@ -116,7 +116,7 @@ type ApplicationSelection struct {
 
 // NormalizedPoolTemplate is the normalized configuration produced from ModelService intent.
 // Platform runtime and accelerator resolution may further constrain it before Groups are created.
-// +kubebuilder:validation:XValidation:rule="self.memberCount == self.nodeCount",message="memberCount must equal nodeCount in v1alpha1"
+// +kubebuilder:validation:XValidation:rule="has(self.afd) ? !has(self.nodeCount) && !has(self.resources) && self.role == 'aggregate' && self.memberCount == self.afd.attention.memberCount + self.afd.ffn.memberCount : has(self.nodeCount) && has(self.resources) && self.memberCount == self.nodeCount",message="ordinary and AFD resource layouts are mutually exclusive; member counts must match topology"
 type NormalizedPoolTemplate struct {
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=1024
@@ -160,13 +160,18 @@ type NormalizedPoolTemplate struct {
 
 	Role ModelRole `json:"role"`
 
+	// +optional
 	// +kubebuilder:validation:Minimum=1
-	NodeCount int32 `json:"nodeCount"`
+	NodeCount int32 `json:"nodeCount,omitempty"`
 
 	// +kubebuilder:validation:Minimum=1
 	MemberCount int32 `json:"memberCount"`
 
-	Resources ModelResources `json:"resources"`
+	// +optional
+	Resources *ModelResources `json:"resources,omitempty"`
+
+	// +optional
+	AFD *AFDTopology `json:"afd,omitempty"`
 
 	// NodeSelector is the normalized Kubernetes placement constraint for this Pool.
 	// +optional
