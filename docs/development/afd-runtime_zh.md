@@ -61,10 +61,11 @@ docker run --rm --entrypoint sh "$AFD_IMAGE" -c \
 准备两张 A100 80GB、兼容 CUDA 13.0 的 NVIDIA 驱动、NVIDIA Container
 Toolkit 和已构建镜像。从官方 `deepseek-ai/DeepSeek-V2-Lite` 仓库选定
 一个完整 commit，模型和 tokenizer 均使用它并记录。镜像本身不确定模型
-revision。将 `MODEL_CACHE` 设为服务器现有缓存目录，在每个验证容器中
-传入缓存与 `MODEL_REVISION`。在两个宿主机终端导出：
+revision。将 `MODEL_CACHE` 设为服务器现有缓存目录，`AFD_IMAGE` 设为
+上文构建时使用的完整镜像引用。在两个宿主机终端分别导出这三个值：
 
 ```bash
+export AFD_IMAGE='<built image reference>'
 export MODEL_REVISION='<full DeepSeek-V2-Lite commit>'
 export MODEL_CACHE='<existing absolute model-cache directory>'
 ```

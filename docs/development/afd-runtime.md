@@ -66,9 +66,11 @@ Use two A100 80GB GPUs, a CUDA 13.0-compatible NVIDIA driver, NVIDIA Container
 Toolkit, and the built image. Record one full commit from the official
 `deepseek-ai/DeepSeek-V2-Lite` repository for both model and tokenizer. No
 model revision is established by this image. Set `MODEL_CACHE` to an existing
-server cache directory. Export both values in the two host terminals:
+server cache directory and `AFD_IMAGE` to the exact image reference used in
+the build above. Export all three values in both host terminals:
 
 ```bash
+export AFD_IMAGE='<built image reference>'
 export MODEL_REVISION='<full DeepSeek-V2-Lite commit>'
 export MODEL_CACHE='<existing absolute model-cache directory>'
 ```
