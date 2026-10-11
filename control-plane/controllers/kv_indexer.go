@@ -61,6 +61,7 @@ func ensureKVIndexerSecret(ctx context.Context, c client.Client, namespace strin
 // kvScopeID is intentionally independent of a Group UID, endpoint, and role so
 // compatible aggregate and P/D components calculate exactly the same namespace.
 func kvScopeID(group *inferencev1alpha1.ModelGroup) string {
+	parallelism := servingParallelism(group)
 	payload := struct {
 		Model, Revision, Tokenizer, TokenizerRevision string
 		Source                                        inferencev1alpha1.ModelSource
@@ -73,7 +74,7 @@ func kvScopeID(group *inferencev1alpha1.ModelGroup) string {
 		Tokenizer:         group.Spec.Artifacts.Tokenizer,
 		TokenizerRevision: group.Spec.Artifacts.TokenizerRevision,
 		Source:            group.Spec.Artifacts.Source,
-		Parallelism:       group.Spec.Parallelism,
+		Parallelism:       &parallelism,
 		EngineArgs:        group.Spec.Runtime.EngineArgs,
 		KVRuntime:         group.Spec.KVRuntime,
 	}

@@ -105,13 +105,25 @@ func (reconciler *ModelGroupReconciler) modelGroupsForPod(_ context.Context, obj
 }
 
 // Reconcile materializes the workload and derives readiness from the model server.
-func (reconciler *ModelGroupReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
+func (reconciler *ModelGroupReconciler) Reconcile(ctx context.Context, request ctrl.Request) (result ctrl.Result, reconcileErr error) {
 	group := new(inferencev1alpha1.ModelGroup)
 	if err := reconciler.Get(ctx, request.NamespacedName, group); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 	if !group.DeletionTimestamp.IsZero() {
 		return reconciler.reconcileDelete(ctx, group)
+	}
+	if group.Spec.AFD != nil {
+		// Ancillary API/preparation failures must also revoke an existing serving entry.
+		// Ordinary Aggregate/P/D reconciliation retains its existing behavior.
+		defer func() {
+			if !group.DeletionTimestamp.IsZero() {
+				return
+			}
+			if reconcileErr != nil || !routingGroupReady(group) {
+				reconcileErr = reconciler.withdrawAFDServing(ctx, group, reconcileErr)
+			}
+		}()
 	}
 	pool, err := reconciler.owningModelPool(ctx, group)
 	if err != nil {
@@ -155,7 +167,7 @@ func (reconciler *ModelGroupReconciler) Reconcile(ctx context.Context, request c
 	}
 
 	if group.Spec.AFD != nil {
-		return reconciler.reconcileAFD(ctx, group)
+		return reconciler.reconcileAFD(ctx, group, pool)
 	}
 
 	available, err := reconciler.reconcileWorkload(ctx, group)
@@ -653,7 +665,9 @@ func modelGroupServiceName(group *inferencev1alpha1.ModelGroup) string {
 func (reconciler *ModelGroupReconciler) reconcileService(ctx context.Context, group *inferencev1alpha1.ModelGroup, pool *inferencev1alpha1.ModelPool) error {
 	labels := modelGroupLabels(group)
 	selector := maps.Clone(labels)
-	if group.Spec.NodeCount > 1 {
+	if group.Spec.AFD != nil {
+		selector[afdExecutionRoleLabel], selector[afdMemberIndexLabel] = string(inferencev1alpha1.AFDAttention), "0"
+	} else if group.Spec.NodeCount > 1 {
 		selector[lwsv1.WorkerIndexLabelKey] = "0"
 	}
 	// Scrape identity belongs on the Service, independently of workload selectors.
@@ -957,7 +971,11 @@ func (reconciler *ModelGroupReconciler) updateStatus(ctx context.Context, group 
 		availability = *state.unavailable
 	}
 	meta.SetStatusCondition(&group.Status.Conditions, metav1.Condition{Type: conditionWorkloadAvailable, Status: availability.status, Reason: availability.reason, Message: availability.message, ObservedGeneration: group.Generation})
-	meta.SetStatusCondition(&group.Status.Conditions, metav1.Condition{Type: conditionReady, Status: conditionStatus(state.available), Reason: availabilityReason(state.available), Message: readinessMessage(state.available), ObservedGeneration: group.Generation})
+	ready := modelGroupConditionState{status: conditionStatus(state.available), reason: availabilityReason(state.available), message: readinessMessage(state.available)}
+	if group.Spec.AFD != nil {
+		ready = availability
+	}
+	meta.SetStatusCondition(&group.Status.Conditions, metav1.Condition{Type: conditionReady, Status: ready.status, Reason: ready.reason, Message: ready.message, ObservedGeneration: group.Generation})
 	if reflect.DeepEqual(base.Status, group.Status) {
 		return nil
 	}

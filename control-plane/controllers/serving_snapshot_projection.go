@@ -757,14 +757,18 @@ func matchingECRuntime(left, right *inferencev1alpha1.ModelGroupECRuntimeConfig)
 	return left.ServiceUID == right.ServiceUID && left.Generation == right.Generation && left.ProfileName == right.ProfileName && left.ProfileRevision == right.ProfileRevision && left.Connector == right.Connector && left.SharedStorageClaim == right.SharedStorageClaim && left.SharedStoragePath == right.SharedStoragePath
 }
 
+// servingParallelism projects only the generation side; FFN contributes no routing or KV ranks.
+func servingParallelism(group *inferencev1alpha1.ModelGroup) inferencev1alpha1.CompiledParallelism {
+	if group.Spec.AFD != nil {
+		return vllmconfig.AFDMemberParallelism(group.Spec.AFD.Attention)
+	}
+	return *group.Spec.Parallelism
+}
+
 func routingParallelism(group *inferencev1alpha1.ModelGroup) servingSnapshotParallelism {
+	p := servingParallelism(group)
 	return servingSnapshotParallelism{
-		TP:  group.Spec.Parallelism.TP,
-		PP:  group.Spec.Parallelism.PP,
-		DP:  group.Spec.Parallelism.DP,
-		PCP: group.Spec.Parallelism.PCP,
-		DCP: group.Spec.Parallelism.DCP,
-		EP:  group.Spec.Parallelism.EP != nil,
+		TP: p.TP, PP: p.PP, DP: p.DP, PCP: p.PCP, DCP: p.DCP, EP: p.EP != nil,
 	}
 }
 
@@ -789,7 +793,7 @@ func routingEPDComponent(service *inferencev1alpha1.ModelService, group *inferen
 		Endpoint:          modelGroupEndpoint(group, group.Spec.Runtime.Port),
 		KVScopeID:         kvScopeID(group),
 		KVLookupScope:     sharedKVLookupScope(group),
-		DataParallelSize:  group.Spec.Parallelism.DP,
+		DataParallelSize:  servingParallelism(group).DP,
 		Parallelism:       routingParallelism(group),
 	}
 	if group.Spec.Role == inferencev1alpha1.ModelRolePrefill {
@@ -834,9 +838,6 @@ func routingControllerOwnerMatches(object metav1.Object, apiVersion, kind, name 
 }
 
 func routingGroupReady(group *inferencev1alpha1.ModelGroup) bool {
-	if group.Spec.AFD != nil {
-		return false
-	}
 	if !group.DeletionTimestamp.IsZero() {
 		return false
 	}
@@ -874,7 +875,7 @@ func routingGroup(group *inferencev1alpha1.ModelGroup) servingSnapshotGroup {
 		Endpoint:          modelGroupEndpoint(group, group.Spec.Runtime.Port),
 		KVScopeID:         kvScopeID(group),
 		KVLookupScope:     sharedKVLookupScope(group),
-		DataParallelSize:  group.Spec.Parallelism.DP,
+		DataParallelSize:  servingParallelism(group).DP,
 	}
 }
 func routingGroupForService(service *inferencev1alpha1.ModelService, pool *inferencev1alpha1.ModelPool, group *inferencev1alpha1.ModelGroup) servingSnapshotGroup {
@@ -959,7 +960,7 @@ func routingPDComponent(service *inferencev1alpha1.ModelService, group *inferenc
 		Endpoint:          modelGroupEndpoint(group, group.Spec.Runtime.Port),
 		KVScopeID:         kvScopeID(group),
 		KVLookupScope:     sharedKVLookupScope(group),
-		DataParallelSize:  group.Spec.Parallelism.DP,
+		DataParallelSize:  servingParallelism(group).DP,
 		Parallelism:       routingParallelism(group),
 	}
 	if group.Spec.Role == inferencev1alpha1.ModelRolePrefill {

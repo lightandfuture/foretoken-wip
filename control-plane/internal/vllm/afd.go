@@ -150,12 +150,7 @@ func BuildAFDLaunchPlan(group inferencev1alpha1.ModelGroupSpec, member AFDMember
 	if member.Index < 0 || member.Index >= side.MemberCount {
 		return LaunchPlan{}, fmt.Errorf("AFD member index is outside its role")
 	}
-	p := side.Parallelism
-	topology := inferencev1alpha1.CompiledParallelism{
-		TP: p.TP, DP: p.DP, PP: 1, PCP: 1, DCP: 1,
-		EP: &inferencev1alpha1.ExpertParallelism{Size: p.DP * p.TP},
-	}
-	plan, err := buildLaunchPlan(group, topology)
+	plan, err := buildLaunchPlan(group, AFDMemberParallelism(side))
 	if err != nil {
 		return LaunchPlan{}, err
 	}
@@ -167,4 +162,14 @@ func BuildAFDLaunchPlan(group inferencev1alpha1.ModelGroupSpec, member AFDMember
 		NumFFNRanks:       afd.FFN.Parallelism.DP * afd.FFN.Parallelism.TP,
 	}
 	return plan, nil
+}
+
+// AFDMemberParallelism gives launch and serving consumers the same role-local layout.
+// The pinned adapter owns the fixed context/pipeline dimensions and required expert parallelism.
+func AFDMemberParallelism(side inferencev1alpha1.AFDMemberSpec) inferencev1alpha1.CompiledParallelism {
+	p := side.Parallelism
+	return inferencev1alpha1.CompiledParallelism{
+		TP: p.TP, DP: p.DP, PP: 1, PCP: 1, DCP: 1,
+		EP: &inferencev1alpha1.ExpertParallelism{Size: p.DP * p.TP},
+	}
 }

@@ -8,7 +8,7 @@ English | [简体中文](afd-managed-runtime_zh.md)
 The model-server consumes private V2 plans for a local, synchronous CUDA 1A1F
 pair. This is a runtime implementation, pending owner-executed OCI and A100
 acceptance; [Group materialization](afd-group-workload.md) adds fixed Pods and discovery,
-while serving publication and whole-Group recovery remain outstanding.
+and complete-pair serving publication. Whole-Group recovery remains outstanding.
 Build the [fixed candidate image](afd-runtime.md) from the runtime source commit.
 
 ## Plan and process ownership
@@ -59,7 +59,10 @@ The status response contains Group UID, role, member index/count and one
 aggregate `ready` boolean. There is no HTTP status listener during startup;
 connection failure must be treated as unavailable. It is not a fabricated
 sequence of per-stage status booleans. Kubernetes Group readiness and routing
-must still aggregate all expected members.
+aggregates all expected members. Attention's serving gate starts closed and is
+controlled through `/internal/afd/serving` by the existing Group owner; see
+[serving readiness](afd-group-workload.md#serving-readiness-and-withdrawal).
+This reversible gate is independent of lifecycle drain admission.
 
 The startup deadline includes preparation, engine startup and AFD readiness.
 The plugin world rendezvous and ready-key wait take their timeout from the
@@ -136,6 +139,17 @@ during startup is expected. Then execute:
 ```bash
 curl --fail http://127.0.0.1:18000/internal/afd/status
 curl --fail http://127.0.0.1:18001/internal/afd/status
+```
+
+After verifying both responses against the saved plans and confirming both are
+ready, the owner of this standalone acceptance pair opens Attention admission
+explicitly (the Kubernetes Group controller performs this step in a deployment):
+Use the `groupUid` from the saved plans if it differs from the example.
+
+```bash
+curl --fail-with-body http://127.0.0.1:18000/internal/afd/serving \
+  -H 'Content-Type: application/json' \
+  -d '{"groupUid":"acceptance-run-001","memberIndex":0,"enabled":true}'
 docker exec -i foretoken-managed-afd-attention /usr/bin/python3 - <<'REQUEST'
 import json
 import os

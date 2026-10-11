@@ -7,7 +7,11 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::{Json, Router, routing::get};
+use axum::{
+    Json, Router,
+    http::StatusCode,
+    routing::{get, post},
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
@@ -15,7 +19,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 use crate::api::RuntimeHealth;
-use crate::launch::AfdPlan;
+use crate::launch::{AfdPlan, ExecutionRole};
 
 /// Owns the socket that receives lifecycle events from this member's only GPU worker.
 pub struct Observer {
@@ -99,9 +103,38 @@ impl Drop for Observer {
     }
 }
 
-/// Exposes member identity and readiness to lifecycle consumers without a generation endpoint.
+/// Exposes member observations and the Attention-only serving gate to the Group controller.
+/// FFN retains read-only status; neither role gains a generation route here.
 pub fn status_router(plan: AfdPlan, health: Arc<RuntimeHealth>) -> Router {
-    Router::new().route(
+    let mut router = Router::new();
+    if plan.role == ExecutionRole::Attention {
+        let identity = plan.clone();
+        let admission = health.clone();
+        router = router.route(
+            "/internal/afd/serving",
+            post(move |Json(request): Json<ServingRequest>| {
+                let plan = identity.clone();
+                let health = admission.clone();
+                async move {
+                    if request.group_uid != plan.group_uid
+                        || request.member_index != plan.member_index
+                    {
+                        return Err(StatusCode::CONFLICT);
+                    }
+                    health.set_afd_serving(request.enabled);
+                    Ok(Json(json!({
+                        "groupUid": plan.group_uid,
+                        "role": plan.role,
+                        "memberIndex": plan.member_index,
+                        "memberCount": plan.member_count,
+                        "ready": health.ready(),
+                        "accepting": health.accepting(),
+                    })))
+                }
+            }),
+        );
+    }
+    router.route(
         "/internal/afd/status",
         get(move || {
             let plan = plan.clone();
@@ -117,4 +150,13 @@ pub fn status_router(plan: AfdPlan, health: Arc<RuntimeHealth>) -> Router {
             }
         }),
     )
+}
+
+// Only the existing Group owner controls this gate after observing the complete AF pair.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServingRequest {
+    group_uid: String,
+    member_index: usize,
+    enabled: bool,
 }

@@ -167,6 +167,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_ffn(&config, engine, client, &mut cache_server, cache_shutdown).await;
     }
     let health = Arc::new(RuntimeHealth::new());
+    if config.launch.afd.is_some() {
+        health.set_afd_serving(false);
+    }
     health.set_process_alive(true);
 
     let mut client_health = client.subscribe_health();

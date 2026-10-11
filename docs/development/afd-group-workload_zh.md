@@ -6,7 +6,8 @@
 [English](afd-group-workload.md) | 简体中文
 
 ModelGroup 控制器按 [managed V2 契约](afd-managed-runtime_zh.md) 物化固定 CUDA 1A1F。
-创建不代表服务就绪；当前不发布 AFD 生成 Service 或路由，不替换失败 Group。
+创建不代表服务就绪；同一控制器在完整 AF 就绪后发布仅指向 Attention 的生成
+Service 和路由，不替换失败 Group。
 OCI 和真实 GPU/Kubernetes 验收仍未完成。
 
 ## 身份与发现
@@ -54,16 +55,44 @@ Group 拥有 headless Service `afd-<uid>-f0`，selector 限定 UID、FFN 角色�
 Pending 与启动超时分开；scheduler condition 继续报告资源不足。不判断“重启耗尽”，
 不把 kubelet 重启本身视作终态，不解析 kubectl 展示文本。失效不等于终止。
 
+## 服务就绪与入口撤销
+
+Group 控制器核对完整成员集合、已记录 Pod UID、角色/序号标签、Running/Ready
+Pod 及两侧 `/internal/afd/status`。运行时响应把 Group UID 和角色绑定到实际
+引擎、connector 和 FFN loop 初始化；端口连通或原生 handshake 不代表完整就绪。
+
+Attention 启动时关闭可恢复的 serving gate。两侧观测全部通过后，控制器向
+Attention 的 `/internal/afd/serving` 提交 Group UID、成员序号及 `enabled`，
+收到身份匹配、运行时 ready 且 `accepting: true` 的响应，才发布生成 Service
+和 Group Ready。FFN 没有此开关或生成 API。该私有契约要求控制器与 model-server
+使用匹配构建；缺少 gate 接口的旧运行时保持不可用。
+
+既有 serving snapshot owner 消费 Group Ready，每个 Group 只发布一个指向
+Attention Service 的目标。DP/TP 和 KV scope 来自 Attention；GPU 统计包含两侧，
+完整 Group 副本仍只计一次。
+
+成员不可用时撤销 Group Ready、删除生成 Service 并关闭 Attention gate，阻止
+已有连接上的新请求。各撤销动作在出错时仍独立尝试，由 reconcile 重试。临时观测
+失败保持未就绪，完整成员再次通过观测后可以恢复；锁存故障保持 Failed。普通调度
+等待和正常删除仍使用各自状态。Ready/WorkloadAvailable 消息标明阻塞角色，
+前置 API 错误也会撤销已发布入口。
+
+gate 与运行时 admission 共用原子请求计数，但不能重新打开排空/退出已关闭的
+lifecycle admission。在途请求可以完成或失败。观测、Service 删除和前端快照安装
+是异步过程，不保证零延迟撤销，也不代表收到前端 generation ACK。Attention 不可达
+时无法确认入口关闭。F0 发现保留到既有顺序清理完成。
+
 ## 删除与责任边界
 
-Group 删除先正常删除 Attention，让现有运行时执行有界关闭。持久化终止证据后移除成员
+Group 删除先撤销 Ready、尝试关闭 Attention gate 并删除生成 Service，再正常删除
+Attention，让现有运行时执行有界关闭。持久化终止证据后移除成员
 finalizer，等待 Pod 消失，再删除 FFN。两个 Pod 都消失后删除 F0 Service，最后释放
 Group finalizer。其余 Group 拥有的准备和网络对象沿用垃圾回收；来源记录和缓存保留原 owner。
 
 未调度且正在删除的 Pod 从未运行；已调度 Pod 必须有终态 phase/container 证据，排除
 NodeLost、Unknown 和 ContainerStatusUnknown。只有驱逐原因不足以证明终止。
 成员消失且没有先前终止证据时保持 `TerminationUnconfirmed`，不强删、不假定 GPU 释放。
-节点隔离、整组恢复和路由撤销集成属于后续工作；手动移除 finalizer 会绕过证据边界。
+节点隔离和整组恢复属于后续工作；手动移除 finalizer 会绕过证据边界。
 
 负责人仍须验证同节点通信、独立 GPU、Pending/部分创建、重入、删除、退出和节点失联。
 编译与渲染不代表这些场景通过。

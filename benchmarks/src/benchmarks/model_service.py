@@ -178,7 +178,13 @@ def _model_gpu_count(
             continue
         if group["metadata"].get("deletionTimestamp") or group["status"].get("phase") != "Ready":
             continue
-        total += int(spec["nodeCount"]) * int(spec["resources"]["requests"]["gpu"]["count"])
+        if "afd" in spec:
+            total += sum(
+                int(side["memberCount"]) * int(side["resources"]["requests"]["gpu"]["count"])
+                for side in (spec["afd"]["attention"], spec["afd"]["ffn"])
+            )
+        else:
+            total += int(spec["nodeCount"]) * int(spec["resources"]["requests"]["gpu"]["count"])
     if total < 1:
         raise DeploymentError(f"no resolved GPU capacity for model {model!r}")
     return total

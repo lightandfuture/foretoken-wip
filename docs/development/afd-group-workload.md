@@ -7,8 +7,9 @@ English | [简体中文](afd-group-workload_zh.md)
 
 The ModelGroup controller materializes a fixed CUDA 1A1F pair using the
 [managed V2 runtime contract](afd-managed-runtime.md). Materialization is not
-serving readiness. It publishes no AFD generation Service or route and does
-not replace failed Groups. OCI and GPU/Kubernetes acceptance remain outstanding.
+serving readiness. The same controller publishes an Attention-only generation
+Service and route after the complete pair is ready. It does not replace failed
+Groups. OCI and GPU/Kubernetes acceptance remain outstanding.
 
 ## Identity and discovery
 
@@ -63,9 +64,44 @@ Pending scheduling remains separate from startup timeout. Scheduler conditions
 still report insufficient capacity. Neither restart exhaustion, kubelet restart
 alone nor kubectl display strings define failure. Failure is not termination.
 
+## Serving readiness and withdrawal
+
+The Group controller observes the exact member set, recorded Pod UIDs, role/index
+labels, Running/Ready Pods and both `/internal/afd/status` responses. The runtime
+responses bind the Group UID and role to real engine, connector and FFN-loop
+initialization. A listening port or native handshake alone is insufficient.
+
+Attention starts with its reversible serving gate closed. After both members
+pass observation, the controller posts the Group UID, member index and `enabled`
+to Attention's `/internal/afd/serving`. It requires matching identity, runtime
+readiness and `accepting: true` before publishing the generation Service and
+Group Ready. FFN exposes neither this gate nor a generation API. This private
+contract requires matching controller and model-server builds; an older runtime
+without the gate remains unavailable.
+
+The existing serving snapshot owner consumes Group Ready and publishes one Group
+target using the Attention Service. DP/TP and KV scope come from Attention; GPU
+accounting includes both roles, while replica accounting counts the Group once.
+
+Unavailable members revoke Group Ready, remove the generation Service and close
+the Attention gate, including requests on established connections. These steps
+are attempted independently on errors and retried by reconciliation. Temporary
+observation failure remains unready and can reopen after the complete pair is
+observed again; latched member failure remains Failed. Pending scheduling and
+normal deletion retain their distinct states. Ready/WorkloadAvailable messages
+identify the blocking role. API errors also withdraw existing serving entries.
+
+The gate shares runtime admission's atomic request counter, but cannot undo
+lifecycle admission closure during drain/shutdown. Already accepted streams may
+finish or fail. Observation, Service removal and frontend snapshot installation
+are asynchronous; this is not a zero-delay withdrawal guarantee or a frontend
+generation acknowledgement. An unreachable Attention cannot acknowledge closure.
+F0 discovery remains until the existing ordered cleanup completes.
+
 ## Deletion and responsibility boundaries
 
-Group deletion normally deletes Attention first, invoking its existing bounded
+Group deletion revokes Ready, attempts to close the Attention gate and removes
+the generation Service. It then normally deletes Attention first, invoking its existing bounded
 runtime shutdown. After termination is recorded durably, the controller removes
 the member finalizer and waits for the Pod to disappear before deleting FFN.
 It removes F0 discovery after both Pods disappear, then releases the Group
@@ -76,8 +112,8 @@ An unscheduled deleting Pod never ran. Scheduled Pods require terminal phase or
 container evidence, excluding NodeLost, Unknown and ContainerStatusUnknown.
 Eviction alone is insufficient. Missing members without prior termination
 evidence retain deletion with `TerminationUnconfirmed`; no forced deletion or
-assumed GPU release occurs. Node isolation, whole-Group recovery and routing
-withdrawal integration remain separate work. Manual finalizer removal bypasses
+assumed GPU release occurs. Node isolation and whole-Group recovery
+remain separate work. Manual finalizer removal bypasses
 this evidence boundary.
 
 Owner acceptance must exercise same-node communication, independent GPUs,

@@ -28,7 +28,8 @@ use foretoken_model_protocol::{
 
 // One atomic word linearizes admission close against request acceptance.
 const ADMISSION_OPEN: u64 = 1 << 63;
-const RUNNING_REQUESTS_MASK: u64 = !ADMISSION_OPEN;
+const AFD_SERVING_BLOCKED: u64 = 1 << 62;
+const RUNNING_REQUESTS_MASK: u64 = !(ADMISSION_OPEN | AFD_SERVING_BLOCKED);
 const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.0.0; charset=utf-8";
 
 /// Engine state used for API health and admission only; process ownership stays upstream.
@@ -60,8 +61,19 @@ impl RuntimeHealth {
         if value {
             self.admission.fetch_or(ADMISSION_OPEN, Ordering::AcqRel);
         } else {
+            self.admission.fetch_and(!ADMISSION_OPEN, Ordering::AcqRel);
+        }
+    }
+
+    /// Applies the Group controller's reversible AFD gate without reopening lifecycle admission.
+    /// The supervisor blocks Attention before listening; ordinary runtimes leave this bit clear.
+    pub fn set_afd_serving(&self, enabled: bool) {
+        if enabled {
             self.admission
-                .fetch_and(RUNNING_REQUESTS_MASK, Ordering::AcqRel);
+                .fetch_and(!AFD_SERVING_BLOCKED, Ordering::AcqRel);
+        } else {
+            self.admission
+                .fetch_or(AFD_SERVING_BLOCKED, Ordering::AcqRel);
         }
     }
     /// Returns process-and-client health for the `/healthz` probe without changing lifecycle state.
@@ -78,14 +90,15 @@ impl RuntimeHealth {
     ///
     /// Existing stream permits remain owned by their handlers after this signal closes.
     pub fn accepting(&self) -> bool {
-        self.admission.load(Ordering::Acquire) & ADMISSION_OPEN != 0
+        self.admission.load(Ordering::Acquire) & (ADMISSION_OPEN | AFD_SERVING_BLOCKED)
+            == ADMISSION_OPEN
     }
     /// Reserves admission and transfers the slot to a response-held permit.
     /// Closing admission clears only the open bit, so existing requests can drain.
     pub fn try_admit(self: &Arc<Self>) -> Option<AdmissionPermit> {
         let mut current = self.admission.load(Ordering::Acquire);
         loop {
-            if current & ADMISSION_OPEN == 0 {
+            if current & (ADMISSION_OPEN | AFD_SERVING_BLOCKED) != ADMISSION_OPEN {
                 return None;
             }
             let next = current + 1;

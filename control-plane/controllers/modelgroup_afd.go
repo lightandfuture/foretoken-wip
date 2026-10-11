@@ -5,6 +5,7 @@ package controllers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -243,8 +244,9 @@ func (reconciler *ModelGroupReconciler) saveAFDMemberStatus(ctx context.Context,
 	return reconciler.Status().Patch(ctx, group, client.MergeFrom(base))
 }
 
-// reconcileAFD creates only never-created members, latches failures, and leaves serving publication to its owner.
-func (reconciler *ModelGroupReconciler) reconcileAFD(ctx context.Context, group *inferencev1alpha1.ModelGroup) (ctrl.Result, error) {
+// reconcileAFD creates only never-created members and publishes the complete pair's serving state.
+// Latched member failure withdraws admission without replacing any member in the old domain.
+func (reconciler *ModelGroupReconciler) reconcileAFD(ctx context.Context, group *inferencev1alpha1.ModelGroup, pool *inferencev1alpha1.ModelPool) (ctrl.Result, error) {
 	// Member and Group observations must share the API-server consistency boundary.
 	if err := reconciler.APIReader.Get(ctx, client.ObjectKeyFromObject(group), group); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
@@ -256,26 +258,26 @@ func (reconciler *ModelGroupReconciler) reconcileAFD(ctx context.Context, group 
 	roles := []inferencev1alpha1.AFDExecutionRole{inferencev1alpha1.AFDAttention, inferencev1alpha1.AFDFFN}
 	for _, role := range roles {
 		if _, _, err := reconciler.observeAFDMember(ctx, group, role); err != nil {
-			return ctrl.Result{}, err
+			state := modelGroupMaterializedState(false, schedulingNotEvaluated())
+			state.unavailable = &modelGroupConditionState{status: metav1.ConditionFalse, reason: "MemberObservationFailed", message: fmt.Sprintf("%s/0: %v", role, err)}
+			return ctrl.Result{}, errors.Join(err, reconciler.publishAFDState(ctx, group, pool, state))
 		}
 	}
-	if err := reconciler.saveAFDMemberStatus(ctx, group, base); err != nil {
-		return ctrl.Result{}, err
-	}
+	memberStatusErr := reconciler.saveAFDMemberStatus(ctx, group, base)
 	for _, member := range group.Status.AFDMembers {
 		if member.FailureReason != "" {
-			scheduling, err := reconciler.schedulingCapacity(ctx, group)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			state := modelGroupMaterializedState(false, scheduling)
+			state := modelGroupMaterializedState(false, schedulingNotEvaluated())
 			state.phase = inferencev1alpha1.ModelGroupPhaseFailed
-			state.unavailable = &modelGroupConditionState{status: metav1.ConditionFalse, reason: member.FailureReason, message: member.FailureMessage}
+			state.unavailable = &modelGroupConditionState{status: metav1.ConditionFalse, reason: member.FailureReason, message: fmt.Sprintf("%s/0: %s", member.Role, member.FailureMessage)}
 			if len(group.Status.AFDMembers) != int(group.Spec.MemberCount) {
 				state.materialized = modelGroupConditionState{status: metav1.ConditionFalse, reason: "IncompleteMembers", message: "Member failure stopped partial materialization"}
 			}
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, reconciler.updateStatus(ctx, group, state)
+			publicationErr := reconciler.publishAFDState(ctx, group, pool, state)
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, errors.Join(memberStatusErr, publicationErr)
 		}
+	}
+	if memberStatusErr != nil {
+		return ctrl.Result{}, memberStatusErr
 	}
 	if err := reconciler.reconcileAFDRendezvous(ctx, group); err != nil {
 		return ctrl.Result{}, err
@@ -304,16 +306,28 @@ func (reconciler *ModelGroupReconciler) reconcileAFD(ctx context.Context, group 
 			return ctrl.Result{}, err
 		}
 	}
-	scheduling, err := reconciler.schedulingCapacity(ctx, group)
-	if err != nil {
-		return ctrl.Result{}, err
+	condition, observationErr := reconciler.afdServingCondition(ctx, group)
+	if observationErr != nil {
+		condition = modelGroupConditionState{status: metav1.ConditionFalse, reason: "MemberObservationFailed", message: observationErr.Error()}
 	}
-	return ctrl.Result{RequeueAfter: 10 * time.Second}, reconciler.updateStatus(ctx, group, modelGroupMaterializedState(false, scheduling))
+	scheduling, schedulingErr := reconciler.schedulingCapacity(ctx, group)
+	if schedulingErr != nil {
+		scheduling = schedulingNotEvaluated()
+		condition = modelGroupConditionState{status: metav1.ConditionFalse, reason: "SchedulingObservationFailed", message: schedulingErr.Error()}
+	}
+	if condition.status == metav1.ConditionTrue {
+		if err := reconciler.setAFDServing(ctx, group, true); err != nil {
+			condition = modelGroupConditionState{status: metav1.ConditionFalse, reason: "AttentionAdmissionUnavailable", message: err.Error()}
+		}
+	}
+	state := modelGroupMaterializedState(condition.status == metav1.ConditionTrue, scheduling)
+	state.unavailable = &condition
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, errors.Join(observationErr, schedulingErr, reconciler.publishAFDState(ctx, group, pool, state))
 }
 
 // reconcileAFDDelete stops Attention before FFN, retaining evidence and discovery until both have ended.
 // It never recreates members and never treats a missing running Pod as proof of GPU release.
-func (reconciler *ModelGroupReconciler) reconcileAFDDelete(ctx context.Context, group *inferencev1alpha1.ModelGroup) (ctrl.Result, error) {
+func (reconciler *ModelGroupReconciler) reconcileAFDDelete(ctx context.Context, group *inferencev1alpha1.ModelGroup) (result ctrl.Result, reconcileErr error) {
 	if err := reconciler.APIReader.Get(ctx, client.ObjectKeyFromObject(group), group); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -322,6 +336,14 @@ func (reconciler *ModelGroupReconciler) reconcileAFDDelete(ctx context.Context, 
 		if err := reconciler.updateDrainStatus(ctx, group, &now, false, false, false, "StoppingMembers", "Stopping Attention before FFN"); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+	// Revoke generation discovery before the existing ordered member shutdown.
+	// Runtime SIGTERM closes admission and drains Attention before FFN is stopped.
+	admissionErr := reconciler.setAFDServing(ctx, group, false)
+	// HTTP loss cannot prevent the existing Pod shutdown path or prove termination.
+	defer func() { reconcileErr = errors.Join(reconcileErr, admissionErr) }()
+	if err := reconciler.withdrawAFDService(ctx, group); err != nil {
+		return ctrl.Result{}, err
 	}
 	for _, role := range []inferencev1alpha1.AFDExecutionRole{inferencev1alpha1.AFDAttention, inferencev1alpha1.AFDFFN} {
 		base := group.DeepCopy()

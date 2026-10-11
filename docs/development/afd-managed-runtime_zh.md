@@ -7,7 +7,7 @@
 
 model-server 可消费私有 V2 plan，启动本机同步 CUDA 1A1F。当前实现仍待负责人
 执行 OCI 构建和 A100 验收。[Group 物化](afd-group-workload_zh.md) 提供固定 Pod 和发现，
-服务发布与整组恢复仍待实现。使用运行时源码
+并聚合完整成员发布服务，整组恢复仍待实现。使用运行时源码
 提交构建[固定候选镜像](afd-runtime_zh.md)。
 
 ## 启动契约与生命周期
@@ -49,6 +49,9 @@ TP=PP=DP=PCP=DCP=1、启用 EP，不支持 KV/EC 传输、KV 事件、EPLB 或�
 
 状态响应包含 Group UID、角色、成员序号/数量和一个聚合 `ready` 布尔值。
 启动阶段没有 HTTP listener，连接失败表示不可用；不伪造分阶段布尔状态。
+Attention serving gate 启动时关闭，由既有 Group owner 通过 `/internal/afd/serving`
+控制；见[服务就绪](afd-group-workload_zh.md#服务就绪与入口撤销)。
+此可恢复开关独立于 lifecycle drain admission。
 Kubernetes Group 就绪与路由仍须聚合所有预期成员。
 
 同一个 startup deadline 覆盖准备、引擎启动和 AFD 就绪。插件 world rendezvous
@@ -118,6 +121,16 @@ docker run -d --name foretoken-managed-afd-attention --gpus device=0 \
 ```bash
 curl --fail http://127.0.0.1:18000/internal/afd/status
 curl --fail http://127.0.0.1:18001/internal/afd/status
+```
+
+先核对两侧响应与保存的 plan 身份一致且均 ready，再由此独立验收对的负责人
+显式打开 Attention 入口；Kubernetes 部署由 Group 控制器执行这一步：
+若本次 plan 使用不同的 `groupUid`，以下请求也应使用该实际值。
+
+```bash
+curl --fail-with-body http://127.0.0.1:18000/internal/afd/serving \
+  -H 'Content-Type: application/json' \
+  -d '{"groupUid":"acceptance-run-001","memberIndex":0,"enabled":true}'
 docker exec -i foretoken-managed-afd-attention /usr/bin/python3 - <<'REQUEST'
 import json
 import os
