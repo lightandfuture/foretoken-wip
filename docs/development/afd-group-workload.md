@@ -119,3 +119,36 @@ this evidence boundary.
 Owner acceptance must exercise same-node communication, independent GPUs,
 Pending/partial creation, re-entry, deletion, exits and node loss. Compilation
 and manifest rendering do not establish these results.
+
+## Pool capacity and interrupted reconciliation
+
+The Pool owns Group creation. Its persisted `modelPoolRef` and controller owner
+reference identify the Pool; `spec.revision` and `spec.ordinal` identify one
+capacity position. The Group name is deterministic for that revision and ordinal.
+The API server assigns each creation a new UID, which scopes the member names
+and F0 communication domain. Pool status is an observation, not a creation ledger.
+
+Revision selection and capacity reconciliation read children directly from the
+API server. A matching AFD Group retains its revision and occupies its position
+while deletion is pending, including while its finalizer waits. The Pool does
+not allocate a second revision merely because all matching Groups are deleting.
+After an object disappears, the existing capacity path can create its missing
+position. If no matching cohort remains, the Pool allocates a new revision;
+otherwise it retains the surviving cohort and replaces only the missing position.
+Other Groups keep their UIDs and communication domains.
+
+A successful Group create may precede both informer delivery and Pool status
+publication. Reconciliation discovers that persisted Group and continues with its
+UID. An AFD create returning AlreadyExists is read back and accepted only when
+the Pool owner and entire immutable spec match. API errors remain errors; retries
+do not adopt foreign objects. Pool deletion requests carry the observed Group UID
+so a delayed request cannot delete a newer incarnation at the same name.
+
+These rules cover capacity convergence, not proof of physical shutdown. Automatic
+failed-Group retirement is not connected: the current scheduled-Pod stop predicate
+can accept a PodGC-synthesized terminal phase with no container exit evidence.
+Foreground garbage collection can also delete the Group's A/F/F0 dependents
+independently of its cleanup loop. Node-loss classification and the AFD resolver's
+RDMA projection remain incomplete. A trustworthy Group cleanup boundary must be
+established before automatic failure retirement can safely use this capacity path;
+neither a timeout nor deletion alone establishes GPU release.

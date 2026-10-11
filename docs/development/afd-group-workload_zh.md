@@ -96,3 +96,27 @@ NodeLost、Unknown 和 ContainerStatusUnknown。只有驱逐原因不足以证�
 
 负责人仍须验证同节点通信、独立 GPU、Pending/部分创建、重入、删除、退出和节点失联。
 编译与渲染不代表这些场景通过。
+
+## Pool 容量与中断续作
+
+Group 由 Pool 创建。持久化的 `modelPoolRef` 与 controller ownerReference
+共同确定所属 Pool，`spec.revision` 与 `spec.ordinal` 确定一个容量位置。
+Group 名称由 revision 和 ordinal 确定；每次创建由 API server 分配新 UID，
+用于成员名称及 F0 通信域。Pool status 只是观测结果，不是创建账本。
+
+revision 选择和容量 reconcile 直接读取 API server 中的子对象。规格匹配的
+AFD Group 在删除期间继续保留 revision 并占用原位置，包括 finalizer 等待阶段。
+Pool 不会仅因全部匹配 Group 正在删除而分配另一个 revision。对象消失后，
+既有容量路径可以补建缺失位置；若已无匹配 cohort，则分配新 revision；若还有
+同规格 cohort，则保留其 revision，只补缺失位置。其他 Group 的 UID 和通信域不变。
+
+Group 创建成功可能早于 informer 事件和 Pool status 写入。重入会发现这个已持久化
+对象并继续使用其 UID。AFD Create 返回 AlreadyExists 时，直接读回对象，只有
+Pool owner 与完整不可变 spec 都匹配才复用。API 错误显式返回，不接管外部对象。
+Pool 删除请求携带观测到的 Group UID，防止迟到请求删除同名的新实例。
+
+这些规则只处理容量收敛，不能证明进程已经停止。自动退休失败 Group 尚未接入：
+当前 scheduled Pod 判停逻辑可能接受 PodGC 合成的终态 phase，而没有容器退出
+证据；foreground GC 也可能独立于 Group 清理循环删除 A/F/F0。节点失联分类和
+AFD resolver 的 RDMA 投影仍有缺口。必须先建立可信的 Group 清理边界，自动故障
+退休才能安全使用此容量路径；超时或对象删除本身均不证明 GPU 已释放。

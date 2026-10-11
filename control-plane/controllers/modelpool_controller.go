@@ -136,17 +136,9 @@ func (reconciler *ModelPoolReconciler) validateModelServiceOwnership(ctx context
 
 // targetRevision reuses a matching cohort or allocates an identity for changed execution settings.
 func (reconciler *ModelPoolReconciler) targetRevision(ctx context.Context, pool *inferencev1alpha1.ModelPool, template resolver.ModelGroupTemplate, servingRevision string) (string, error) {
-	groups, err := ownedModelGroups(ctx, reconciler.Client, pool)
-	if err != nil {
-		return "", err
-	}
-	if revision := matchingRevision(groups, pool, template, servingRevision); revision != "" {
-		return revision, nil
-	}
-
-	// A successful create can precede its informer event. Read current children before
-	// allocating an identity so retries cannot materialize a second matching cohort.
-	groups, err = ownedModelGroups(ctx, reconciler.APIReader, pool)
+	// A cached cohort can outlive deletion while a replacement already exists.
+	// Select from persisted children even when the informer still has a match.
+	groups, err := ownedModelGroups(ctx, reconciler.APIReader, pool)
 	if err != nil {
 		return "", err
 	}
@@ -157,6 +149,7 @@ func (reconciler *ModelPoolReconciler) targetRevision(ctx context.Context, pool 
 }
 
 // matchingRevision prefers the selected cohort, then reuses a matching target still starting.
+// AFD deletion retains its cohort until cleanup completes; it does not free capacity.
 func matchingRevision(groups []inferencev1alpha1.ModelGroup, pool *inferencev1alpha1.ModelPool, template resolver.ModelGroupTemplate, servingRevision string) string {
 	for _, revision := range []string{pool.Status.PreparedRevision, servingRevision} {
 		if revision == "" {
@@ -164,14 +157,14 @@ func matchingRevision(groups []inferencev1alpha1.ModelGroup, pool *inferencev1al
 		}
 		for index := range groups {
 			group := &groups[index]
-			if group.DeletionTimestamp.IsZero() && group.Spec.Revision == revision && groupMatchesTemplate(group, pool, template) {
+			if (group.DeletionTimestamp.IsZero() || group.Spec.AFD != nil) && group.Spec.Revision == revision && groupMatchesTemplate(group, pool, template) {
 				return revision
 			}
 		}
 	}
 	for index := range groups {
 		group := &groups[index]
-		if group.DeletionTimestamp.IsZero() && groupMatchesTemplate(group, pool, template) {
+		if (group.DeletionTimestamp.IsZero() || group.Spec.AFD != nil) && groupMatchesTemplate(group, pool, template) {
 			return group.Spec.Revision
 		}
 	}
@@ -208,7 +201,9 @@ func (reconciler *ModelPoolReconciler) currentActiveState(ctx context.Context, p
 
 // reconcileGroups converges target and serving ModelGroup cohorts for one ModelPool.
 func (reconciler *ModelPoolReconciler) reconcileGroups(ctx context.Context, pool *inferencev1alpha1.ModelPool, template resolver.ModelGroupTemplate, servingRevision string) (groupState, error) {
-	groups, err := ownedModelGroups(ctx, reconciler.Client, pool)
+	// Deleting children still occupy their slots; a successful Create is durable
+	// even if Pool status and informer delivery have not caught up.
+	groups, err := ownedModelGroups(ctx, reconciler.APIReader, pool)
 	if err != nil {
 		return groupState{}, err
 	}
@@ -230,7 +225,7 @@ func (reconciler *ModelPoolReconciler) reconcileGroups(ctx context.Context, pool
 			continue
 		}
 		scalePending = true
-		if err := reconciler.Delete(ctx, group); err != nil && !apierrors.IsNotFound(err) {
+		if err := reconciler.Delete(ctx, group, client.Preconditions{UID: &group.UID}); err != nil && !apierrors.IsNotFound(err) {
 			return groupState{}, fmt.Errorf("delete excess ModelGroup %q: %w", group.Name, err)
 		}
 		delete(current, ordinal)
@@ -250,7 +245,19 @@ func (reconciler *ModelPoolReconciler) reconcileGroups(ctx context.Context, pool
 			return groupState{}, fmt.Errorf("set ModelGroup owner: %w", err)
 		}
 		if err := reconciler.Create(ctx, group); err != nil {
-			return groupState{}, fmt.Errorf("create ModelGroup ordinal %d: %w", ordinal, err)
+			if pool.Spec.Template.AFD == nil || !apierrors.IsAlreadyExists(err) {
+				return groupState{}, fmt.Errorf("create ModelGroup ordinal %d: %w", ordinal, err)
+			}
+			// The deterministic name is the API uniqueness boundary for this slot.
+			// Reuse a successful concurrent create, including its assigned UID.
+			existing := new(inferencev1alpha1.ModelGroup)
+			if err := reconciler.APIReader.Get(ctx, client.ObjectKeyFromObject(group), existing); err != nil {
+				return groupState{}, fmt.Errorf("read existing ModelGroup ordinal %d: %w", ordinal, err)
+			}
+			if !metav1.IsControlledBy(existing, pool) || !reflect.DeepEqual(existing.Spec, spec) {
+				return groupState{}, fmt.Errorf("ModelGroup %q has an unexpected owner or immutable spec", group.Name)
+			}
+			group = existing
 		}
 		current[ordinal] = group
 	}
@@ -278,7 +285,7 @@ func (reconciler *ModelPoolReconciler) reconcileGroups(ctx context.Context, pool
 				continue
 			}
 			rolloutPending = true
-			if err := reconciler.Delete(ctx, group); err != nil && !apierrors.IsNotFound(err) {
+			if err := reconciler.Delete(ctx, group, client.Preconditions{UID: &group.UID}); err != nil && !apierrors.IsNotFound(err) {
 				return groupState{}, fmt.Errorf("delete unschedulable serving ModelGroup %q: %w", group.Name, err)
 			}
 		}
@@ -292,7 +299,7 @@ func (reconciler *ModelPoolReconciler) reconcileGroups(ctx context.Context, pool
 			continue
 		}
 		rolloutPending = true
-		if err := reconciler.Delete(ctx, group); err != nil && !apierrors.IsNotFound(err) {
+		if err := reconciler.Delete(ctx, group, client.Preconditions{UID: &group.UID}); err != nil && !apierrors.IsNotFound(err) {
 			return groupState{}, fmt.Errorf("delete superseded ModelGroup %q: %w", group.Name, err)
 		}
 	}
