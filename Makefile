@@ -6,6 +6,9 @@
 CONTROL_PLANE_IMAGE ?= foretoken-control-plane:dev
 FRONTEND_IMAGE ?= foretoken-frontend:dev
 MODEL_SERVER_IMAGE ?= foretoken-model-server:dev
+AFD_MODEL_SERVER_IMAGE ?= foretoken-model-server-afd:dev
+VLLM_AFD_IMAGE ?= foretoken-vllm-afd:dev
+VLLM_AFD_BASE_IMAGE ?= vllm/vllm-openai:v0.30.0
 OMNI_MODEL_SERVER_IMAGE ?= foretoken-omni-model-server:dev
 VLLM_OMNI_IMAGE ?= foretoken-vllm-omni:dev
 MOONCAKE_IMAGE ?= foretoken-mooncake
@@ -27,7 +30,8 @@ GIT = git $(if $(FORETOKEN_GITHUB_MIRROR),-c url.$(patsubst %/,%,$(FORETOKEN_GIT
 
 .PHONY: vllm-source build-data-plane format verify-data-plane dev-build \
 	image-control-plane image-frontend image-vllm-metax image-model-server image-model-server-omni \
-	image-model-server-metax image-vllm-omni image-benchmark dashboard alert-receivers
+	image-model-server-metax image-vllm-afd image-model-server-afd \
+	image-vllm-omni image-benchmark dashboard alert-receivers
 
 # Regenerates the localized Grafana dashboards shipped by the chart; needs the `dev` extra installed.
 dashboard:
@@ -110,6 +114,21 @@ image-model-server:
 		--target "$(IMAGE_TARGET)" $(if $(IMAGE_OUTPUT),--output "$(IMAGE_OUTPUT)",) \
 		--build-arg VLLM_REVISION="$(VLLM_REVISION)" \
 		-f data-plane/model-server/Dockerfile -t "$(MODEL_SERVER_IMAGE)" .
+
+# Build the pinned CUDA AFD environment through the existing image entrypoint.
+# The source-only Rust VLLM_REVISION remains owned by the workspace gitlink.
+image-vllm-afd image-model-server-afd: export DOCKER_DEFAULT_PLATFORM := linux/amd64
+image-vllm-afd image-model-server-afd: export FORETOKEN_VLLM_PYTHON := $(or $(FORETOKEN_VLLM_PYTHON),/usr/bin/python3)
+
+image-vllm-afd:
+	$(MAKE) image-model-server IMAGE_TARGET=afd-engine IMAGE_OUTPUT= \
+		INFERENCE_ENGINE_IMAGE="$(VLLM_AFD_BASE_IMAGE)" \
+		MODEL_SERVER_IMAGE="$(VLLM_AFD_IMAGE)"
+
+image-model-server-afd: image-vllm-afd
+	$(MAKE) image-model-server \
+		INFERENCE_ENGINE_IMAGE="$(VLLM_AFD_IMAGE)" \
+		MODEL_SERVER_IMAGE="$(AFD_MODEL_SERVER_IMAGE)"
 
 image-vllm-omni:
 	docker build \

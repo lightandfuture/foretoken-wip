@@ -15,6 +15,7 @@ ARG RUST_BUILDER_IMAGE=${BASE_IMAGE_REGISTRY}/library/rust:1.97.1-bullseye
 ARG INFERENCE_ENGINE_IMAGE=${INFERENCE_ENGINE_IMAGE_REGISTRY}/shiweijiezero/foretoken/model-server
 ARG FORETOKEN_VLLM_PYTHON
 ARG UV_IMAGE=${UV_IMAGE_REGISTRY}/astral-sh/uv:0.9.10
+ARG AFD_PLUGIN_REVISION=b7561d726b92f366f92634773b731b38e364fbe6
 
 FROM ${UV_IMAGE} AS uv
 
@@ -23,6 +24,24 @@ FROM ${BASE_IMAGE_REGISTRY}/library/debian:bookworm-slim AS patch-tool
 RUN apt-get update \
     && apt-get install -y --no-install-recommends patch ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Build the Python-only CUDA plugin with Git metadata for setuptools-scm.
+# Keep its packaging tools out of the engine image.
+FROM patch-tool AS afd-plugin-build
+ARG AFD_PLUGIN_REVISION
+ARG FORETOKEN_GITHUB_MIRROR
+ARG UV_DEFAULT_INDEX=https://pypi.org/simple
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+RUN origin="${FORETOKEN_GITHUB_MIRROR:-https://github.com}" \
+    && git init /src/afd-plugin \
+    && git -C /src/afd-plugin fetch --depth=1 \
+      "${origin%/}/vllm-project/afd-plugin.git" "${AFD_PLUGIN_REVISION}" \
+    && git -C /src/afd-plugin checkout --detach FETCH_HEAD
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    AFD_BUILD_ASCEND_OPS=0 uv build --python python3 --wheel \
+      --default-index "${UV_DEFAULT_INDEX}" --out-dir /wheels /src/afd-plugin
 
 # The upstream musl binary also runs in inference images with older glibc.
 FROM patch-tool AS dragonfly-client
@@ -120,6 +139,70 @@ LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
       org.opencontainers.image.revision="${OCI_REVISION}"
 COPY --from=builder /out/model-server /usr/local/bin/foretoken-omni-model-server
 ENTRYPOINT ["foretoken-omni-model-server"]
+
+# The explicit CUDA AFD base owns its plugin and dependency alignment. The
+# existing engine-runtime stages then wrap it into the model-server image.
+FROM ${INFERENCE_ENGINE_IMAGE} AS afd-engine
+ARG FORETOKEN_VLLM_PYTHON
+ENV FORETOKEN_VLLM_PYTHON=${FORETOKEN_VLLM_PYTHON} \
+    UV_OVERRIDE=/etc/uv-overrides.txt
+ARG AFD_PLUGIN_REVISION
+ARG UV_DEFAULT_INDEX=https://pypi.org/simple
+ARG OCI_SOURCE=https://github.com/shiweijiezero/foretoken
+ARG OCI_REVISION
+LABEL org.opencontainers.image.source="${OCI_SOURCE}" \
+      org.opencontainers.image.revision="${OCI_REVISION}" \
+      io.foretoken.afd.plugin.revision="${AFD_PLUGIN_REVISION}"
+# Upstream overrides NCCL for DeepEP v2. Synchronous AFD P2P uses PyTorch's
+# declared NCCL dependency instead; this variant does not support DeepEP v2.
+RUN --mount=from=uv,source=/uv,target=/usr/local/bin/uv \
+    --mount=from=afd-plugin-build,source=/wheels,target=/tmp/afd-plugin <<'SH'
+set -eu
+python_path=$("${FORETOKEN_VLLM_PYTHON:-python}" -c 'import sys; print(sys.executable)')
+printf '%s\n' 'nvidia-nccl-cu13==2.29.7' > "$UV_OVERRIDE"
+uv pip install --no-cache --no-deps --python "$python_path" \
+    --default-index "${UV_DEFAULT_INDEX}" --requirements "$UV_OVERRIDE"
+uv pip install --no-cache --no-deps --python "$python_path" /tmp/afd-plugin/*.whl
+uv pip check --python "$python_path"
+"$python_path" - <<'PY'
+import json
+import os
+import platform
+import sys
+from importlib.metadata import distribution, version
+from pathlib import Path
+
+import torch
+
+if sys.version_info[:2] != (3, 12):
+    raise SystemExit("CUDA AFD requires the Python 3.12 runtime")
+expected = {
+    "vllm": "0.30.0",
+    "torch": "2.13.0",
+    "nvidia-nccl-cu13": "2.29.7",
+}
+packages = {name: version(name) for name in expected}
+for name, required in expected.items():
+    if packages[name].split("+")[0] != required:
+        raise SystemExit(f"CUDA AFD requires {name}=={required}, got {packages[name]}")
+if torch.version.cuda != "13.0" or os.environ.get("CUDA_VERSION") != "13.0.3":
+    raise SystemExit("CUDA AFD requires the CUDA 13.0.3 image and cu130 PyTorch")
+plugin = distribution("vllm-afd-plugin")
+packages[plugin.name] = plugin.version
+record = {
+    "python": sys.executable,
+    "python_version": platform.python_version(),
+    "packages": packages,
+    "cuda": os.environ["CUDA_VERSION"],
+    "torch_cuda": torch.version.cuda,
+    "plugin_revision": os.environ["AFD_PLUGIN_REVISION"],
+}
+output = Path("/usr/share/foretoken/afd-runtime.json")
+output.parent.mkdir(parents=True, exist_ok=True)
+output.write_text(json.dumps(record, indent=2) + "\n")
+print(output.read_text())
+PY
+SH
 
 FROM ${INFERENCE_ENGINE_IMAGE} AS engine-runtime
 
