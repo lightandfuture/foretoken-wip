@@ -152,3 +152,11 @@ independently of its cleanup loop. Node-loss classification and the AFD resolver
 RDMA projection remain incomplete. A trustworthy Group cleanup boundary must be
 established before automatic failure retirement can safely use this capacity path;
 neither a timeout nor deletion alone establishes GPU release.
+
+For an AFD Pool with zero requested Groups, `RolloutPending` becomes false only
+when the direct API read finds no owned Groups across any revision. Deleting
+Groups still count as pending. No prepared or serving revision is needed for an
+empty Pool; `Ready` remains false with reason `ScaledToZero`. This condition
+reports object convergence only. Normal scale-down and update retirement still
+use the Group cleanup path and inherit the stop-evidence and garbage-collection
+limitations above; an empty API list does not independently prove GPU release.

@@ -120,3 +120,9 @@ Pool 删除请求携带观测到的 Group UID，防止迟到请求删除同名�
 证据；foreground GC 也可能独立于 Group 清理循环删除 A/F/F0。节点失联分类和
 AFD resolver 的 RDMA 投影仍有缺口。必须先建立可信的 Group 清理边界，自动故障
 退休才能安全使用此容量路径；超时或对象删除本身均不证明 GPU 已释放。
+
+AFD Pool 的期望 Group 数为零时，只有直接读取 API 确认所有 revision 均无所属
+Group，`RolloutPending` 才变为 false；删除中的 Group 仍保持 pending。空 Pool
+不需要 prepared 或 serving revision，`Ready` 仍为 false、reason 为
+`ScaledToZero`。此条件只报告对象容量收敛。正常缩容和更新退休仍使用 Group
+清理路径，继承上述停止证据及垃圾回收顺序限制；API 空列表不独立证明 GPU 释放。

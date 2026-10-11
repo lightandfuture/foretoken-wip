@@ -273,6 +273,11 @@ func (reconciler *ModelPoolReconciler) reconcileGroups(ctx context.Context, pool
 	servingRevisionDraining := targetInsufficientCapacity && servingRevision != "" && servingRevision != template.Revision
 	ready := pool.Spec.DesiredGroups > 0 && revisionServingReady(groups, servingRevision) && !servingRevisionDraining
 	rolloutPending := preparedRevision != template.Revision || servingRevision != template.Revision || !targetReady
+	if pool.Spec.Template.AFD != nil && pool.Spec.DesiredGroups == 0 {
+		// Zero capacity has no revision to prepare or serve. Persisted children,
+		// including deleting cohorts, keep object convergence pending.
+		rolloutPending = len(groups) > 0
+	}
 
 	// Keep the old cohort for zero-downtime replacement while the target can
 	// schedule. If the target is explicitly unschedulable, retaining the old
