@@ -26,11 +26,14 @@ pub const PYTHON_MODULE_PATH: &str = "/opt/foretoken/python";
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LaunchPlanV1 {
+pub struct LaunchPlan {
     pub version: u8,
     /// Kubernetes nodes participating in this complete execution group.
     #[serde(rename = "nodeCount")]
-    pub node_count: usize,
+    pub node_count: Option<usize>,
+    /// Role-local membership and the shared AFD rendezvous for version 2.
+    #[serde(default)]
+    pub afd: Option<AfdPlan>,
     pub artifacts: Artifacts,
     pub parallelism: Parallelism,
     pub kv: KvPlan,
@@ -43,6 +46,27 @@ pub struct LaunchPlanV1 {
     pub internal_generate_request_body_limit_bytes: usize,
     #[serde(default, rename = "engineArgs")]
     pub engine_args: BTreeMap<String, serde_json::Value>,
+}
+
+/// Version 2 member projection. The rendezvous identifies this Group's F0.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AfdPlan {
+    pub role: ExecutionRole,
+    pub member_index: usize,
+    pub member_count: usize,
+    pub group_uid: String,
+    pub host: String,
+    pub port: u16,
+    pub num_attention_ranks: usize,
+    pub num_ffn_ranks: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionRole {
+    Attention,
+    Ffn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,7 +274,7 @@ impl EcTransferPlan {
     }
 }
 
-impl LaunchPlanV1 {
+impl LaunchPlan {
     /// Decodes the controller-projected launch plan used by model-server startup.
     ///
     /// Returns an owned, validated plan or a configuration error without retaining the input.
@@ -265,11 +289,105 @@ impl LaunchPlanV1 {
     ///
     /// Callers retain the plan; success publishes no state, while failure reports the invalid field.
     pub fn validate(&self) -> Result<(), String> {
-        if self.version != 1 {
-            return Err("launch plan version must be 1".into());
+        match (self.version, self.node_count, &self.afd) {
+            (1, Some(count), None) if count > 0 => {}
+            (2, None, Some(afd)) => {
+                if afd.member_index != 0
+                    || afd.member_count != 1
+                    || afd.num_attention_ranks != 1
+                    || afd.num_ffn_ranks != 1
+                    || self.parallelism.tp != 1
+                    || self.parallelism.dp != 1
+                    || self.parallelism.pp != 1
+                    || self.parallelism.pcp != 1
+                    || self.parallelism.dcp != 1
+                {
+                    return Err("AFD currently requires one single-GPU member per role".into());
+                }
+                if afd.group_uid.is_empty() || afd.host.is_empty() || afd.port == 0 {
+                    return Err("AFD requires groupUid and a nonempty rendezvous endpoint".into());
+                }
+                if self.parallelism.ep.is_none()
+                    || self.ec.enabled()
+                    || !matches!(self.kv, KvPlan::None { events: false })
+                    || self.profiling.engine != crate::profiling::Engine::Pytorch
+                {
+                    return Err(
+                        "AFD requires EP and does not support KV/EC transfer or profiling".into(),
+                    );
+                }
+            }
+            (1, _, _) => {
+                return Err("version 1 requires positive nodeCount and no afd fields".into());
+            }
+            (2, _, _) => return Err("version 2 requires afd and forbids nodeCount".into()),
+            _ => return Err("launch plan version must be 1 or 2".into()),
         }
-        if self.node_count == 0 {
-            return Err("launch plan requires a positive node count".into());
+        for (name, value) in &self.engine_args {
+            // vLLM normalizes underscores only in the option name, before JSON dot keys.
+            let (option, field) = name.split_once('.').unwrap_or((name, ""));
+            let option = option.replace('_', "-");
+            if "additional-config".starts_with(&option) {
+                if field == "afd" || field.starts_with("afd.") {
+                    return Err(
+                        "engineArgs.additional-config.afd is owned by the launch plan".into(),
+                    );
+                }
+                if field.is_empty() {
+                    let value = match value {
+                        serde_json::Value::String(text) => serde_json::from_str(text)
+                            .map_err(|error| format!("invalid additional-config JSON: {error}"))?,
+                        value => value.clone(),
+                    };
+                    if value.get("afd").is_some() {
+                        return Err(
+                            "engineArgs.additional-config.afd is owned by the launch plan".into(),
+                        );
+                    }
+                }
+                if self.afd.is_some() && name != "additional-config" {
+                    return Err("additional-config must be supplied as one JSON object".into());
+                }
+            }
+            let positive_option = option.strip_prefix("no-").unwrap_or(&option);
+            // argparse also accepts unambiguous long-option prefixes.
+            if self.afd.is_some()
+                && "enforce-eager".starts_with(positive_option)
+                && (name != "enforce-eager" || value != &json!(true))
+            {
+                return Err("managed AFD requires enforce-eager=true".into());
+            }
+            if self.afd.is_some()
+                && [
+                    "worker-cls",
+                    "worker-extension-cls",
+                    "data-parallel-size",
+                    "tensor-parallel-size",
+                    "pipeline-parallel-size",
+                    "prefill-context-parallel-size",
+                    "decode-context-parallel-size",
+                    "data-parallel-size-local",
+                    "data-parallel-rank",
+                    "data-parallel-start-rank",
+                    "data-parallel-address",
+                    "data-parallel-rpc-port",
+                    "node-rank",
+                    "nnodes",
+                    "distributed-executor-backend",
+                    "enable-fault-tolerance",
+                    "enable-dbo",
+                    "enable-eplb",
+                    "enable-expert-parallel",
+                    "kv-transfer-config",
+                    "ec-transfer-config",
+                ]
+                .iter()
+                .any(|owned| owned.starts_with(positive_option))
+            {
+                return Err(format!(
+                    "engineArgs.{name} conflicts with the managed AFD plan"
+                ));
+            }
         }
         for (name, value) in [
             ("model", &self.artifacts.model),
@@ -285,7 +403,7 @@ impl LaunchPlanV1 {
         if p.tp == 0 || p.pp == 0 || p.dp == 0 || p.pcp == 0 || p.dcp == 0 {
             return Err("launch plan topology values must be positive".into());
         }
-        if !(p.tp * p.pp * p.pcp * p.dp).is_multiple_of(self.node_count) {
+        if !(p.tp * p.pp * p.pcp * p.dp).is_multiple_of(self.engine_node_count()) {
             return Err("worker count must divide evenly across model nodes".into());
         }
         if let Some(ep) = &p.ep
@@ -325,6 +443,21 @@ impl LaunchPlanV1 {
             _ => {}
         }
         self.ec.validate()
+    }
+
+    /// Returns the local engine membership without changing version 1 Group semantics.
+    pub fn engine_node_count(&self) -> usize {
+        self.afd.as_ref().map_or_else(
+            || self.node_count.expect("validated V1 nodeCount"),
+            |afd| afd.member_count,
+        )
+    }
+
+    /// Reports whether this member owns the connector-driven FFN daemon.
+    pub fn is_ffn(&self) -> bool {
+        self.afd
+            .as_ref()
+            .is_some_and(|afd| afd.role == ExecutionRole::Ffn)
     }
 
     /// Resolves the image's Python interpreter for engine launch and native report inspection.
@@ -369,7 +502,7 @@ impl LaunchPlanV1 {
         if let Some(member) = member {
             config.handshake_host = member.leader_address.clone();
             config.python_args.extend([
-                format!("--nnodes={}", self.node_count),
+                format!("--nnodes={}", self.engine_node_count()),
                 format!("--node-rank={}", member.index),
                 format!("--master-addr={}", member.leader_address),
                 "--master-port=29800".into(),
@@ -399,7 +532,7 @@ impl LaunchPlanV1 {
             .arg(
                 json!({
                     "member_index": member.index,
-                    "member_count": self.node_count,
+                    "member_count": self.engine_node_count(),
                     "leader": member.leader_address,
                     "port": 29600,
                     "startup_seconds": startup_remaining.as_secs_f64(),
@@ -448,6 +581,10 @@ impl LaunchPlanV1 {
         // The controller has already normalized native option names.
         // Keep argument values intact: this command never goes through a shell.
         for (name, value) in &self.engine_args {
+            if self.afd.is_some() && matches!(name.as_str(), "additional-config" | "enforce-eager")
+            {
+                continue;
+            }
             if matches!(self.ec.role, Some(EcRole::Producer))
                 && matches!(name.as_str(), "mm-encoder-only" | "enforce-eager")
             {
@@ -473,6 +610,36 @@ impl LaunchPlanV1 {
         }
         if let Some(config) = self.ec.transfer_config() {
             args.push(format!("--ec-transfer-config={config}"));
+        }
+        if let Some(afd) = &self.afd {
+            args.extend([
+                "--enforce-eager".into(),
+                "--no-enable-fault-tolerance".into(),
+            ]);
+            let mut additional = match self.engine_args.get("additional-config") {
+                None => json!({}),
+                Some(serde_json::Value::String(text)) => serde_json::from_str(text)
+                    .map_err(|error| format!("invalid additional-config JSON: {error}"))?,
+                Some(value) => value.clone(),
+            };
+            let object = additional
+                .as_object_mut()
+                .ok_or("engineArgs.additional-config must be a JSON object")?;
+            object.insert(
+                "afd".into(),
+                json!({
+                    "role": afd.role,
+                    "connector": "P2pNcclAFDConnector",
+                    "host": afd.host,
+                    "port": afd.port,
+                    "num_attention_ranks": afd.num_attention_ranks,
+                    "num_ffn_ranks": afd.num_ffn_ranks,
+                    "async_dp": false,
+                    "compute_gate_on_attention": false,
+                    "afd_process_group_timeout_s": self.lifecycle.startup_seconds,
+                }),
+            );
+            args.push(format!("--additional-config={additional}"));
         }
         Ok(args)
     }
@@ -513,7 +680,7 @@ pub fn append_engine_arg(
     Ok(())
 }
 
-impl LaunchPlanV1 {
+impl LaunchPlan {
     /// Returns the connector-owned placement exposed by live prefix observation.
     pub fn shared_prefix_placement(&self) -> Option<KvPlacement> {
         match self.kv {

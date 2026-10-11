@@ -6,8 +6,8 @@
 English | [简体中文](afd-runtime_zh.md)
 
 Build an explicitly selected CUDA environment for native Attention/FFN
-Disaggregation (AFD) validation. This image supplies the plugin; it does not
-add Foretoken AFD launch plans, scheduling, or readiness. A100 and K3s
+Disaggregation (AFD) validation. This image supplies the plugin and the [managed runtime](afd-managed-runtime.md);
+Kubernetes AFD scheduling and recovery are not yet provided. A100 and K3s
 acceptance remain owner-executed work before this candidate is supported.
 
 ## Build on Linux amd64
@@ -147,5 +147,5 @@ Start both roles concurrently and repeat generation and ordered shutdown.
 Expect actual tensor exchange across Pod boundaries and released resources.
 Save request output, communication logs, container/Pod exit statuses, and GPU
 allocations after termination. Host-network success alone does not prove this
-case. This is native validation; Foretoken-managed AFD lifecycle and
-controller deployment are outside the image's scope.
+case. This is native validation; managed lifecycle acceptance follows the [runtime guide](afd-managed-runtime.md).
+Controller deployment remains outside this validation.

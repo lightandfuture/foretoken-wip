@@ -51,7 +51,7 @@ impl SharedKvLookup {
                     || crate::runtime_transport::LOOPBACK_HOST.to_string(),
                     |member| {
                         member.node_address(
-                            rank * config.launch.node_count / config.launch.parallelism.dp,
+                            rank * config.launch.engine_node_count() / config.launch.parallelism.dp,
                         )
                     },
                 );

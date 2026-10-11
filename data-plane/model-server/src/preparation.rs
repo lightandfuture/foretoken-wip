@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::process::Command;
 
-use crate::launch::{Artifacts, LaunchPlanV1, PYTHON_MODULE_PATH};
+use crate::launch::{Artifacts, LaunchPlan, PYTHON_MODULE_PATH};
 
 /// Controller-owned publication scope shared by replicas of one Pool revision.
 pub const PREPARATION_SCOPE_ENV: &str = "FORETOKEN_MODEL_PREPARATION_SCOPE";
@@ -141,7 +141,7 @@ fn load_result(
 }
 
 // Provider imports happen in a child so transfer tuning does not affect the serving engine.
-fn provider_command(plan: &LaunchPlanV1, model_root: &Path) -> io::Result<Command> {
+fn provider_command(plan: &LaunchPlan, model_root: &Path) -> io::Result<Command> {
     let (source, performance_setting, default) = match plan.artifacts.source {
         ModelSource::Hf => ("hf", "HF_XET_HIGH_PERFORMANCE", "1"),
         ModelSource::ModelScope => ("modelscope", "MODELSCOPE_DOWNLOAD_PARALLELS", "16"),
@@ -193,10 +193,7 @@ async fn run_provider<T: serde::de::DeserializeOwned>(command: &mut Command) -> 
     serde_json::from_slice(&output.stdout).map_err(io::Error::other)
 }
 
-async fn resolve_revisions(
-    plan: &LaunchPlanV1,
-    model_root: &Path,
-) -> io::Result<ResolvedArtifacts> {
+async fn resolve_revisions(plan: &LaunchPlan, model_root: &Path) -> io::Result<ResolvedArtifacts> {
     let mut command = provider_command(plan, model_root)?;
     command
         .env("FORETOKEN_PREPARE_ACTION", "resolve")
@@ -221,7 +218,7 @@ async fn resolve_revisions(
 // ConfigMap resourceVersion makes the first successful publication authoritative across Jobs.
 // A competing publisher adopts the winner instead of resolving or overwriting another version.
 async fn publish_source(
-    plan: &LaunchPlanV1,
+    plan: &LaunchPlan,
     model_root: &Path,
     name: &str,
 ) -> io::Result<ResolvedArtifacts> {
@@ -290,7 +287,7 @@ async fn publish_source(
 }
 
 /// Freezes source revisions for a controller-owned resolve-only Job without downloading weights.
-pub async fn resolve(plan: &LaunchPlanV1) -> io::Result<()> {
+pub async fn resolve(plan: &LaunchPlan) -> io::Result<()> {
     let name = std::env::var(SOURCE_CONFIG_MAP_ENV).map_err(io::Error::other)?;
     let model_root = foretoken_artifacts::model_root().unwrap_or_else(std::env::temp_dir);
     publish_source(plan, &model_root, &name).await?;
@@ -301,7 +298,7 @@ pub async fn resolve(plan: &LaunchPlanV1) -> io::Result<()> {
 /// Serving processes read the mounted publication; filesystem paths are only a reusable cache.
 /// `require_publication` prevents a serving restart from choosing a new moving source revision.
 pub async fn prepare(
-    plan: &LaunchPlanV1,
+    plan: &LaunchPlan,
     model_root: &Path,
     scope: &str,
     require_publication: bool,

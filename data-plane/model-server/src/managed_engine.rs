@@ -15,11 +15,23 @@ use crate::profiling::{Config, Engine, nsight};
 pub struct ManagedEngine {
     handle: ManagedEngineHandle,
     nsight_session: Option<String>,
+    afd: Option<crate::afd::Observer>,
 }
 
 impl ManagedEngine {
     /// Starts the configured engine command and retains its process and diagnostic session.
-    pub async fn spawn(command: Command, profiling: Option<&Config>) -> Result<Self, String> {
+    pub async fn spawn(
+        mut command: Command,
+        profiling: Option<&Config>,
+        afd: bool,
+    ) -> Result<Self, String> {
+        let observer = afd
+            .then(crate::afd::Observer::bind)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        if let Some(observer) = &observer {
+            observer.configure(&mut command);
+        }
         let nsight_session = profiling
             .filter(|config| config.engine == Engine::Nsight)
             .map(|config| nsight::session_name(&config.runtime_id));
@@ -33,7 +45,27 @@ impl ManagedEngine {
         Ok(Self {
             handle,
             nsight_session,
+            afd: observer,
         })
+    }
+
+    /// Requires real worker completion in addition to the native EngineCore handshake.
+    pub async fn wait_afd_ready(&self, ffn: bool) -> Result<(), String> {
+        if let Some(observer) = &self.afd {
+            observer
+                .ready(ffn)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Reports a fatal AFD observation or channel loss to the existing shutdown owner.
+    pub async fn wait_afd_failure(&self) -> String {
+        match &self.afd {
+            Some(observer) => observer.failure().await.to_string(),
+            None => std::future::pending().await,
+        }
     }
 
     /// Reports launcher exit to the main loop; shutdown still owns target cleanup.

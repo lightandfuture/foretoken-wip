@@ -6,7 +6,7 @@
 [English](afd-runtime.md) | 简体中文
 
 构建显式选择的 CUDA 环境，用于原生 Attention/FFN 分离（AFD）验证。
-镜像提供插件，不包含 Foretoken AFD 启动协议、调度或就绪实现。
+镜像提供插件及[受管运行时](afd-managed-runtime_zh.md)，尚不提供 Kubernetes AFD 调度和恢复。
 候选环境必须由负责人完成 A100 和 K3s 验收，才能认定为受支持环境。
 
 ## 在 Linux amd64 上构建
@@ -138,5 +138,5 @@ GPU、网卡及 NCCL 环境。两侧共享的 rendezvous 地址必须指向可�
 
 并行启动两侧，重复生成和有序退出。预期跨 Pod 真实交换张量并释放资源。
 保存请求输出、通信日志、容器及 Pod 退出状态、终止后的 GPU 占用。
-host-network 成功不能替代跨 Pod 验证。这是原生验证；Foretoken 管理的
-AFD 生命周期和控制器部署不属于镜像交付范围。
+host-network 成功不能替代跨 Pod 验证。这是原生验证；Foretoken
+受管 AFD 生命周期验收见[运行时指南](afd-managed-runtime_zh.md)；控制器部署不属于本轮验证范围。

@@ -15,7 +15,7 @@ use foretoken_model_server::api::{AppState, RuntimeHealth, router};
 use foretoken_model_server::backend::VllmBackend;
 use foretoken_model_server::config::{MODEL_GROUP_UID_ENV, RuntimeConfig};
 use foretoken_model_server::kv_event_adapter::KvEventAdapter;
-use foretoken_model_server::launch::LaunchPlanV1;
+use foretoken_model_server::launch::LaunchPlan;
 use foretoken_model_server::managed_engine::ManagedEngine;
 use foretoken_model_server::preparation;
 use foretoken_model_server::profiling;
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Some("resolve") => {
-            let plan = LaunchPlanV1::parse(&required_env("FORETOKEN_VLLM_LAUNCH_PLAN")?)?;
+            let plan = LaunchPlan::parse(&required_env("FORETOKEN_VLLM_LAUNCH_PLAN")?)?;
             preparation::resolve(&plan).await?;
             return Ok(());
         }
@@ -123,7 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(EngineStartupFailure::PersistentCache { context, source }) => {
             // Distributed members restart together; a local retry would reuse stale peers.
-            if config.member.is_some() {
+            if config.member.is_some() || config.launch.afd.is_some() {
                 return Err(io::Error::new(source.kind(), format!("{context}: {source}")).into());
             }
             let cache = cache_config
@@ -163,6 +163,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(failure) => return Err(failure.into_error().into()),
     };
+    if config.launch.is_ffn() {
+        return run_ffn(&config, engine, client, &mut cache_server, cache_shutdown).await;
+    }
     let health = Arc::new(RuntimeHealth::new());
     health.set_process_alive(true);
 
@@ -267,16 +270,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(cache_config) = cache_config {
         app_state = app_state.with_runtime_cache(cache_config);
     }
+    let mut routes = router(
+        app_state,
+        config.launch.internal_generate_request_body_limit_bytes,
+    );
+    if let Some(afd) = &config.launch.afd {
+        routes = routes.merge(foretoken_model_server::afd::status_router(
+            afd.clone(),
+            health.clone(),
+        ));
+    }
     let mut server = Box::pin(
-        axum::serve(
-            listener,
-            router(
-                app_state,
-                config.launch.internal_generate_request_body_limit_bytes,
-            ),
-        )
-        .with_graceful_shutdown(async move { server_shutdown.notified().await })
-        .into_future(),
+        axum::serve(listener, routes)
+            .with_graceful_shutdown(async move { server_shutdown.notified().await })
+            .into_future(),
     );
 
     // Signals, client health, child exit, and server failure converge on one shutdown path.
@@ -297,6 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 unreachable!("EngineCore health only transitions to unhealthy")
             }
         },
+        reason = engine.wait_afd_failure() => Stop::ClientUnhealthy(reason),
         status = engine.wait_for_exit() => Stop::ChildExited(format!("managed EngineCore exited unexpectedly: {status}")),
         result = &mut server => Stop::Server(match result {
             Ok(()) => "HTTP server stopped unexpectedly".into(),
@@ -351,11 +359,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    if let Err(error) = backend.shutdown().await {
-        warn!(%error, "could not shut down EngineCore client cleanly");
-    }
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    engine.shutdown(remaining).await.map_err(io::Error::other)?;
+    shutdown_engine(&engine, deadline, backend.shutdown()).await?;
     health.set_process_alive(false);
     if let Some(profiler) = &mut profiler {
         profiler.engine_stopped("runtime terminated").await;
@@ -368,6 +372,95 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         | Stop::Server(reason)
         | Stop::CacheServer(reason)
         | Stop::Profiling(reason) => Err(std::io::Error::other(reason).into()),
+    }
+}
+
+/// Closes either role's client before its owned process group, preserving cleanup diagnostics.
+async fn shutdown_engine<E: std::fmt::Display>(
+    engine: &ManagedEngine,
+    deadline: Instant,
+    client_shutdown: impl std::future::Future<Output = Result<(), E>>,
+) -> io::Result<()> {
+    if let Err(error) = client_shutdown.await {
+        warn!(%error, "could not shut down EngineCore client cleanly");
+    }
+    engine
+        .shutdown(deadline.saturating_duration_since(Instant::now()))
+        .await
+        .map_err(io::Error::other)
+}
+
+/// Serves only FFN lifecycle observations while the upstream connector daemon owns execution.
+async fn run_ffn(
+    config: &RuntimeConfig,
+    engine: ManagedEngine,
+    client: EngineCoreClient,
+    cache_server: &mut Option<tokio::task::JoinHandle<io::Result<()>>>,
+    cache_shutdown: Arc<Notify>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use axum::{Router, http::StatusCode, routing::get};
+    let health = Arc::new(RuntimeHealth::new());
+    health.set_process_alive(true);
+    health.set_client_healthy(true);
+    let probe = health.clone();
+    let routes = Router::new()
+        .route("/healthz", get(move || async { StatusCode::OK }))
+        .route(
+            "/readyz",
+            get(move || {
+                let health = probe.clone();
+                async move {
+                    if health.ready() {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        )
+        .merge(foretoken_model_server::afd::status_router(
+            config.launch.afd.clone().expect("FFN requires AFD plan"),
+            health.clone(),
+        ));
+    let listener = match TcpListener::bind(config.listen_address).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            shutdown_engine(
+                &engine,
+                Instant::now() + config.launch.drain_timeout(),
+                client.shutdown(),
+            )
+            .await?;
+            return Err(error.into());
+        }
+    };
+    let shutdown = Arc::new(Notify::new());
+    let stopped = shutdown.clone();
+    let mut server = Box::pin(
+        axum::serve(listener, routes)
+            .with_graceful_shutdown(async move { stopped.notified().await })
+            .into_future(),
+    );
+    let mut client_health = client.subscribe_health();
+    let reason = tokio::select! {
+        () = shutdown_signal() => None,
+        status = engine.wait_for_exit() => Some(format!("FFN engine exited unexpectedly: {status}")),
+        reason = engine.wait_afd_failure() => Some(reason),
+        _ = async {
+            if *client_health.borrow() { let _ = client_health.changed().await; }
+        } => Some("FFN EngineCore became unhealthy".into()),
+        reason = wait_cache_server(cache_server) => Some(reason),
+        result = &mut server => Some(format!("FFN lifecycle server stopped: {result:?}")),
+    };
+    health.set_client_healthy(false);
+    shutdown.notify_waiters();
+    cache_shutdown.notify_waiters();
+    let deadline = Instant::now() + config.launch.drain_timeout();
+    shutdown_engine(&engine, deadline, client.shutdown()).await?;
+    health.set_process_alive(false);
+    match reason {
+        Some(reason) => Err(io::Error::other(reason).into()),
+        None => Ok(()),
     }
 }
 
@@ -514,6 +607,7 @@ async fn spawn_engine_attempt(
         })?;
     }
     if config.member.is_some()
+        || config.launch.afd.is_some()
         || config.launch.shared_prefix_lookup()
         || config.launch.ec.enabled()
         || config.launch.profiling.engine == profiling::Engine::Mctracer
@@ -533,6 +627,10 @@ async fn spawn_engine_attempt(
             "PYTHONPATH".into(),
             python_path.to_string_lossy().into_owned(),
         ));
+    }
+    if let Some(afd) = &config.launch.afd {
+        environment.push(("VLLM_USE_V2_MODEL_RUNNER".into(), "0".into()));
+        environment.push(("FORETOKEN_AFD_GROUP_UID".into(), afd.group_uid.clone()));
     }
     if config.launch.shared_prefix_lookup() {
         environment.push((
@@ -661,7 +759,7 @@ async fn spawn_engine_attempt(
     );
     command.envs(environment);
     let instrumentation = profiling.filter(|_| mode == runtime_cache::Mode::Persistent);
-    let engine = ManagedEngine::spawn(command, instrumentation)
+    let engine = ManagedEngine::spawn(command, instrumentation, config.launch.afd.is_some())
         .await
         .map_err(|error| {
             classify_engine_startup_failure(
@@ -719,12 +817,31 @@ async fn start_engine_attempt(
             Ok(client) => Ok(client),
             Err(error) => Err(classify_engine_startup_failure(cache, mode, format!("could not connect to EngineCore: {error}"))),
         },
+        () = shutdown_signal() => Err(EngineStartupFailure::Other(io::Error::new(io::ErrorKind::Interrupted, "engine startup cancelled"))),
         status = engine.wait_for_exit() => Err(classify_engine_startup_failure(cache, mode, format!("managed EngineCore exited during startup: {status}"))),
         reason = wait_cache_server(cache_server) => Err(EngineStartupFailure::Other(io::Error::other(format!("cache observation server stopped during startup: {reason}")))),
         error = wait_cache_write_failure(cache, mode) => Err(cache_mode_failure(mode, format!("{} cache became unwritable during EngineCore startup", mode.as_str()), error)),
     };
     match client {
-        Ok(client) => Ok((engine, client, prepared_tokenizer)),
+        Ok(client) => {
+            let result = tokio::select! {
+                result = engine.wait_afd_ready(config.launch.is_ffn()) => result,
+                () = tokio::time::sleep(startup_deadline.saturating_duration_since(Instant::now())) => Err("AFD readiness exceeded startup deadline".into()),
+                status = engine.wait_for_exit() => Err(format!("engine exited before AFD readiness: {status}")),
+                () = shutdown_signal() => Err("engine startup cancelled".into()),
+            };
+            if let Err(reason) = result {
+                shutdown_engine(
+                    &engine,
+                    Instant::now() + config.launch.drain_timeout(),
+                    client.shutdown(),
+                )
+                .await
+                .map_err(EngineStartupFailure::Other)?;
+                return Err(EngineStartupFailure::Other(io::Error::other(reason)));
+            }
+            Ok((engine, client, prepared_tokenizer))
+        }
         Err(error) => {
             // Failed cleanup must end this runtime, not start a temporary-cache retry beside the old engine.
             engine
@@ -819,7 +936,7 @@ fn kv_event_adapter(
 
 /// Publishes provider snapshots for the controller-owned preparation Job.
 async fn prepare_model() -> Result<(), Box<dyn std::error::Error>> {
-    let plan = LaunchPlanV1::parse(&required_env("FORETOKEN_VLLM_LAUNCH_PLAN")?)?;
+    let plan = LaunchPlan::parse(&required_env("FORETOKEN_VLLM_LAUNCH_PLAN")?)?;
     let model_root = foretoken_artifacts::model_root()
         .ok_or("FORETOKEN_MODEL_ROOT must be set for model preparation")?;
     let scope = required_env(preparation::PREPARATION_SCOPE_ENV)?;

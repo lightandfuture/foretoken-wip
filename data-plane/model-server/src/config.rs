@@ -5,7 +5,7 @@
 
 use std::net::SocketAddr;
 
-use crate::launch::LaunchPlanV1;
+use crate::launch::LaunchPlan;
 
 const LAUNCH_PLAN_ENV: &str = "FORETOKEN_VLLM_LAUNCH_PLAN";
 const LISTEN_ENV: &str = "FORETOKEN_INTERNAL_LISTEN";
@@ -14,7 +14,7 @@ pub const MODEL_GROUP_UID_ENV: &str = "FORETOKEN_MODEL_GROUP_UID";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
-    pub launch: LaunchPlanV1,
+    pub launch: LaunchPlan,
     pub listen_address: SocketAddr,
     pub member: Option<MemberContext>,
 }
@@ -46,15 +46,15 @@ impl RuntimeConfig {
     ///
     /// Startup receives an owned configuration; environment values are not retained after parsing.
     pub fn from_env() -> Result<Self, String> {
-        let launch = LaunchPlanV1::parse(&required_env(LAUNCH_PLAN_ENV)?)?;
+        let launch = LaunchPlan::parse(&required_env(LAUNCH_PLAN_ENV)?)?;
         let listen_address = required_env(LISTEN_ENV)?
             .parse()
             .map_err(|_| format!("{LISTEN_ENV} must be a socket address"))?;
-        let member = if launch.node_count > 1 {
+        let member = if launch.engine_node_count() > 1 {
             let index = required_env("LWS_WORKER_INDEX")?
                 .parse::<usize>()
                 .map_err(|_| "LWS_WORKER_INDEX must be a nonnegative integer".to_string())?;
-            if index >= launch.node_count {
+            if index >= launch.engine_node_count() {
                 return Err("LWS_WORKER_INDEX is outside the model group".into());
             }
             let address = required_env("FORETOKEN_MEMBER_IP")?
