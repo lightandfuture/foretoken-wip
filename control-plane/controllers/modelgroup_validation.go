@@ -24,8 +24,13 @@ func validateGroupProfile(group *inferencev1alpha1.ModelGroup) error {
 }
 
 func validateGroupRuntime(group *inferencev1alpha1.ModelGroup) error {
+	if rdma := group.Spec.RDMA; rdma != nil && (rdma.ResourceName == "" || rdma.ResourceCount < 1) {
+		return fmt.Errorf("RDMA allocation requires a resource name and positive count")
+	}
+
 	if group.Spec.AFD != nil {
-		return fmt.Errorf("AFD Group workloads are not supported by this controller")
+		_, err := afdMemberLaunchPlan(group, inferencev1alpha1.AFDAttention)
+		return err
 	}
 	if group.Spec.Runtime.SourceRevision != "" && group.Spec.Runtime.Backend != "vllm" {
 		return fmt.Errorf("source bundles support the vLLM model-server only")
@@ -47,9 +52,6 @@ func validateGroupRuntime(group *inferencev1alpha1.ModelGroup) error {
 	}
 	if group.Spec.Runtime.Backend != "vllm" {
 		return fmt.Errorf("inference backend %q is not supported", group.Spec.Runtime.Backend)
-	}
-	if rdma := group.Spec.RDMA; rdma != nil && (rdma.ResourceName == "" || rdma.ResourceCount < 1) {
-		return fmt.Errorf("RDMA allocation requires a resource name and positive count")
 	}
 	if group.Spec.PDRuntime != nil && group.Spec.PDRuntime.Protocol == "rdma" && group.Spec.RDMA == nil {
 		return fmt.Errorf("P/D Groups with RDMA transport require an RDMA allocation")

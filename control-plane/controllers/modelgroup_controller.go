@@ -61,6 +61,7 @@ const (
 // ModelGroupReconciler owns the Kubernetes workload for one execution Group.
 type ModelGroupReconciler struct {
 	client.Client
+	APIReader             client.Reader
 	DrainClient           ModelGroupDrainClient
 	Now                   func() time.Time
 	ControlPlaneNamespace string
@@ -72,6 +73,7 @@ type ModelGroupReconciler struct {
 
 // SetupWithManager registers the ModelGroup controller and its owned resources.
 func (reconciler *ModelGroupReconciler) SetupWithManager(manager ctrl.Manager) error {
+	reconciler.APIReader = manager.GetAPIReader()
 	builder := ctrl.NewControllerManagedBy(manager).
 		For(&inferencev1alpha1.ModelGroup{}).
 		Owns(&batchv1.Job{}).
@@ -90,7 +92,7 @@ func (reconciler *ModelGroupReconciler) SetupWithManager(manager ctrl.Manager) e
 }
 
 // modelGroupsForPod requeues the execution Group when a member Pod changes.
-// Workload controllers, rather than ModelGroups, directly own the Pods.
+// AFD members are directly owned; ordinary members retain Deployment/LWS ownership.
 func (reconciler *ModelGroupReconciler) modelGroupsForPod(_ context.Context, object client.Object) []reconcile.Request {
 	groupName := object.GetLabels()[modelGroupLabel]
 	if groupName == "" {
@@ -152,6 +154,10 @@ func (reconciler *ModelGroupReconciler) Reconcile(ctx context.Context, request c
 		return ctrl.Result{Requeue: true}, nil
 	}
 
+	if group.Spec.AFD != nil {
+		return reconciler.reconcileAFD(ctx, group)
+	}
+
 	available, err := reconciler.reconcileWorkload(ctx, group)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -194,7 +200,7 @@ func (reconciler *ModelGroupReconciler) owningModelPool(ctx context.Context, gro
 func (reconciler *ModelGroupReconciler) reconcilePreparation(ctx context.Context, group *inferencev1alpha1.ModelGroup, pool *inferencev1alpha1.ModelPool) (bool, error) {
 	// Existing cohorts retain their acquisition contract until the Pool replaces them.
 	// Once materialized, the serving runtime owns cache recovery.
-	if group.Spec.Runtime.PreparationVersion == 0 || meta.IsStatusConditionTrue(group.Status.Conditions, conditionWorkloadMaterialized) {
+	if group.Spec.Runtime.PreparationVersion == 0 || len(group.Status.AFDMembers) > 0 || meta.IsStatusConditionTrue(group.Status.Conditions, conditionWorkloadMaterialized) {
 		return true, nil
 	}
 	if group.Spec.Artifacts.Source == inferencev1alpha1.ModelSourceLocal {
@@ -260,7 +266,7 @@ func groupApplicationURL(group *inferencev1alpha1.ModelGroup, files runtimeconfi
 
 // desiredPreparationJob builds a CPU/network/storage-only source preparation workload.
 func desiredPreparationJob(group *inferencev1alpha1.ModelGroup, imagePullSecrets []corev1.LocalObjectReference, distribution runtimeconfig.ModelDistributionProfile, files runtimeconfig.ApplicationFiles) (*batchv1.Job, error) {
-	launchPlan, err := vllmconfig.BuildLaunchPlan(group.Spec)
+	launchPlan, err := modelPreparationLaunchPlan(group)
 	if err != nil {
 		return nil, fmt.Errorf("build model preparation launch plan: %w", err)
 	}
@@ -386,6 +392,9 @@ func (reconciler *ModelGroupReconciler) reconcileDeployment(ctx context.Context,
 
 func modelGroupLabels(group *inferencev1alpha1.ModelGroup) map[string]string {
 	labels := map[string]string{modelGroupLabel: group.Name, modelGroupRoleLabel: string(group.Spec.Role)}
+	if group.Spec.AFD != nil {
+		labels[modelGroupUIDLabel] = string(group.UID)
+	}
 	if group.Spec.PDRuntime != nil {
 		labels[modelGroupPDPipelineScopeLabel] = pdPipelineScopeID(group)
 	}
@@ -422,6 +431,24 @@ func desiredDeployment(group *inferencev1alpha1.ModelGroup, imagePullSecrets []c
 	default:
 		return nil, fmt.Errorf("unsupported inference backend %q", group.Spec.Runtime.Backend)
 	}
+	template, err := desiredModelServerTemplate(group, group.Spec.Resources, imagePullSecrets, files, launchJSON, launchEnv, command, startupSeconds, drainSeconds)
+	if err != nil {
+		return nil, err
+	}
+	one, history, deadline := int32(1), int32(10), int32(startupSeconds)
+	return &appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{Name: group.Name, Namespace: group.Namespace, Labels: modelGroupLabels(group)},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &one, RevisionHistoryLimit: &history, ProgressDeadlineSeconds: &deadline,
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
+			Selector: &metav1.LabelSelector{MatchLabels: modelGroupLabels(group)}, Template: *template,
+		},
+	}, nil
+}
+
+// desiredModelServerTemplate shares image, storage, devices and process lifecycle across workload owners.
+func desiredModelServerTemplate(group *inferencev1alpha1.ModelGroup, resources *inferencev1alpha1.ModelResources, imagePullSecrets []corev1.LocalObjectReference, files runtimeconfig.ApplicationFiles, launchJSON, launchEnv, command string, startupSeconds, drainSeconds int64) (*corev1.PodTemplateSpec, error) {
 	labels := modelGroupLabels(group)
 	var annotations map[string]string
 	if group.Spec.Network != "" {
@@ -433,9 +460,6 @@ func desiredDeployment(group *inferencev1alpha1.ModelGroup, imagePullSecrets []c
 		}
 		annotations[runtimeconfig.SourceRevisionAnnotation] = group.Spec.Runtime.SourceRevision
 	}
-	replicas := int32(1)
-	revisionHistoryLimit := int32(10)
-	progressDeadlineSeconds := int32(startupSeconds)
 	automountToken := false
 	enableServiceLinks := true
 	allowPrivilegeEscalation := false
@@ -486,20 +510,20 @@ func desiredDeployment(group *inferencev1alpha1.ModelGroup, imagePullSecrets []c
 	}
 
 	requests := corev1.ResourceList{
-		corev1.ResourceCPU:    resource.MustParse(string(group.Spec.Resources.Requests.CPU)),
-		corev1.ResourceMemory: resource.MustParse(string(group.Spec.Resources.Requests.Memory)),
+		corev1.ResourceCPU:    resource.MustParse(string(resources.Requests.CPU)),
+		corev1.ResourceMemory: resource.MustParse(string(resources.Requests.Memory)),
 	}
 	limits := corev1.ResourceList{}
-	if group.Spec.Resources.Limits != nil {
-		if group.Spec.Resources.Limits.CPU != nil {
-			limits[corev1.ResourceCPU] = resource.MustParse(string(*group.Spec.Resources.Limits.CPU))
+	if resources.Limits != nil {
+		if resources.Limits.CPU != nil {
+			limits[corev1.ResourceCPU] = resource.MustParse(string(*resources.Limits.CPU))
 		}
-		if group.Spec.Resources.Limits.Memory != nil {
-			limits[corev1.ResourceMemory] = resource.MustParse(string(*group.Spec.Resources.Limits.Memory))
+		if resources.Limits.Memory != nil {
+			limits[corev1.ResourceMemory] = resource.MustParse(string(*resources.Limits.Memory))
 		}
 	}
 	deviceResource := corev1.ResourceName(group.Spec.Accelerator.DeviceResourceName)
-	deviceCount := *resource.NewQuantity(int64(group.Spec.Resources.Requests.GPU.Count), resource.DecimalSI)
+	deviceCount := *resource.NewQuantity(int64(resources.Requests.GPU.Count), resource.DecimalSI)
 	requests[deviceResource] = deviceCount
 	limits[deviceResource] = deviceCount
 	if rdma := group.Spec.RDMA; rdma != nil {
@@ -549,61 +573,50 @@ func desiredDeployment(group *inferencev1alpha1.ModelGroup, imagePullSecrets []c
 		runtimeClassName = &group.Spec.Accelerator.RuntimeClassName
 	}
 
-	deployment := &appsv1.Deployment{
-		TypeMeta:   metav1.TypeMeta{APIVersion: appsv1.SchemeGroupVersion.String(), Kind: "Deployment"},
-		ObjectMeta: metav1.ObjectMeta{Name: group.Name, Namespace: group.Namespace, Labels: labels},
-		Spec: appsv1.DeploymentSpec{
-			Replicas:                &replicas,
-			RevisionHistoryLimit:    &revisionHistoryLimit,
-			ProgressDeadlineSeconds: &progressDeadlineSeconds,
-			Strategy:                appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
-			Selector:                &metav1.LabelSelector{MatchLabels: labels},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: maps.Clone(labels), Annotations: annotations},
-				Spec: corev1.PodSpec{
-					AutomountServiceAccountToken:  &automountToken,
-					EnableServiceLinks:            &enableServiceLinks,
-					ImagePullSecrets:              slices.Clone(imagePullSecrets),
-					RestartPolicy:                 corev1.RestartPolicyAlways,
-					DNSPolicy:                     corev1.DNSClusterFirst,
-					SchedulerName:                 corev1.DefaultSchedulerName,
-					RuntimeClassName:              runtimeClassName,
-					NodeSelector:                  maps.Clone(group.Spec.Accelerator.NodeSelector),
-					Tolerations:                   acceleratorTolerations(group.Spec.Accelerator.DeviceResourceName),
-					TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
-					SecurityContext:               runtimeCachePodSecurityContext(group.Spec.Artifacts.Cache),
-					InitContainers:                runtimeCacheInitContainers(group.Spec.Runtime.Image, group.Spec.Artifacts.Cache),
-					Volumes:                       volumes,
-					Containers: []corev1.Container{{
-						Name:            "model-server",
-						Image:           group.Spec.Runtime.Image,
-						ImagePullPolicy: corev1.PullIfNotPresent,
-						Command:         []string{command},
-						Args:            []string{},
-						Ports:           ports,
-						Env:             env,
-						VolumeMounts:    mounts,
-						SecurityContext: &corev1.SecurityContext{
-							AllowPrivilegeEscalation: &allowPrivilegeEscalation,
-							Capabilities:             capabilities,
-						},
-						StartupProbe:             modelServerProbe("/readyz", 10, startupFailureThreshold),
-						LivenessProbe:            modelServerProbe("/healthz", 10, 3),
-						ReadinessProbe:           modelServerProbe("/readyz", 5, 3),
-						TerminationMessagePath:   corev1.TerminationMessagePathDefault,
-						TerminationMessagePolicy: corev1.TerminationMessageReadFile,
-						Resources:                corev1.ResourceRequirements{Requests: requests, Limits: limits},
-					}},
+	template := &corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{Labels: maps.Clone(labels), Annotations: annotations},
+		Spec: corev1.PodSpec{
+			AutomountServiceAccountToken:  &automountToken,
+			EnableServiceLinks:            &enableServiceLinks,
+			ImagePullSecrets:              slices.Clone(imagePullSecrets),
+			RestartPolicy:                 corev1.RestartPolicyAlways,
+			DNSPolicy:                     corev1.DNSClusterFirst,
+			SchedulerName:                 corev1.DefaultSchedulerName,
+			RuntimeClassName:              runtimeClassName,
+			NodeSelector:                  maps.Clone(group.Spec.Accelerator.NodeSelector),
+			Tolerations:                   acceleratorTolerations(group.Spec.Accelerator.DeviceResourceName),
+			TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
+			SecurityContext:               runtimeCachePodSecurityContext(group.Spec.Artifacts.Cache),
+			InitContainers:                runtimeCacheInitContainers(group.Spec.Runtime.Image, group.Spec.Artifacts.Cache),
+			Volumes:                       volumes,
+			Containers: []corev1.Container{{
+				Name:            "model-server",
+				Image:           group.Spec.Runtime.Image,
+				ImagePullPolicy: corev1.PullIfNotPresent,
+				Command:         []string{command},
+				Args:            []string{},
+				Ports:           ports,
+				Env:             env,
+				VolumeMounts:    mounts,
+				SecurityContext: &corev1.SecurityContext{
+					AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+					Capabilities:             capabilities,
 				},
-			},
+				StartupProbe:             modelServerProbe("/readyz", 10, startupFailureThreshold),
+				LivenessProbe:            modelServerProbe("/healthz", 10, 3),
+				ReadinessProbe:           modelServerProbe("/readyz", 5, 3),
+				TerminationMessagePath:   corev1.TerminationMessagePathDefault,
+				TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+				Resources:                corev1.ResourceRequirements{Requests: requests, Limits: limits},
+			}},
 		},
 	}
-	files.Configure(&deployment.Spec.Template, &deployment.Spec.Template.Spec.Containers[0], groupApplicationURL(group, files), command)
-	mountPreparationSource(group, &deployment.Spec.Template)
-	if err := configureWeightSources(group.Spec, &deployment.Spec.Template); err != nil {
+	files.Configure(template, &template.Spec.Containers[0], groupApplicationURL(group, files), command)
+	mountPreparationSource(group, template)
+	if err := configureWeightSources(group.Spec, template); err != nil {
 		return nil, err
 	}
-	return deployment, nil
+	return template, nil
 }
 
 func dns1035NamePart(value string) string {
@@ -740,7 +753,7 @@ func (reconciler *ModelGroupReconciler) reconcileNetworkPolicy(ctx context.Conte
 		}}
 		ingress = append(ingress, preparationIngress...)
 	}
-	if group.Spec.NodeCount > 1 {
+	if group.Spec.NodeCount > 1 || group.Spec.AFD != nil {
 		// EngineCore and collectives allocate additional ports during the group handshake.
 		ingress = append(ingress, networkingv1.NetworkPolicyIngressRule{From: []networkingv1.NetworkPolicyPeer{{
 			PodSelector: &metav1.LabelSelector{MatchLabels: labels},
@@ -825,6 +838,7 @@ type modelGroupStatusState struct {
 	phase        inferencev1alpha1.ModelGroupPhase
 	preparation  modelGroupConditionState
 	materialized modelGroupConditionState
+	unavailable  *modelGroupConditionState
 	available    bool
 	scheduling   schedulingCapacityState
 }
@@ -938,7 +952,11 @@ func (reconciler *ModelGroupReconciler) updateStatus(ctx context.Context, group 
 	meta.SetStatusCondition(&group.Status.Conditions, metav1.Condition{Type: conditionModelPreparation, Status: state.preparation.status, Reason: state.preparation.reason, Message: state.preparation.message, ObservedGeneration: group.Generation})
 	meta.SetStatusCondition(&group.Status.Conditions, metav1.Condition{Type: conditionWorkloadMaterialized, Status: state.materialized.status, Reason: state.materialized.reason, Message: state.materialized.message, ObservedGeneration: group.Generation})
 	meta.SetStatusCondition(&group.Status.Conditions, metav1.Condition{Type: conditionSchedulingCapacity, Status: state.scheduling.status, Reason: state.scheduling.reason, Message: state.scheduling.message, ObservedGeneration: group.Generation})
-	meta.SetStatusCondition(&group.Status.Conditions, metav1.Condition{Type: conditionWorkloadAvailable, Status: conditionStatus(state.available), Reason: availabilityReason(state.available), Message: availabilityMessage(state.available), ObservedGeneration: group.Generation})
+	availability := modelGroupConditionState{status: conditionStatus(state.available), reason: availabilityReason(state.available), message: availabilityMessage(state.available)}
+	if state.unavailable != nil {
+		availability = *state.unavailable
+	}
+	meta.SetStatusCondition(&group.Status.Conditions, metav1.Condition{Type: conditionWorkloadAvailable, Status: availability.status, Reason: availability.reason, Message: availability.message, ObservedGeneration: group.Generation})
 	meta.SetStatusCondition(&group.Status.Conditions, metav1.Condition{Type: conditionReady, Status: conditionStatus(state.available), Reason: availabilityReason(state.available), Message: readinessMessage(state.available), ObservedGeneration: group.Generation})
 	if reflect.DeepEqual(base.Status, group.Status) {
 		return nil

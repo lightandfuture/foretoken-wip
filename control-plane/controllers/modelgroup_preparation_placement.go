@@ -22,11 +22,17 @@ func (reconciler *ModelGroupReconciler) preparationNodeAffinity(ctx context.Cont
 	if err := reconciler.List(ctx, &nodes, client.MatchingLabels(group.Spec.Accelerator.NodeSelector)); err != nil {
 		return nil, fmt.Errorf("list accelerator nodes for model preparation: %w", err)
 	}
+	gpuCount := int32(0)
+	if group.Spec.AFD != nil {
+		gpuCount = max(group.Spec.AFD.Attention.Resources.Requests.GPU.Count, group.Spec.AFD.FFN.Resources.Requests.GPU.Count)
+	} else {
+		gpuCount = group.Spec.Resources.Requests.GPU.Count
+	}
 	resourceName := corev1.ResourceName(group.Spec.Accelerator.DeviceResourceName)
 	var terms []corev1.NodeSelectorTerm
 	for _, node := range nodes.Items {
 		allocatable := node.Status.Allocatable[resourceName]
-		if node.Spec.Unschedulable || allocatable.Value() < int64(group.Spec.Resources.Requests.GPU.Count) {
+		if node.Spec.Unschedulable || allocatable.Value() < int64(gpuCount) {
 			continue
 		}
 		ready := false

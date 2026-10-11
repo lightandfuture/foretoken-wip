@@ -385,6 +385,7 @@ rules:
     resources:
       - pods
     verbs:
+      - create
       - get
       - list
       - watch

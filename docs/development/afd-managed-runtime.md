@@ -7,7 +7,8 @@ English | [简体中文](afd-managed-runtime_zh.md)
 
 The model-server consumes private V2 plans for a local, synchronous CUDA 1A1F
 pair. This is a runtime implementation, pending owner-executed OCI and A100
-acceptance; it does not provide Kubernetes AFD deployment or recovery.
+acceptance; [Group materialization](afd-group-workload.md) adds fixed Pods and discovery,
+while serving publication and whole-Group recovery remain outstanding.
 Build the [fixed candidate image](afd-runtime.md) from the runtime source commit.
 
 ## Plan and process ownership

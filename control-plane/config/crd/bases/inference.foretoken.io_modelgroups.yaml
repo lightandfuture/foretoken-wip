@@ -967,6 +967,38 @@ spec:
           status:
             description: ModelGroupStatus defines the observed state of a ModelGroup.
             properties:
+              afdMembers:
+                description: AFDMembers records only members actually persisted by
+                  the API server.
+                items:
+                  description: |-
+                    ModelGroupAFDMemberStatus retains Pod identity and termination evidence across reconciliation.
+                    The Group controller consumes it to prevent member replacement and premature cleanup.
+                  properties:
+                    failureMessage:
+                      type: string
+                    failureReason:
+                      description: FailureReason is latched for the lifetime of this
+                        member's communication domain.
+                      type: string
+                    podUID:
+                      type: string
+                    role:
+                      description: AFDExecutionRole identifies a member inside an
+                        aggregate Group, not a service role.
+                      type: string
+                    terminationConfirmed:
+                      description: TerminationConfirmed records observed termination,
+                        never inferred from a missing Pod.
+                      type: boolean
+                  required:
+                  - podUID
+                  - role
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - role
+                x-kubernetes-list-type: map
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

@@ -117,6 +117,10 @@ func (reconciler *ModelGroupReconciler) reconcileDelete(ctx context.Context, gro
 		return ctrl.Result{}, nil
 	}
 
+	if group.Spec.AFD != nil {
+		return reconciler.reconcileAFDDelete(ctx, group)
+	}
+
 	now := reconciler.now()
 	if group.Status.DrainStartedAt == nil {
 		started := metav1.NewTime(now)

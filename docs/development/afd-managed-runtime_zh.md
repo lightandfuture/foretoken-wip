@@ -6,7 +6,8 @@
 [English](afd-managed-runtime.md) | 简体中文
 
 model-server 可消费私有 V2 plan，启动本机同步 CUDA 1A1F。当前实现仍待负责人
-执行 OCI 构建和 A100 验收，不提供 Kubernetes AFD 部署或恢复。使用运行时源码
+执行 OCI 构建和 A100 验收。[Group 物化](afd-group-workload_zh.md) 提供固定 Pod 和发现，
+服务发布与整组恢复仍待实现。使用运行时源码
 提交构建[固定候选镜像](afd-runtime_zh.md)。
 
 ## 启动契约与生命周期

@@ -322,8 +322,29 @@ const (
 	ModelGroupPhaseTerminating  ModelGroupPhase = "Terminating"
 )
 
+// ModelGroupAFDMemberStatus retains Pod identity and termination evidence across reconciliation.
+// The Group controller consumes it to prevent member replacement and premature cleanup.
+type ModelGroupAFDMemberStatus struct {
+	Role   AFDExecutionRole `json:"role"`
+	PodUID string           `json:"podUID"`
+	// TerminationConfirmed records observed termination, never inferred from a missing Pod.
+	// +optional
+	TerminationConfirmed bool `json:"terminationConfirmed,omitempty"`
+	// FailureReason is latched for the lifetime of this member's communication domain.
+	// +optional
+	FailureReason string `json:"failureReason,omitempty"`
+	// +optional
+	FailureMessage string `json:"failureMessage,omitempty"`
+}
+
 // ModelGroupStatus defines the observed state of a ModelGroup.
 type ModelGroupStatus struct {
+	// AFDMembers records only members actually persisted by the API server.
+	// +optional
+	// +listType=map
+	// +listMapKey=role
+	AFDMembers []ModelGroupAFDMemberStatus `json:"afdMembers,omitempty"`
+
 	// +optional
 	Phase ModelGroupPhase `json:"phase,omitempty"`
 
