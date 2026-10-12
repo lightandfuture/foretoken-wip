@@ -77,6 +77,8 @@ foretoken deploy examples/quickstart --timeout 20m
 
 该示例部署一个前端服务和一个 `Qwen/Qwen3-0.6B` 模型副本。模型请求 1 张 GPU、4 个 CPU 和 48 GiB 内存，资源上限为 8 个 CPU 和 64 GiB。示例使用仓库根目录的 `./data` 目录保存模型文件和运行时缓存。更多部署配置见 [`examples/`](examples/)。
 
+Attention/FFN 分离见 [DeepSeek-V2-Lite 候选示例](examples/attention-ffn/README_zh.md)，其中明确列出尚未验证的部署与生命周期边界。
+
 ### 4. 发送测试请求
 
 ```bash

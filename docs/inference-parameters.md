@@ -72,6 +72,11 @@ With EP enabled, attention can use TP × DP while routed experts span the corres
 
 ### Attention/FFN Pool configuration
 
+Start with the [DeepSeek-V2-Lite candidate example](../examples/attention-ffn/README.md)
+for installation, immutable model preparation, 1A1F/2A2F layouts and the
+request-to-deletion path. It includes [acceptance status](development/afd-acceptance.md),
+not a verified support matrix.
+
 For an aggregate vLLM Pool, `modelPools[].afd` contains `attention` and `ffn` roles. Each role specifies `nodes`, per-member `resources`, and `parallelism.dp`/`parallelism.tp`; its node count × GPUs per member must equal DP × TP. The Pool's `replicas` counts complete Attention/FFN Groups. A Pool with `afd` cannot also set ordinary Pool-level `nodes` or `resources`, and its engine arguments cannot override the role topology or `additional-config.afd`.
 
 The CUDA AFD profile supports multiple members and GPUs per member: local GPUs must divide TP or be divisible by TP, and Attention DP × TP must be at least FFN DP × TP. Same-role members spread across nodes; cross-role co-location is a preference. All members must be ready before Attention member zero serves generation. A persistent cache for multiple members must be ReadWriteMany and reachable on all selected nodes. AFD requires the matching platform image/profile; RDMA-dependent expansion and automatic whole-Group recovery remain incomplete. See [AFD workload boundaries](development/afd-group-workload.md); real GPU/Kubernetes acceptance remains outstanding.

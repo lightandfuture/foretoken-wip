@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
+
+apiVersion: inference.foretoken.io/v1alpha1
+kind: ModelService
+metadata:
+  name: deepseek-v2-lite
+spec:
+  # Populate the shared model root with an owner-recorded immutable snapshot first.
+  model: deepseek-ai/DeepSeek-V2-Lite
+  source: local
+  backend: vllm
+  timeouts:
+    startup: 20m
+    drain: 2m
+  engineArgs:
+    dtype: bfloat16
+    max-model-len: 2048
+  modelPools:
+    - name: afd
+      replicas: 1 # Complete AF Groups, not individual A/F members.
+      nodeSelector:
+        workload-group: afd-single
+      afd:
+        attention:
+          nodes: 1
+          resources:
+            requests:
+              cpu: "4"
+              memory: 48Gi
+              gpu:
+                count: 1
+          parallelism:
+            dp: 1
+            tp: 1
+        ffn:
+          nodes: 1
+          resources:
+            requests:
+              cpu: "4"
+              memory: 48Gi
+              gpu:
+                count: 1
+          parallelism:
+            dp: 1
+            tp: 1

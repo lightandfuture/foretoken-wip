@@ -72,6 +72,10 @@ P/D 和 E/P/D 各 Pool 可以在模型和引擎支持的组合内分别配置并
 
 ### Attention/FFN Pool 配置
 
+从 [DeepSeek-V2-Lite 候选示例](../examples/attention-ffn/README_zh.md)开始，
+按安装、不可变模型准备、1A1F/2A2F 布局、请求到删除的路径操作。
+其中的[验收状态](development/afd-acceptance_zh.md)不是已验证支持矩阵。
+
 Aggregate vLLM Pool 的 `modelPools[].afd` 包含 `attention` 和 `ffn` 两侧。每侧分别填写 `nodes`、每成员 `resources` 和 `parallelism.dp`／`parallelism.tp`；节点数 × 每成员 GPU 数须等于 DP × TP。Pool 的 `replicas` 表示完整 Attention/FFN Group 的数量。填写 `afd` 后，不再填写 Pool 顶层的 `nodes` 或 `resources`，也不能用引擎参数覆盖角色拓扑或 `additional-config.afd`。
 
 CUDA AFD profile 支持多成员及每成员多 GPU：每成员 GPU 数必须整除 TP 或被 TP 整除，Attention 的 DP × TP 不小于 FFN。同角色跨节点分散，跨角色同机只是偏好。完整成员全部就绪后，仅 Attention 成员零提供生成。多成员持久缓存须为 ReadWriteMany 且在所有选中节点可达。AFD 需要匹配的平台镜像/profile；依赖 RDMA 的扩展和自动整组恢复仍未闭环。参见 [AFD 工作负载边界](development/afd-group-workload_zh.md)，真实 GPU/Kubernetes 验收仍未完成。

@@ -77,6 +77,8 @@ foretoken deploy examples/quickstart --timeout 20m
 
 This example deploys one frontend service and one `Qwen/Qwen3-0.6B` model replica. The model requests 1 GPU, 4 CPU, and 48 GiB memory, with limits of 8 CPU and 64 GiB. The example uses the repository-root `./data` directory for model files and runtime cache. More deployments are available in [`examples/`](examples/).
 
+For Attention/FFN disaggregation, see the [DeepSeek-V2-Lite candidate example](examples/attention-ffn/README.md), including its unverified deployment and lifecycle boundaries.
+
 ### 4. Send a test request
 
 ```bash

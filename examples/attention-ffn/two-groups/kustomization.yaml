@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../base
+patches:
+  - target:
+      kind: ModelService
+      name: deepseek-v2-lite
+    patch: |-
+      - op: replace
+        path: /spec/modelPools/0/nodeSelector/workload-group
+        value: afd-pair
+      - op: replace
+        path: /spec/modelPools/0/replicas
+        value: 2
