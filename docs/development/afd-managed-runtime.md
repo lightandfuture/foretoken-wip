@@ -7,9 +7,9 @@ English | [简体中文](afd-managed-runtime_zh.md)
 
 The model-server consumes private V2 plans for synchronous CUDA AFD roles across
 multiple members or GPUs per member. OCI and A100 acceptance remain owner-executed.
-[Group materialization](afd-group-workload.md) still supports single-GPU 1A1F only;
-multi-member discovery, placement and complete-set publication remain controller
-work. Whole-Group recovery is incomplete. Build the [fixed image](afd-runtime.md).
+[Group materialization](afd-group-workload.md) owns multi-member discovery,
+role-scoped placement and complete-set publication. Whole-Group recovery remains
+incomplete. Build the [fixed image](afd-runtime.md).
 
 ## Plan and process ownership
 
@@ -28,10 +28,10 @@ including dynamic transport ports. Roles sharing a network namespace need distin
 role ports. Neither endpoint may balance across other members or Groups.
 Single-member plans omit coordination and retain native local coordination.
 
-BuildAFDLaunchPlan is the actual Go projection boundary. The Pool compiler and
-Group workload owner still reject multi-member and multi-GPU materialization.
-Direct projection does not establish ModelService-to-multiple-Pod deployment.
-No public API or CRD field is added.
+BuildAFDLaunchPlan is the Go projection boundary used by the Group workload owner
+for every role/index position. The compiler accepts the topology below; the
+controller checks persistent-cache access modes and observes the complete member set.
+Runtime V2 fields are unchanged; controller status keys members by role/index.
 
 Each role satisfies memberCount × GPUs per member = DP × TP. Local GPUs must divide
 TP or be divisible by TP, matching the fixed native homogeneous placement. Attention

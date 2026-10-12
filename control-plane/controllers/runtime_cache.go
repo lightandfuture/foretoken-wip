@@ -21,6 +21,7 @@ import (
 const (
 	runtimeCacheVolumeName         = "runtime-cache"
 	runtimeCacheClaimEnv           = "FORETOKEN_RUNTIME_CACHE_CLAIM"
+	runtimeCacheClaimLabel         = "inference.foretoken.io/runtime-cache-claim"
 	runtimeCacheFSGroup      int64 = 1000
 	directoryOwnerAnnotation       = "inference.foretoken.io/directory-owner"
 )
@@ -97,18 +98,17 @@ func placeRuntimeCache(ctx context.Context, reader client.Reader, namespace stri
 			return nil
 		}
 	}
-	const claimLabel = "inference.foretoken.io/runtime-cache-claim"
 	if pod.Labels == nil {
 		pod.Labels = make(map[string]string)
 	}
-	pod.Labels[claimLabel] = string(claim.UID)
+	pod.Labels[runtimeCacheClaimLabel] = string(claim.UID)
 	if pod.Spec.Affinity == nil {
 		pod.Spec.Affinity = &corev1.Affinity{}
 	}
 	pod.Spec.Affinity.PodAffinity = &corev1.PodAffinity{
 		RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
 			TopologyKey:   corev1.LabelHostname,
-			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{claimLabel: string(claim.UID)}},
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{runtimeCacheClaimLabel: string(claim.UID)}},
 		}},
 	}
 	return nil

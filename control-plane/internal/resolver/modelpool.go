@@ -476,6 +476,15 @@ func copyInt32(value *int32) *int32 {
 // resolveAFDPool selects the platform CUDA environment and stores static transport state.
 // Member identity and rendezvous addresses are supplied later by Group materialization.
 func resolveAFDPool(template inferencev1alpha1.NormalizedPoolTemplate, profile RuntimeProfile) (ModelGroupTemplate, error) {
+	// Expanded AFD profiles require the role resource projection to be complete.
+	// Do not silently discard an RDMA allocation while enabling a new topology.
+	if profile.RDMA != nil {
+		for _, side := range []inferencev1alpha1.AFDMemberSpec{template.AFD.Attention, template.AFD.FFN} {
+			if side.MemberCount > 1 || side.Resources.Requests.GPU.Count > 1 {
+				return ModelGroupTemplate{}, fmt.Errorf("multi-member or multi-GPU AFD with an RDMA runtime profile is unsupported: AFD RDMA allocation projection is incomplete")
+			}
+		}
+	}
 	if profile.AFD == nil || profile.AFD.Port < 1 || profile.AFD.Port > 65535 {
 		return ModelGroupTemplate{}, fmt.Errorf("CUDA AFD runtime profile requires a connector port")
 	}

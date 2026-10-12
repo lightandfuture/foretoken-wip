@@ -981,6 +981,13 @@ spec:
                       description: FailureReason is latched for the lifetime of this
                         member's communication domain.
                       type: string
+                    memberIndex:
+                      default: 0
+                      description: MemberIndex identifies a member within its role;
+                        existing single members default to zero.
+                      format: int32
+                      minimum: 0
+                      type: integer
                     podUID:
                       type: string
                     role:
@@ -992,12 +999,14 @@ spec:
                         never inferred from a missing Pod.
                       type: boolean
                   required:
+                  - memberIndex
                   - podUID
                   - role
                   type: object
                 type: array
                 x-kubernetes-list-map-keys:
                 - role
+                - memberIndex
                 x-kubernetes-list-type: map
               conditions:
                 items:

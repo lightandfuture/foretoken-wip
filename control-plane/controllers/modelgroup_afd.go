@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strconv"
 	"time"
 
 	inferencev1alpha1 "github.com/shiweijiezero/foretoken/control-plane/api/v1alpha1"
+	"github.com/shiweijiezero/foretoken/control-plane/internal/runtimeconfig"
 	vllmconfig "github.com/shiweijiezero/foretoken/control-plane/internal/vllm"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -27,38 +29,81 @@ const (
 	afdMemberFinalizer    = "inference.foretoken.io/afd-member"
 )
 
-func afdMemberName(group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole) string {
-	return "afd-" + string(group.UID) + "-" + string(role) + "-0"
+// afdMemberIdentity is one expected role-local position in the immutable Group topology.
+type afdMemberIdentity struct {
+	role  inferencev1alpha1.AFDExecutionRole
+	index int32
+	count int32
 }
 
-func afdRendezvousName(group *inferencev1alpha1.ModelGroup) string {
-	return "afd-" + string(group.UID) + "-f0"
-}
-
-// afdMemberLaunchPlan supplies the persisted Group identity and F0 DNS name to the V2 adapter.
-func afdMemberLaunchPlan(group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole) (vllmconfig.LaunchPlan, error) {
-	for _, side := range []inferencev1alpha1.AFDMemberSpec{group.Spec.AFD.Attention, group.Spec.AFD.FFN} {
-		if side.MemberCount != 1 || side.Resources.Requests.GPU.Count != 1 {
-			return vllmconfig.LaunchPlan{}, fmt.Errorf("AFD workload materialization currently requires one single-GPU member per role")
+// afdMembers enumerates the complete domain in Attention-then-FFN shutdown order.
+func afdMembers(group *inferencev1alpha1.ModelGroup) []afdMemberIdentity {
+	var members []afdMemberIdentity
+	for _, role := range []inferencev1alpha1.AFDExecutionRole{inferencev1alpha1.AFDAttention, inferencev1alpha1.AFDFFN} {
+		count := afdRoleSpec(group, role).MemberCount
+		for index := int32(0); index < count; index++ {
+			members = append(members, afdMemberIdentity{role, index, count})
 		}
 	}
+	return members
+}
+
+func afdRoleSpec(group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole) inferencev1alpha1.AFDMemberSpec {
+	if role == inferencev1alpha1.AFDAttention {
+		return group.Spec.AFD.Attention
+	}
+	return group.Spec.AFD.FFN
+}
+
+func afdMemberName(group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole, index int32) string {
+	return "afd-" + string(group.UID) + "-" + string(role) + "-" + strconv.Itoa(int(index))
+}
+
+func afdDiscoveryName(group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole) string {
+	suffix := "f0"
+	if role == inferencev1alpha1.AFDAttention {
+		suffix = "a0"
+	}
+	return "afd-" + string(group.UID) + "-" + suffix
+}
+
+// afdRoleCoordination assigns private ports at materialization, separate from shared F0.
+// All members derive the same endpoint without writing addresses into immutable spec.
+func afdRoleCoordination(group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole) *vllmconfig.AFDCoordination {
+	if afdRoleSpec(group, role).MemberCount == 1 {
+		return nil
+	}
+	ports := make([]int32, 0, 2)
+	for port := int32(29800); len(ports) < 2; port++ {
+		if port == group.Spec.Runtime.Port || port == group.Spec.AFD.Port ||
+			(group.Spec.Artifacts.Cache != nil && port == runtimeconfig.CacheObservationPort(group.Spec.Runtime.Port)) {
+			continue
+		}
+		ports = append(ports, port)
+	}
+	return &vllmconfig.AFDCoordination{Host: afdDiscoveryName(group, role) + "." + group.Namespace + ".svc", MasterPort: ports[0], HandshakePort: ports[1]}
+}
+
+// afdMemberLaunchPlan supplies persisted identity and materialized endpoints to the V2 adapter.
+func afdMemberLaunchPlan(group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole, index int32) (vllmconfig.LaunchPlan, error) {
 	return vllmconfig.BuildAFDLaunchPlan(group.Spec, vllmconfig.AFDMember{
-		Role: role, Index: 0, GroupUID: string(group.UID),
-		RendezvousHost: afdRendezvousName(group) + "." + group.Namespace + ".svc",
+		Role: role, Index: index, GroupUID: string(group.UID),
+		RendezvousHost: afdDiscoveryName(group, inferencev1alpha1.AFDFFN) + "." + group.Namespace + ".svc",
+		Coordination:   afdRoleCoordination(group, role),
 	})
 }
 
 // modelPreparationLaunchPlan uses the same artifact contract without starting either engine.
 func modelPreparationLaunchPlan(group *inferencev1alpha1.ModelGroup) (vllmconfig.LaunchPlan, error) {
 	if group.Spec.AFD != nil {
-		return afdMemberLaunchPlan(group, inferencev1alpha1.AFDAttention)
+		return afdMemberLaunchPlan(group, inferencev1alpha1.AFDAttention, 0)
 	}
 	return vllmconfig.BuildLaunchPlan(group.Spec)
 }
 
 // desiredAFDMember reuses the common runtime template with role resources and a non-restarting Pod.
-func (reconciler *ModelGroupReconciler) desiredAFDMember(ctx context.Context, group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole) (*corev1.Pod, error) {
-	plan, err := afdMemberLaunchPlan(group, role)
+func (reconciler *ModelGroupReconciler) desiredAFDMember(ctx context.Context, group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole, index int32) (*corev1.Pod, error) {
+	plan, err := afdMemberLaunchPlan(group, role, index)
 	if err != nil {
 		return nil, err
 	}
@@ -74,20 +119,36 @@ func (reconciler *ModelGroupReconciler) desiredAFDMember(ctx context.Context, gr
 	if err != nil {
 		return nil, err
 	}
-	template.Labels[afdExecutionRoleLabel], template.Labels[afdMemberIndexLabel] = string(role), "0"
+	template.Labels[afdExecutionRoleLabel], template.Labels[afdMemberIndexLabel] = string(role), strconv.Itoa(int(index))
 	template.Spec.RestartPolicy = corev1.RestartPolicyNever
 	// Never applies to probe-triggered exits too; no member may restart into this domain.
 	template.Spec.Containers[0].Env = append(template.Spec.Containers[0].Env, corev1.EnvVar{
 		Name: "FORETOKEN_MEMBER_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}},
 	})
+	if endpoint := plan.AFD.Coordination; endpoint != nil {
+		template.Spec.Containers[0].Ports = append(template.Spec.Containers[0].Ports,
+			corev1.ContainerPort{Name: "role-master", ContainerPort: endpoint.MasterPort, Protocol: corev1.ProtocolTCP},
+			corev1.ContainerPort{Name: "role-handshake", ContainerPort: endpoint.HandshakePort, Protocol: corev1.ProtocolTCP},
+		)
+	}
 	if role == inferencev1alpha1.AFDFFN {
 		template.Spec.Containers[0].Ports = append(template.Spec.Containers[0].Ports, corev1.ContainerPort{Name: "afd", ContainerPort: group.Spec.AFD.Port, Protocol: corev1.ProtocolTCP})
 	}
 	if err := placeRuntimeCache(ctx, reconciler.Client, group.Namespace, group.Spec.Artifacts.Cache, template); err != nil {
 		return nil, err
 	}
+	if template.Spec.Affinity != nil && template.Spec.Affinity.PodAffinity != nil &&
+		(group.Spec.AFD.Attention.MemberCount > 1 || group.Spec.AFD.FFN.MemberCount > 1) {
+		for _, term := range template.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+			claimUID := template.Labels[runtimeCacheClaimLabel]
+			if claimUID != "" && term.TopologyKey == corev1.LabelHostname && term.LabelSelector != nil && term.LabelSelector.MatchLabels[runtimeCacheClaimLabel] == claimUID {
+				return nil, fmt.Errorf("multi-member AFD requires a ReadWriteMany runtime cache; single-node cache affinity conflicts with role spreading")
+			}
+		}
+	}
+	placeAFDMember(group, role, template)
 	pod := &corev1.Pod{ObjectMeta: template.ObjectMeta, Spec: template.Spec}
-	pod.Name, pod.Namespace = afdMemberName(group, role), group.Namespace
+	pod.Name, pod.Namespace = afdMemberName(group, role, index), group.Namespace
 	// Retain the Pod even if deletion races the Group status write. The same owner records its
 	// identity and real termination before releasing it; absence never authorizes a replacement.
 	controllerutil.AddFinalizer(pod, afdMemberFinalizer)
@@ -97,64 +158,113 @@ func (reconciler *ModelGroupReconciler) desiredAFDMember(ctx context.Context, gr
 	return pod, nil
 }
 
-// reconcileAFDRendezvous owns a headless, readiness-independent F0 endpoint for this Group UID.
-func (reconciler *ModelGroupReconciler) reconcileAFDRendezvous(ctx context.Context, group *inferencev1alpha1.ModelGroup) error {
-	labels := modelGroupLabels(group)
-	labels[afdExecutionRoleLabel], labels[afdMemberIndexLabel] = string(inferencev1alpha1.AFDFFN), "0"
-	desired := &corev1.Service{
-		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
-		ObjectMeta: metav1.ObjectMeta{Name: afdRendezvousName(group), Namespace: group.Namespace},
-		Spec: corev1.ServiceSpec{ClusterIP: corev1.ClusterIPNone, PublishNotReadyAddresses: true, Selector: labels,
-			Ports: []corev1.ServicePort{{Name: "afd", Port: group.Spec.AFD.Port, TargetPort: intstr.FromString("afd"), Protocol: corev1.ProtocolTCP}},
+// placeAFDMember spreads one role per host within its UID and prefers opposite-role peers.
+// Cache constraints stay authoritative; soft affinity never establishes a communication pairing.
+func placeAFDMember(group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole, pod *corev1.PodTemplateSpec) {
+	opposite := inferencev1alpha1.AFDAttention
+	if role == inferencev1alpha1.AFDAttention {
+		opposite = inferencev1alpha1.AFDFFN
+	}
+	if pod.Spec.Affinity == nil {
+		pod.Spec.Affinity = &corev1.Affinity{}
+	}
+	pod.Spec.Affinity.PodAntiAffinity = &corev1.PodAntiAffinity{RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
+		TopologyKey:   corev1.LabelHostname,
+		LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{modelGroupUIDLabel: string(group.UID), afdExecutionRoleLabel: string(role)}},
+	}}}
+	if pod.Spec.Affinity.PodAffinity == nil {
+		pod.Spec.Affinity.PodAffinity = &corev1.PodAffinity{}
+	}
+	pod.Spec.Affinity.PodAffinity.PreferredDuringSchedulingIgnoredDuringExecution = []corev1.WeightedPodAffinityTerm{{
+		Weight: 100, PodAffinityTerm: corev1.PodAffinityTerm{
+			TopologyKey:   corev1.LabelHostname,
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{modelGroupUIDLabel: string(group.UID), afdExecutionRoleLabel: string(opposite)}},
 		},
+	}}
+}
+
+// afdDiscoveryServices describes the Group-owned startup endpoints for creation and cleanup.
+// F0 always exposes shared rendezvous; multi-member roles add separate coordination ports.
+func afdDiscoveryServices(group *inferencev1alpha1.ModelGroup) []*corev1.Service {
+	var services []*corev1.Service
+	for _, role := range []inferencev1alpha1.AFDExecutionRole{inferencev1alpha1.AFDAttention, inferencev1alpha1.AFDFFN} {
+		var ports []corev1.ServicePort
+		if role == inferencev1alpha1.AFDFFN {
+			ports = append(ports, corev1.ServicePort{Name: "afd", Port: group.Spec.AFD.Port, TargetPort: intstr.FromString("afd"), Protocol: corev1.ProtocolTCP})
+		}
+		if endpoint := afdRoleCoordination(group, role); endpoint != nil {
+			ports = append(ports,
+				corev1.ServicePort{Name: "role-master", Port: endpoint.MasterPort, TargetPort: intstr.FromString("role-master"), Protocol: corev1.ProtocolTCP},
+				corev1.ServicePort{Name: "role-handshake", Port: endpoint.HandshakePort, TargetPort: intstr.FromString("role-handshake"), Protocol: corev1.ProtocolTCP},
+			)
+		}
+		if len(ports) == 0 {
+			continue
+		}
+		services = append(services, &corev1.Service{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+			ObjectMeta: metav1.ObjectMeta{Name: afdDiscoveryName(group, role), Namespace: group.Namespace},
+			Spec: corev1.ServiceSpec{ClusterIP: corev1.ClusterIPNone, PublishNotReadyAddresses: true,
+				Selector: map[string]string{modelGroupUIDLabel: string(group.UID), afdExecutionRoleLabel: string(role), afdMemberIndexLabel: "0"}, Ports: ports},
+		})
 	}
-	if err := controllerutil.SetControllerReference(group, desired, reconciler.Scheme()); err != nil {
-		return err
+	return services
+}
+
+// reconcileAFDDiscovery owns readiness-independent role and shared F0 discovery for this UID.
+func (reconciler *ModelGroupReconciler) reconcileAFDDiscovery(ctx context.Context, group *inferencev1alpha1.ModelGroup) error {
+	for _, desired := range afdDiscoveryServices(group) {
+		if err := controllerutil.SetControllerReference(group, desired, reconciler.Scheme()); err != nil {
+			return err
+		}
+		current := new(corev1.Service)
+		err := reconciler.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), current)
+		if err == nil && !metav1.IsControlledBy(current, group) {
+			return fmt.Errorf("AFD discovery %q belongs to another owner", current.Name)
+		}
+		if err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+		if err := reconciler.Patch(ctx, desired, client.Apply, client.FieldOwner(modelGroupFieldOwner), client.ForceOwnership); err != nil {
+			return err
+		}
 	}
-	current := new(corev1.Service)
-	err := reconciler.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), current)
-	if err == nil && !metav1.IsControlledBy(current, group) {
-		return fmt.Errorf("AFD rendezvous %q belongs to another owner", current.Name)
-	}
-	if err != nil && !apierrors.IsNotFound(err) {
-		return err
-	}
-	return reconciler.Patch(ctx, desired, client.Apply, client.FieldOwner(modelGroupFieldOwner), client.ForceOwnership)
+	return nil
 }
 
 // observeAFDMember reads the API server directly so informer lag cannot become a lost member.
 // The persisted UID and failure are retained even when a Pod has disappeared.
-func (reconciler *ModelGroupReconciler) observeAFDMember(ctx context.Context, group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole) (*corev1.Pod, *inferencev1alpha1.ModelGroupAFDMemberStatus, error) {
+func (reconciler *ModelGroupReconciler) observeAFDMember(ctx context.Context, group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole, index int32) (*corev1.Pod, *inferencev1alpha1.ModelGroupAFDMemberStatus, error) {
 	var member *inferencev1alpha1.ModelGroupAFDMemberStatus
 	for i := range group.Status.AFDMembers {
-		if group.Status.AFDMembers[i].Role == role {
+		if group.Status.AFDMembers[i].Role == role && group.Status.AFDMembers[i].MemberIndex == index {
 			member = &group.Status.AFDMembers[i]
 			break
 		}
 	}
 	pod := new(corev1.Pod)
-	err := reconciler.APIReader.Get(ctx, client.ObjectKey{Namespace: group.Namespace, Name: afdMemberName(group, role)}, pod)
+	err := reconciler.APIReader.Get(ctx, client.ObjectKey{Namespace: group.Namespace, Name: afdMemberName(group, role, index)}, pod)
 	if apierrors.IsNotFound(err) {
 		if member != nil && group.DeletionTimestamp.IsZero() && member.FailureReason == "" {
-			member.FailureReason, member.FailureMessage = "MemberMissing", fmt.Sprintf("%s/0 Pod %s disappeared; termination is not inferred", role, member.PodUID)
+			member.FailureReason, member.FailureMessage = "MemberMissing", fmt.Sprintf("%s/%d Pod %s disappeared; termination is not inferred", role, index, member.PodUID)
 		}
 		return nil, member, nil
 	}
 	if err != nil {
 		return nil, member, err
 	}
-	if !metav1.IsControlledBy(pod, group) || pod.Labels[modelGroupUIDLabel] != string(group.UID) || pod.Labels[afdExecutionRoleLabel] != string(role) || pod.Labels[afdMemberIndexLabel] != "0" {
+	if !metav1.IsControlledBy(pod, group) || pod.Labels[modelGroupUIDLabel] != string(group.UID) || pod.Labels[afdExecutionRoleLabel] != string(role) || pod.Labels[afdMemberIndexLabel] != strconv.Itoa(int(index)) {
 		return nil, member, fmt.Errorf("AFD Pod %q has an unexpected owner or member identity", pod.Name)
 	}
 	if member == nil {
-		group.Status.AFDMembers = append(group.Status.AFDMembers, inferencev1alpha1.ModelGroupAFDMemberStatus{Role: role, PodUID: string(pod.UID)})
+		group.Status.AFDMembers = append(group.Status.AFDMembers, inferencev1alpha1.ModelGroupAFDMemberStatus{Role: role, MemberIndex: index, PodUID: string(pod.UID)})
 		member = &group.Status.AFDMembers[len(group.Status.AFDMembers)-1]
 	}
 	if member.PodUID != string(pod.UID) {
 		if !group.DeletionTimestamp.IsZero() {
 			return nil, member, fmt.Errorf("AFD Pod %q has a replacement UID; cleanup requires owner intervention", pod.Name)
 		}
-		member.FailureReason, member.FailureMessage = "MemberReplaced", fmt.Sprintf("%s/0 no longer has recorded Pod UID %s; replacement is not adopted", role, member.PodUID)
+		member.FailureReason, member.FailureMessage = "MemberReplaced", fmt.Sprintf("%s/%d no longer has recorded Pod UID %s; replacement is not adopted", role, index, member.PodUID)
 		return nil, member, nil
 	}
 	if afdPodStopped(pod) {
@@ -249,7 +359,7 @@ func (reconciler *ModelGroupReconciler) saveAFDMemberStatus(ctx context.Context,
 	return reconciler.Status().Patch(ctx, group, client.MergeFrom(base))
 }
 
-// reconcileAFD creates only never-created members and publishes the complete pair's serving state.
+// reconcileAFD creates only never-created members and publishes the complete Group's serving state.
 // Latched member failure withdraws admission without replacing any member in the old domain.
 func (reconciler *ModelGroupReconciler) reconcileAFD(ctx context.Context, group *inferencev1alpha1.ModelGroup, pool *inferencev1alpha1.ModelPool) (ctrl.Result, error) {
 	// Member and Group observations must share the API-server consistency boundary.
@@ -260,11 +370,12 @@ func (reconciler *ModelGroupReconciler) reconcileAFD(ctx context.Context, group 
 		return reconciler.reconcileAFDDelete(ctx, group)
 	}
 	base := group.DeepCopy()
-	roles := []inferencev1alpha1.AFDExecutionRole{inferencev1alpha1.AFDAttention, inferencev1alpha1.AFDFFN}
-	for _, role := range roles {
-		if _, _, err := reconciler.observeAFDMember(ctx, group, role); err != nil {
+	members := afdMembers(group)
+	for _, expected := range members {
+		role, index := expected.role, expected.index
+		if _, _, err := reconciler.observeAFDMember(ctx, group, role, index); err != nil {
 			state := modelGroupMaterializedState(false, schedulingNotEvaluated())
-			state.unavailable = &modelGroupConditionState{status: metav1.ConditionFalse, reason: "MemberObservationFailed", message: fmt.Sprintf("%s/0: %v", role, err)}
+			state.unavailable = &modelGroupConditionState{status: metav1.ConditionFalse, reason: "MemberObservationFailed", message: fmt.Sprintf("%s/%d: %v", role, index, err)}
 			return ctrl.Result{}, errors.Join(err, reconciler.publishAFDState(ctx, group, pool, state))
 		}
 	}
@@ -273,7 +384,7 @@ func (reconciler *ModelGroupReconciler) reconcileAFD(ctx context.Context, group 
 		if member.FailureReason != "" {
 			state := modelGroupMaterializedState(false, schedulingNotEvaluated())
 			state.phase = inferencev1alpha1.ModelGroupPhaseFailed
-			state.unavailable = &modelGroupConditionState{status: metav1.ConditionFalse, reason: member.FailureReason, message: fmt.Sprintf("%s/0: %s", member.Role, member.FailureMessage)}
+			state.unavailable = &modelGroupConditionState{status: metav1.ConditionFalse, reason: member.FailureReason, message: fmt.Sprintf("%s/%d: %s", member.Role, member.MemberIndex, member.FailureMessage)}
 			if len(group.Status.AFDMembers) != int(group.Spec.MemberCount) {
 				state.materialized = modelGroupConditionState{status: metav1.ConditionFalse, reason: "IncompleteMembers", message: "Member failure stopped partial materialization"}
 			}
@@ -284,13 +395,15 @@ func (reconciler *ModelGroupReconciler) reconcileAFD(ctx context.Context, group 
 	if memberStatusErr != nil {
 		return ctrl.Result{}, memberStatusErr
 	}
-	if err := reconciler.reconcileAFDRendezvous(ctx, group); err != nil {
+	if err := reconciler.reconcileAFDDiscovery(ctx, group); err != nil {
 		return ctrl.Result{}, err
 	}
-	for _, role := range roles {
+	var creationErr error
+	for _, expected := range members {
+		role, index := expected.role, expected.index
 		exists := false
 		for _, member := range group.Status.AFDMembers {
-			if member.Role == role {
+			if member.Role == role && member.MemberIndex == index {
 				exists = true
 				break
 			}
@@ -298,18 +411,23 @@ func (reconciler *ModelGroupReconciler) reconcileAFD(ctx context.Context, group 
 		if exists {
 			continue
 		}
-		desired, err := reconciler.desiredAFDMember(ctx, group, role)
-		if err != nil {
-			return ctrl.Result{}, err
+		desired, err := reconciler.desiredAFDMember(ctx, group, role, index)
+		if err == nil {
+			err = reconciler.Create(ctx, desired)
 		}
-		if err := reconciler.Create(ctx, desired); err != nil {
-			return ctrl.Result{}, err
+		if err != nil {
+			// A failed create must not withhold the other role's independent startup.
+			creationErr = errors.Join(creationErr, fmt.Errorf("create %s/%d: %w", role, index, err))
+			continue
 		}
 		base = group.DeepCopy()
-		group.Status.AFDMembers = append(group.Status.AFDMembers, inferencev1alpha1.ModelGroupAFDMemberStatus{Role: role, PodUID: string(desired.UID)})
+		group.Status.AFDMembers = append(group.Status.AFDMembers, inferencev1alpha1.ModelGroupAFDMemberStatus{Role: role, MemberIndex: index, PodUID: string(desired.UID)})
 		if err := reconciler.saveAFDMemberStatus(ctx, group, base); err != nil {
-			return ctrl.Result{}, err
+			return ctrl.Result{}, errors.Join(creationErr, err)
 		}
+	}
+	if creationErr != nil {
+		return ctrl.Result{}, creationErr
 	}
 	condition, observationErr := reconciler.afdServingCondition(ctx, group)
 	if observationErr != nil {
@@ -351,51 +469,56 @@ func (reconciler *ModelGroupReconciler) reconcileAFDDelete(ctx context.Context, 
 		return ctrl.Result{}, err
 	}
 	for _, role := range []inferencev1alpha1.AFDExecutionRole{inferencev1alpha1.AFDAttention, inferencev1alpha1.AFDFFN} {
-		base := group.DeepCopy()
-		pod, member, err := reconciler.observeAFDMember(ctx, group, role)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := reconciler.saveAFDMemberStatus(ctx, group, base); err != nil {
-			return ctrl.Result{}, err
-		}
-		if pod == nil {
-			if member != nil && !member.TerminationConfirmed {
-				return ctrl.Result{RequeueAfter: modelGroupDrainPollInterval}, reconciler.updateDrainStatus(ctx, group, group.Status.DrainStartedAt, false, false, false, "TerminationUnconfirmed", fmt.Sprintf("%s/0 disappeared without termination evidence", role))
+		pending := false
+		for index := int32(0); index < afdRoleSpec(group, role).MemberCount; index++ {
+			base := group.DeepCopy()
+			pod, member, err := reconciler.observeAFDMember(ctx, group, role, index)
+			if err != nil {
+				return ctrl.Result{}, err
 			}
-			continue
+			if err := reconciler.saveAFDMemberStatus(ctx, group, base); err != nil {
+				return ctrl.Result{}, err
+			}
+			if pod == nil {
+				if member != nil && !member.TerminationConfirmed {
+					pending = true
+				}
+				continue
+			}
+			pending = true
+			if pod.DeletionTimestamp.IsZero() {
+				if err := reconciler.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); client.IgnoreNotFound(err) != nil {
+					return ctrl.Result{}, err
+				}
+				continue
+			}
+			if member.TerminationConfirmed && controllerutil.ContainsFinalizer(pod, afdMemberFinalizer) {
+				before := pod.DeepCopy()
+				controllerutil.RemoveFinalizer(pod, afdMemberFinalizer)
+				if err := reconciler.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
+					return ctrl.Result{}, err
+				}
+			}
 		}
-		if pod.DeletionTimestamp.IsZero() {
-			if err := reconciler.Delete(ctx, pod, client.Preconditions{UID: &pod.UID}); client.IgnoreNotFound(err) != nil {
+		if pending {
+			return ctrl.Result{RequeueAfter: modelGroupDrainPollInterval}, reconciler.updateDrainStatus(ctx, group, group.Status.DrainStartedAt, false, false, false, "TerminationUnconfirmed", fmt.Sprintf("Waiting for all %s members to terminate and disappear", role))
+		}
+	}
+	for _, desired := range afdDiscoveryServices(group) {
+		service := new(corev1.Service)
+		err := reconciler.APIReader.Get(ctx, client.ObjectKeyFromObject(desired), service)
+		if err == nil {
+			if !metav1.IsControlledBy(service, group) {
+				return ctrl.Result{}, fmt.Errorf("AFD discovery %q belongs to another owner", service.Name)
+			}
+			if err := reconciler.Delete(ctx, service, client.Preconditions{UID: &service.UID}); client.IgnoreNotFound(err) != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{RequeueAfter: modelGroupDrainPollInterval}, nil
 		}
-		if !member.TerminationConfirmed {
-			return ctrl.Result{RequeueAfter: modelGroupDrainPollInterval}, reconciler.updateDrainStatus(ctx, group, group.Status.DrainStartedAt, false, false, false, "TerminationUnconfirmed", fmt.Sprintf("Waiting for %s/0 termination evidence", role))
-		}
-		if controllerutil.ContainsFinalizer(pod, afdMemberFinalizer) {
-			before := pod.DeepCopy()
-			controllerutil.RemoveFinalizer(pod, afdMemberFinalizer)
-			if err := reconciler.Patch(ctx, pod, client.MergeFrom(before)); err != nil {
-				return ctrl.Result{}, err
-			}
-		}
-		return ctrl.Result{RequeueAfter: modelGroupDrainPollInterval}, nil
-	}
-	service := new(corev1.Service)
-	err := reconciler.APIReader.Get(ctx, client.ObjectKey{Namespace: group.Namespace, Name: afdRendezvousName(group)}, service)
-	if err == nil {
-		if !metav1.IsControlledBy(service, group) {
-			return ctrl.Result{}, fmt.Errorf("AFD rendezvous belongs to another owner")
-		}
-		if err := reconciler.Delete(ctx, service, client.Preconditions{UID: &service.UID}); client.IgnoreNotFound(err) != nil {
+		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: modelGroupDrainPollInterval}, nil
-	}
-	if !apierrors.IsNotFound(err) {
-		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, reconciler.removeDrainFinalizer(ctx, group)
 }

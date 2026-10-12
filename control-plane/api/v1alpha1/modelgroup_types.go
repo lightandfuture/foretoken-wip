@@ -325,8 +325,12 @@ const (
 // ModelGroupAFDMemberStatus retains Pod identity and termination evidence across reconciliation.
 // The Group controller consumes it to prevent member replacement and premature cleanup.
 type ModelGroupAFDMemberStatus struct {
-	Role   AFDExecutionRole `json:"role"`
-	PodUID string           `json:"podUID"`
+	Role AFDExecutionRole `json:"role"`
+	// MemberIndex identifies a member within its role; existing single members default to zero.
+	// +kubebuilder:default=0
+	// +kubebuilder:validation:Minimum=0
+	MemberIndex int32  `json:"memberIndex"`
+	PodUID      string `json:"podUID"`
 	// TerminationConfirmed records observed termination, never inferred from a missing Pod.
 	// +optional
 	TerminationConfirmed bool `json:"terminationConfirmed,omitempty"`
@@ -343,6 +347,7 @@ type ModelGroupStatus struct {
 	// +optional
 	// +listType=map
 	// +listMapKey=role
+	// +listMapKey=memberIndex
 	AFDMembers []ModelGroupAFDMemberStatus `json:"afdMembers,omitempty"`
 
 	// +optional

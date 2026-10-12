@@ -57,12 +57,6 @@ func validateAFD(template inferencev1alpha1.NormalizedPoolTemplate, args inferen
 	if err := validateAFDTopology(*template.AFD, template.MemberCount); err != nil {
 		return err
 	}
-	// The current workload owner still materializes exactly one single-GPU Pod per role.
-	for _, side := range []inferencev1alpha1.AFDMemberSpec{template.AFD.Attention, template.AFD.FFN} {
-		if side.MemberCount != 1 || side.Resources.Requests.GPU.Count != 1 {
-			return fmt.Errorf("AFD workload materialization currently requires one single-GPU member per role")
-		}
-	}
 	ownedOptions := []string{
 		"tensor-parallel-size", "pipeline-parallel-size", "data-parallel-size",
 		"prefill-context-parallel-size", "decode-context-parallel-size",

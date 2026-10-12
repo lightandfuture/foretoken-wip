@@ -6,8 +6,7 @@
 [English](afd-managed-runtime.md) | 简体中文
 
 model-server 消费私有 V2 plan，支持同步 CUDA AFD 角色跨多成员或单成员多 GPU。
-OCI 和 A100 验收仍由负责人执行。[Group 物化](afd-group-workload_zh.md) 当前仍限于
-两侧各一个单 GPU Pod；多成员发现、放置和完整集合发布属于后续控制面工作，整组恢复
+OCI 和 A100 验收仍由负责人执行。[Group 物化](afd-group-workload_zh.md) 负责多成员发现、角色放置和完整集合发布，整组恢复
 仍未闭环。使用运行时源码构建[固定候选镜像](afd-runtime_zh.md)。
 
 ## 启动契约与生命周期
@@ -24,9 +23,9 @@ Group 物化方提供按 UID 隔离、启动发现不依赖 Ready 的角色成�
 角色端口，端点不能负载均衡到其他成员或 Group。单成员省略 coordination，保留
 原生本地协调。
 
-BuildAFDLaunchPlan 是实际 Go 生产投影边界。Pool compiler 与 Group 工作负载 owner
-仍拒绝多成员、多 GPU 物化，直接调用投影不代表 ModelService→多 Pod 已接通。
-本次不增加公共 API/CRD 字段。
+BuildAFDLaunchPlan 是 Group 工作负载 owner 为每个角色/序号调用的 Go 投影边界。
+compiler 接受下述拓扑，控制器检查存储条件并观测完整集合。运行时 V2 字段保持不变；
+控制器 status 按角色/序号标识成员。
 
 每角色满足 memberCount × 每成员 GPU 数 = DP × TP。每成员 GPU 数须整除 TP
 或被 TP 整除，与固定原生同构放置一致。Attention ranks 不少于 FFN，不要求整数比例。

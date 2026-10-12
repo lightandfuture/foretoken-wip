@@ -5,33 +5,55 @@
 
 [English](afd-group-workload.md) | 简体中文
 
-ModelGroup 控制器按 [managed V2 契约](afd-managed-runtime_zh.md) 物化固定 CUDA 1A1F。
+ModelGroup 控制器按 [managed V2 契约](afd-managed-runtime_zh.md) 物化固定 CUDA Attention/FFN 成员集合。
 创建不代表服务就绪；同一控制器在完整 AF 就绪后发布仅指向 Attention 的生成
 Service 和路由，不替换失败 Group。
 OCI 和真实 GPU/Kubernetes 验收仍未完成。
 
-运行时投影支持多个角色成员，Pool profile 和工作负载 owner 仍要求每角色一个
-单 GPU 成员。多成员物化须提供 UID 隔离的角色协调端点，保留共享 F0 发现与
-既有创建/清理 owner。
+每侧按 memberCount 创建成员并分配每成员 GPU，满足 memberCount × GPU = DP × TP
+及 managed runtime 拓扑限制。角色协调端点与共享 F0 发现由同一 Group owner 创建和清理。
 
 ## 身份与发现
 
-Pod 名为 `afd-<uid>-attention-0` 和 `afd-<uid>-ffn-0`，UID 来自 API server
+Pod 名为 `afd-<uid>-attention-<index>` 和 `afd-<uid>-ffn-<index>`，UID 来自 API server
 持久化的 Group。controller ownerReference 指向 Group，restartPolicy 为 Never。
 成员标签为：
 
 - `inference.foretoken.io/model-group-uid`：Group UID；
 - `inference.foretoken.io/execution-role`：attention 或 ffn；
-- `inference.foretoken.io/member-index`：角色内序号 0。
+- `inference.foretoken.io/member-index`：角色内序号，从零到 memberCount − 1。
 
 Group 拥有 headless Service `afd-<uid>-f0`，selector 限定 UID、FFN 角色和序号 0。
-`publishNotReadyAddresses: true` 让启动发现不依赖 Ready。两侧 V2 plan 都使用
+`publishNotReadyAddresses: true` 让启动发现不依赖 Ready。所有成员 V2 plan 都使用
 `afd-<uid>-f0.<namespace>.svc` 和已解析的 connector 端口，不把身份和地址写回 spec。
-两侧都提交创建，不等待另一侧 Ready；不引入跨角色反亲和或多成员放置策略。
+两侧都提交完整成员集合，不等待另一侧 Ready。多成员角色的 A0/F0 Service
+另暴露 role-master 和 role-handshake，仍只选择该角色成员零。A0 名为
+`afd-<uid>-a0`，F0 保留原名与共享 rendezvous 端口。afd.coordination 从 29800
+起选择两个不与 model-server、缓存观察和共享 rendezvous 冲突的端口。单成员省略
+coordination。每个 Pod 使用独立网络命名空间，同机角色不共享监听端口。DP=1 时
+即使 TP 跨成员，EngineCore 握手仍使用本地地址；role-master 继续协调跨成员 worker。
 
 共享 Pod 模板保留镜像/应用选择、拉取凭据、每侧资源、RDMA、Multus、缓存放置和退出
 宽限期。既有 CPU 准备 Job 消费 Attention V2 产物配置，prepare/resolve 不启动引擎。
 两侧挂载 Pool 拥有的同一来源记录，peer 入站许可限定当前 Group UID。
+
+## 放置与存储
+
+同角色硬 Pod 反亲和只匹配 Group UID＋execution-role，拓扑键为 kubernetes.io/hostname。
+同角色成员需要不同可用节点，不同 Group 不互斥。软 Pod 亲和匹配本 Group 另一角色，
+不保证同机或同序号配对。普通 LWS 多节点放置与重启策略保持不变。
+
+多成员 Group 的持久运行时缓存须是 ReadWriteMany，且在所有选中节点可达。
+既有缓存 owner 保留单节点可写卷的同机约束；多成员 AFD 在创建成员前拒绝这种
+与角色分散冲突的组合。无持久缓存时沿用来源准备及逐 Pod 获取流程。本地模型及
+tokenizer 路径须在各成员镜像或挂载缓存中一致存在。CPU-only 准备 Job 仍归 Group，
+不启动引擎。
+
+GPU、共享内存、网络和设备设置复用公共 Pod builder。AFD resolver 尚未将
+RuntimeProfile.RDMA 投影到 Group.Spec.RDMA。resolver 明确拒绝非空 RDMA profile
+与多成员或每成员多 GPU 的组合；原单 GPU 1A1F 路径不变，不表示其 RDMA 已正确分配。
+依赖 RDMA 的扩展不属于本次交付范围。
+这是前置依赖，不新增传输回退或设备分配 owner。
 
 ## 创建与观测
 
@@ -39,9 +61,10 @@ Group 拥有 headless Service `afd-<uid>-f0`，selector 限定 UID、FFN 角色�
 `inference.foretoken.io/afd-member`，避免创建成功而 Group status 未保存时对象被删除。
 仍由同一 Group 控制器处理该 finalizer，不增加第二生命周期 owner。
 
-`status.afdMembers` 保存角色、实际 Pod UID、锁存的故障原因/消息及
-`terminationConfirmed`。直接读取 API server，避免把 informer 延迟当作丢失。
-部分创建失败重试复用现有身份，只创建从未创建的角色；不在旧通信域补建失效成员。
+`status.afdMembers` 保存角色、memberIndex、实际 Pod UID、锁存的故障原因/消息及
+`terminationConfirmed`。列表以 role/memberIndex 联合标识，旧单成员记录默认
+index=0，保留 Pod UID 和停止证据。先部署生成的 CRD，再部署匹配控制器。直接读取 API server，避免把 informer 延迟当作丢失。
+部分创建失败重试复用现有身份，只创建从未创建的角色/序号位置；不在旧通信域补建失效成员。
 故障使 Group 进入 Failed，通过 WorkloadAvailable 报告，Ready 保持 false。
 当前 Pool 保留失败 Group，整组替换属于后续恢复实现。
 
@@ -62,13 +85,13 @@ Pending 与启动超时分开；scheduler condition 继续报告资源不足。�
 ## 服务就绪与入口撤销
 
 Group 控制器核对完整成员集合、已记录 Pod UID、角色/序号标签、Running/Ready
-Pod 及两侧 `/internal/afd/status`。运行时响应把 Group UID 和角色绑定到实际
+Pod 及每个成员的 `/internal/afd/status`。运行时响应把 Group UID 和角色绑定到实际
 引擎、connector 和 FFN loop 初始化；端口连通或原生 handshake 不代表完整就绪。
 
-Attention 启动时关闭可恢复的 serving gate。两侧观测全部通过后，控制器向
-Attention 的 `/internal/afd/serving` 提交 Group UID、成员序号及 `enabled`，
+Attention 成员零启动时关闭 serving gate。完整成员观测全部通过后，控制器向
+Attention 成员零的 `/internal/afd/serving` 提交 Group UID、成员序号及 `enabled`，
 收到身份匹配、运行时 ready 且 `accepting: true` 的响应，才发布生成 Service
-和 Group Ready。FFN 没有此开关或生成 API。该私有契约要求控制器与 model-server
+和 Group Ready。其他 Attention 成员和所有 FFN 没有此开关或生成 API。该私有契约要求控制器与 model-server
 使用匹配构建；缺少 gate 接口的旧运行时保持不可用。
 
 既有 serving snapshot owner 消费 Group Ready，每个 Group 只发布一个指向
@@ -84,14 +107,14 @@ Attention Service 的目标。DP/TP 和 KV scope 来自 Attention；GPU 统计�
 gate 与运行时 admission 共用原子请求计数，但不能重新打开排空/退出已关闭的
 lifecycle admission。在途请求可以完成或失败。观测、Service 删除和前端快照安装
 是异步过程，不保证零延迟撤销，也不代表收到前端 generation ACK。Attention 不可达
-时无法确认入口关闭。F0 发现保留到既有顺序清理完成。
+时无法确认入口关闭。A0/F0 发现保留到既有顺序清理完成。
 
 ## 删除与责任边界
 
-Group 删除先撤销 Ready、尝试关闭 Attention gate 并删除生成 Service，再正常删除
-Attention，让现有运行时执行有界关闭。持久化终止证据后移除成员
-finalizer，等待 Pod 消失，再删除 FFN。两个 Pod 都消失后删除 F0 Service，最后释放
-Group finalizer。其余 Group 拥有的准备和网络对象沿用垃圾回收；来源记录和缓存保留原 owner。
+Group 删除先撤销 Ready、尝试关闭 Attention gate 并删除生成 Service，再对全部 Attention
+请求删除，不在同角色成员之间等待，使其进入既有有界关闭。持久化各成员停止证据后
+移除其 finalizer，全部 Attention Pod 消失后再请求全部 FFN 删除。全部成员消失后
+删除 A0/F0 Service，最后释放 Group finalizer。其余 Group 拥有的准备和网络对象沿用垃圾回收；来源记录和缓存保留原 owner。
 
 未调度且正在删除的 Pod 从未运行；已调度 Pod 必须有终态 phase/container 证据，排除
 NodeLost、Unknown 和 ContainerStatusUnknown。只有驱逐原因不足以证明终止。

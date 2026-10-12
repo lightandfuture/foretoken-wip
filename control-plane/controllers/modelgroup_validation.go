@@ -29,7 +29,7 @@ func validateGroupRuntime(group *inferencev1alpha1.ModelGroup) error {
 	}
 
 	if group.Spec.AFD != nil {
-		_, err := afdMemberLaunchPlan(group, inferencev1alpha1.AFDAttention)
+		_, err := afdMemberLaunchPlan(group, inferencev1alpha1.AFDAttention, 0)
 		return err
 	}
 	if group.Spec.Runtime.SourceRevision != "" && group.Spec.Runtime.Backend != "vllm" {

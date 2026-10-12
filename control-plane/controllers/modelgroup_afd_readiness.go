@@ -33,7 +33,7 @@ type afdRuntimeStatus struct {
 	Ready       bool                               `json:"ready"`
 }
 
-// afdServingCondition observes the exact persisted pair and both private runtime endpoints.
+// afdServingCondition observes the complete persisted member set and every private runtime endpoint.
 // Pod readiness alone is insufficient; no listener during startup means unavailable.
 func (reconciler *ModelGroupReconciler) afdServingCondition(ctx context.Context, group *inferencev1alpha1.ModelGroup) (modelGroupConditionState, error) {
 	condition := modelGroupConditionState{status: metav1.ConditionFalse, reason: "MembersNotReady"}
@@ -46,41 +46,42 @@ func (reconciler *ModelGroupReconciler) afdServingCondition(ctx context.Context,
 		condition.reason = "IncompleteMembers"
 		blockers = append(blockers, fmt.Sprintf("Expected %d AFD members, observed %d", group.Spec.MemberCount, len(pods.Items)))
 	}
-	for _, role := range []inferencev1alpha1.AFDExecutionRole{inferencev1alpha1.AFDAttention, inferencev1alpha1.AFDFFN} {
+	for _, expected := range afdMembers(group) {
+		role, index := expected.role, expected.index
 		var pod *corev1.Pod
 		for i := range pods.Items {
-			if pods.Items[i].Name == afdMemberName(group, role) {
+			if pods.Items[i].Name == afdMemberName(group, role, index) {
 				pod = &pods.Items[i]
 			}
 		}
 		identityMatches := false
-		if pod != nil && metav1.IsControlledBy(pod, group) && pod.Labels[afdExecutionRoleLabel] == string(role) && pod.Labels[afdMemberIndexLabel] == "0" {
+		if pod != nil && metav1.IsControlledBy(pod, group) && pod.Labels[afdExecutionRoleLabel] == string(role) && pod.Labels[afdMemberIndexLabel] == strconv.Itoa(int(index)) {
 			for _, member := range group.Status.AFDMembers {
-				if member.Role == role && member.PodUID == string(pod.UID) && member.FailureReason == "" {
+				if member.Role == role && member.MemberIndex == index && member.PodUID == string(pod.UID) && member.FailureReason == "" {
 					identityMatches = true
 				}
 			}
 		}
 		if !identityMatches {
-			blockers = append(blockers, fmt.Sprintf("%s/0: expected persisted member identity is absent", role))
+			blockers = append(blockers, fmt.Sprintf("%s/%d: expected persisted member identity is absent", role, index))
 			continue
 		}
 		if pod.Spec.NodeName == "" {
-			blockers = append(blockers, fmt.Sprintf("%s/0: waiting for scheduling", role))
+			blockers = append(blockers, fmt.Sprintf("%s/%d: waiting for scheduling", role, index))
 			continue
 		}
 		if !pod.DeletionTimestamp.IsZero() || pod.Status.Phase != corev1.PodRunning || !podReady(pod) || pod.Status.PodIP == "" {
-			blockers = append(blockers, fmt.Sprintf("%s/0: phase=%s, Pod is not ready", role, pod.Status.Phase))
+			blockers = append(blockers, fmt.Sprintf("%s/%d: phase=%s, Pod is not ready", role, index, pod.Status.Phase))
 			continue
 		}
 		endpoint := afdPodEndpoint(group, pod)
 		var status afdRuntimeStatus
 		if err := readAFDStatus(ctx, endpoint+"/internal/afd/status", &status); err != nil {
-			blockers = append(blockers, fmt.Sprintf("%s/0: runtime status unavailable: %v", role, err))
+			blockers = append(blockers, fmt.Sprintf("%s/%d: runtime status unavailable: %v", role, index, err))
 			continue
 		}
-		if status.GroupUID != string(group.UID) || status.Role != role || status.MemberIndex == nil || *status.MemberIndex != 0 || status.MemberCount != 1 || !status.Ready {
-			blockers = append(blockers, fmt.Sprintf("%s/0: runtime identity or complete initialization is not ready", role))
+		if status.GroupUID != string(group.UID) || status.Role != role || status.MemberIndex == nil || *status.MemberIndex != index || status.MemberCount != expected.count || !status.Ready {
+			blockers = append(blockers, fmt.Sprintf("%s/%d: runtime identity or complete initialization is not ready", role, index))
 			continue
 		}
 	}
@@ -180,7 +181,7 @@ func (reconciler *ModelGroupReconciler) withdrawAFDService(ctx context.Context, 
 // It cannot reopen lifecycle admission closed for drain or shutdown.
 func (reconciler *ModelGroupReconciler) setAFDServing(ctx context.Context, group *inferencev1alpha1.ModelGroup, enabled bool) error {
 	pod := new(corev1.Pod)
-	err := reconciler.APIReader.Get(ctx, client.ObjectKey{Namespace: group.Namespace, Name: afdMemberName(group, inferencev1alpha1.AFDAttention)}, pod)
+	err := reconciler.APIReader.Get(ctx, client.ObjectKey{Namespace: group.Namespace, Name: afdMemberName(group, inferencev1alpha1.AFDAttention, 0)}, pod)
 	if apierrors.IsNotFound(err) && !enabled {
 		return nil
 	}
@@ -188,7 +189,7 @@ func (reconciler *ModelGroupReconciler) setAFDServing(ctx context.Context, group
 		return err
 	}
 	for _, member := range group.Status.AFDMembers {
-		if member.Role == inferencev1alpha1.AFDAttention && member.PodUID == string(pod.UID) && metav1.IsControlledBy(pod, group) && pod.Labels[modelGroupUIDLabel] == string(group.UID) && pod.Labels[afdExecutionRoleLabel] == string(member.Role) && pod.Labels[afdMemberIndexLabel] == "0" {
+		if member.Role == inferencev1alpha1.AFDAttention && member.MemberIndex == 0 && member.PodUID == string(pod.UID) && metav1.IsControlledBy(pod, group) && pod.Labels[modelGroupUIDLabel] == string(group.UID) && pod.Labels[afdExecutionRoleLabel] == string(member.Role) && pod.Labels[afdMemberIndexLabel] == "0" {
 			if !enabled && pod.Status.PodIP == "" {
 				return nil
 			}
@@ -208,7 +209,7 @@ func (reconciler *ModelGroupReconciler) setAFDServing(ctx context.Context, group
 			if err := requestAFDStatus(ctx, http.MethodPost, afdPodEndpoint(group, pod)+"/internal/afd/serving", body, &response); err != nil {
 				return fmt.Errorf("attention/0 serving gate: %w", err)
 			}
-			if response.GroupUID != string(group.UID) || response.Role != member.Role || response.MemberIndex == nil || *response.MemberIndex != 0 || response.MemberCount != 1 || response.Accepting == nil {
+			if response.GroupUID != string(group.UID) || response.Role != member.Role || response.MemberIndex == nil || *response.MemberIndex != 0 || response.MemberCount != group.Spec.AFD.Attention.MemberCount || response.Accepting == nil {
 				return fmt.Errorf("attention/0 serving gate returned an invalid identity or admission state")
 			}
 			if *response.Accepting != enabled || (enabled && !response.Ready) {
