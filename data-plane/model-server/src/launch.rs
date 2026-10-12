@@ -60,6 +60,27 @@ pub struct AfdPlan {
     pub port: u16,
     pub num_attention_ranks: usize,
     pub num_ffn_ranks: usize,
+    pub coordination: Option<RoleCoordination>,
+}
+
+/// Materializer-owned endpoint for this role's member zero, separate from shared F0.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoleCoordination {
+    pub host: String,
+    pub master_port: u16,
+    pub handshake_port: u16,
+}
+
+impl AfdPlan {
+    /// Returns the exact role-rank interval hosted by this homogeneous member.
+    pub fn local_ranks(&self) -> std::ops::Range<usize> {
+        let ranks = match self.role {
+            ExecutionRole::Attention => self.num_attention_ranks,
+            ExecutionRole::Ffn => self.num_ffn_ranks,
+        } / self.member_count;
+        self.member_index * ranks..(self.member_index + 1) * ranks
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -292,22 +313,58 @@ impl LaunchPlan {
         match (self.version, self.node_count, &self.afd) {
             (1, Some(count), None) if count > 0 => {}
             (2, None, Some(afd)) => {
-                if afd.member_index != 0
-                    || afd.member_count != 1
-                    || afd.num_attention_ranks != 1
-                    || afd.num_ffn_ranks != 1
-                    || self.parallelism.tp != 1
-                    || self.parallelism.dp != 1
+                let role_ranks = match afd.role {
+                    ExecutionRole::Attention => afd.num_attention_ranks,
+                    ExecutionRole::Ffn => afd.num_ffn_ranks,
+                };
+                if afd.member_count == 0
+                    || afd.member_index >= afd.member_count
+                    || afd.num_ffn_ranks == 0
+                    || afd.num_attention_ranks < afd.num_ffn_ranks
+                    || self.parallelism.tp == 0
+                    || self.parallelism.dp == 0
+                    || self.parallelism.tp.checked_mul(self.parallelism.dp) != Some(role_ranks)
+                    || !role_ranks.is_multiple_of(afd.member_count)
                     || self.parallelism.pp != 1
                     || self.parallelism.pcp != 1
                     || self.parallelism.dcp != 1
                 {
-                    return Err("AFD currently requires one single-GPU member per role".into());
+                    return Err(
+                        "AFD requires valid role membership, DP*TP ranks, A>=F and PP=PCP=DCP=1"
+                            .into(),
+                    );
+                }
+                let local_ranks = role_ranks / afd.member_count;
+                if !local_ranks.is_multiple_of(self.parallelism.tp)
+                    && !self.parallelism.tp.is_multiple_of(local_ranks)
+                {
+                    return Err(
+                        "AFD TP must divide local GPUs or span an integral number of members"
+                            .into(),
+                    );
+                }
+                if afd.member_count > 1 && afd.coordination.is_none() {
+                    return Err("multi-member AFD requires a role coordination endpoint".into());
+                }
+                if let Some(endpoint) = &afd.coordination
+                    && (endpoint.host.is_empty()
+                        || endpoint.master_port == 0
+                        || endpoint.handshake_port == 0
+                        || endpoint.master_port == endpoint.handshake_port)
+                {
+                    return Err(
+                        "AFD role coordination requires a host and distinct nonzero ports".into(),
+                    );
                 }
                 if afd.group_uid.is_empty() || afd.host.is_empty() || afd.port == 0 {
                     return Err("AFD requires groupUid and a nonempty rendezvous endpoint".into());
                 }
                 if self.parallelism.ep.is_none()
+                    || self
+                        .parallelism
+                        .ep
+                        .as_ref()
+                        .is_some_and(|ep| ep.eplb || !ep.backend.is_empty())
                     || self.ec.enabled()
                     || !matches!(self.kv, KvPlan::None { events: false })
                     || self.profiling.engine != crate::profiling::Engine::Pytorch
@@ -370,9 +427,21 @@ impl LaunchPlan {
                     "data-parallel-rank",
                     "data-parallel-start-rank",
                     "data-parallel-address",
+                    "data-parallel-backend",
+                    "data-parallel-external-lb",
+                    "data-parallel-hybrid-lb",
+                    "data-parallel-multi-port-external-lb",
                     "data-parallel-rpc-port",
                     "node-rank",
                     "nnodes",
+                    "master-addr",
+                    "master-port",
+                    "headless",
+                    "config",
+                    "api-server-count",
+                    "grpc",
+                    "all2all-backend",
+                    "enable-elastic-ep",
                     "distributed-executor-backend",
                     "enable-fault-tolerance",
                     "enable-dbo",
@@ -500,12 +569,21 @@ impl LaunchPlan {
             python_args: self.render_vllm_args(member)?,
         };
         if let Some(member) = member {
-            config.handshake_host = member.leader_address.clone();
+            config.handshake_host = if self.afd.is_some() && self.parallelism.dp == 1 {
+                LOOPBACK_HOST.into()
+            } else {
+                member.leader_address.clone()
+            };
+            let master_port = self
+                .afd
+                .as_ref()
+                .and_then(|afd| afd.coordination.as_ref())
+                .map_or(29800, |endpoint| endpoint.master_port);
             config.python_args.extend([
                 format!("--nnodes={}", self.engine_node_count()),
                 format!("--node-rank={}", member.index),
                 format!("--master-addr={}", member.leader_address),
-                "--master-port=29800".into(),
+                format!("--master-port={master_port}"),
                 "--distributed-executor-backend=mp".into(),
                 "--data-parallel-backend=mp".into(),
             ]);
@@ -513,7 +591,7 @@ impl LaunchPlan {
         Ok(config)
     }
 
-    /// Builds the startup command, including network calibration for distributed members.
+    /// Builds the startup command; ordinary distributed members retain MCCL calibration.
     ///
     /// The launcher execs the original engine, so its probes share the managed process group.
     pub fn engine_command(
@@ -523,6 +601,9 @@ impl LaunchPlan {
         startup_remaining: Duration,
     ) -> Command {
         let command = engine.to_command();
+        if self.afd.is_some() {
+            return command;
+        }
         let Some(member) = member else {
             return command;
         };

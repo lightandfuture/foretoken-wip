@@ -19,7 +19,7 @@ pub struct RuntimeConfig {
     pub member: Option<MemberContext>,
 }
 
-/// Pod-local identity supplied by Kubernetes and LeaderWorkerSet for distributed startup.
+/// Pod-local startup identity from an AFD plan or ordinary LeaderWorkerSet environment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemberContext {
     pub model_group_uid: String,
@@ -51,9 +51,27 @@ impl RuntimeConfig {
             .parse()
             .map_err(|_| format!("{LISTEN_ENV} must be a socket address"))?;
         let member = if launch.engine_node_count() > 1 {
-            let index = required_env("LWS_WORKER_INDEX")?
-                .parse::<usize>()
-                .map_err(|_| "LWS_WORKER_INDEX must be a nonnegative integer".to_string())?;
+            let (index, model_group_uid, leader_address) = if let Some(afd) = &launch.afd {
+                (
+                    afd.member_index,
+                    afd.group_uid.clone(),
+                    afd.coordination
+                        .as_ref()
+                        .expect("validated role endpoint")
+                        .host
+                        .clone(),
+                )
+            } else {
+                (
+                    required_env("LWS_WORKER_INDEX")?
+                        .parse::<usize>()
+                        .map_err(|_| {
+                            "LWS_WORKER_INDEX must be a nonnegative integer".to_string()
+                        })?,
+                    required_env(MODEL_GROUP_UID_ENV)?,
+                    required_env("LWS_LEADER_ADDRESS")?,
+                )
+            };
             if index >= launch.engine_node_count() {
                 return Err("LWS_WORKER_INDEX is outside the model group".into());
             }
@@ -61,10 +79,10 @@ impl RuntimeConfig {
                 .parse::<std::net::IpAddr>()
                 .map_err(|_| "FORETOKEN_MEMBER_IP must be a Pod IP address".to_string())?;
             Some(MemberContext {
-                model_group_uid: required_env(MODEL_GROUP_UID_ENV)?,
+                model_group_uid,
                 index,
                 address,
-                leader_address: required_env("LWS_LEADER_ADDRESS")?,
+                leader_address,
             })
         } else {
             None

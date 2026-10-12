@@ -5,30 +5,60 @@
 
 English | [简体中文](afd-managed-runtime_zh.md)
 
-The model-server consumes private V2 plans for a local, synchronous CUDA 1A1F
-pair. This is a runtime implementation, pending owner-executed OCI and A100
-acceptance; [Group materialization](afd-group-workload.md) adds fixed Pods and discovery,
-and complete-pair serving publication. Whole-Group recovery remains outstanding.
-Build the [fixed candidate image](afd-runtime.md) from the runtime source commit.
+The model-server consumes private V2 plans for synchronous CUDA AFD roles across
+multiple members or GPUs per member. OCI and A100 acceptance remain owner-executed.
+[Group materialization](afd-group-workload.md) still supports single-GPU 1A1F only;
+multi-member discovery, placement and complete-set publication remain controller
+work. Whole-Group recovery is incomplete. Build the [fixed image](afd-runtime.md).
 
 ## Plan and process ownership
 
-`FORETOKEN_VLLM_LAUNCH_PLAN` retains V1 for ordinary groups. V1 requires
-`nodeCount` with its existing whole-Group meaning. V2 forbids that field and
-requires `afd` with `role`, `memberIndex`, `memberCount`, `groupUid`, `host`,
-`port`, `numAttentionRanks`, and `numFfnRanks`. Only index 0, one member and
-one GPU rank per role are currently supported. Both roles use the same fresh
-Group UID and rendezvous endpoint, which must reach FFN. Multi-member plans
-fail before an engine starts.
+Ordinary V1 retains nodeCount and LWS environment semantics. V2 forbids nodeCount;
+afd supplies role, memberIndex, memberCount, groupUid, shared F0 host/port,
+numAttentionRanks and numFfnRanks. Both roles share one fresh Group UID and a
+rendezvous targeting only the member hosting F0. A multi-member role also requires
+an afd.coordination object with host, masterPort and handshakePort.
 
-Shared artifacts, lifecycle, parallelism, and native engine arguments retain
-the existing launch schema. V2 requires TP=PP=DP=PCP=DCP=1 and EP enabled,
-with no KV/EC transfer, KV events, EPLB, or native diagnostic instrumentation.
-The Rust renderer selects synchronous `P2pNcclAFDConnector`,
-`compute_gate_on_attention=false`, the V1 model runner and eager execution.
-It preserves other `additional-config` JSON entries, rejects user-owned `afd`,
-and emits one merged `--additional-config`. Native topology, worker-class,
-fault-tolerance and DBO overrides are rejected.
+The Group materializer supplies this UID-isolated, readiness-independent endpoint
+for member zero of each role. masterPort coordinates native workers; handshakePort
+connects that role's EngineCores to its Rust leader. Shared afd.host/port independently
+locates cross-role F0. Runtime consumes endpoints and creates no discovery objects.
+The materializer reserves nonconflicting ports and permits native peer traffic,
+including dynamic transport ports. Roles sharing a network namespace need distinct
+role ports. Neither endpoint may balance across other members or Groups.
+Single-member plans omit coordination and retain native local coordination.
+
+BuildAFDLaunchPlan is the actual Go projection boundary. The Pool compiler and
+Group workload owner still reject multi-member and multi-GPU materialization.
+Direct projection does not establish ModelService-to-multiple-Pod deployment.
+No public API or CRD field is added.
+
+Each role satisfies memberCount × GPUs per member = DP × TP. Local GPUs must divide
+TP or be divisible by TP, matching the fixed native homogeneous placement. Attention
+ranks must be at least FFN ranks; an integral cross-role ratio is not required.
+V2 retains PP=PCP=DCP=1, EP enabled, no KV/EC transfer, KV events, EPLB or native
+diagnostics. Rust alone renders synchronous P2pNcclAFDConnector, async_dp=false,
+compute_gate_on_attention=false, V1 model runner and eager execution. It preserves
+other additional-config content, rejects user afd and native topology overrides,
+and emits one merged JSON argument. Native aliases and abbreviations cannot
+supplant platform topology.
+
+| Identity | Producer and consumer |
+|---|---|
+| Role member index/count | Materializer → V2 → node-rank/nnodes; no physical-node deduplication |
+| GPUs per member G | Normalized resources; Rust derives DP × TP / memberCount |
+| DP placement | Fixed vLLM: local DP=max(G / TP, 1), first global DP rank=floor(memberIndex × G / TP) |
+| TP rank | Native worker process groups; TP may span members |
+| AFD role rank | Fixed plugin: global DP rank × TP + TP rank (PCP=1) |
+| AFD world rank | FFN: role rank; Attention: numFfnRanks + role rank |
+| Group UID | Persisted Group → plans, discovery isolation and readiness keys |
+
+Rust checks the exact local interval [memberIndex × G, (memberIndex + 1) × G).
+A Pod ordinal does not identify all its workers. Fixed vLLM argument handling owns
+DP placement; plugin topology owns AFD rank mapping. V2 member identity comes from
+the plan and its routable multi-member Pod address from FORETOKEN_MEMBER_IP.
+V1 retains LWS_WORKER_INDEX, LWS_LEADER_ADDRESS and its Group UID environment.
+AFD does not run the ordinary MetaX calibration launcher.
 
 The managed process receives the adapter through the existing Python source
 bundle. Its `vllm.general_plugins` entry point is inactive without the private
@@ -43,27 +73,27 @@ actual methods in the [P2P connector][p2p-source] and [FFN worker][ffn-source].
 The fixed vLLM [worker wrapper][worker-source] loads general plugins before
 constructing the worker:
 
-1. Successful `init_afd_connector` establishes the actual NCCL groups.
-2. FFN native EngineCore handshake can finish before its busy loop invokes
-   `start_ffn_server_loop`. That method's thread creation is not readiness.
-3. The first `recv_dp_metadata_list` entry follows CUDA device setup in the
-   actual FFN thread. It publishes a UID-scoped ready key in the existing P2P
-   group store, then reports local loop readiness on the private Unix socket.
-4. Attention waits for that store key before reporting connector completion.
-   This does not prevent the independent FFN handshake and loop from starting.
-5. Rust requires native handshake plus the worker events before opening its
-   HTTP listener. Attention retains the generation API; FFN has only health,
-   readiness and `/internal/afd/status`.
+1. Every worker completes actual connector initialization.
+2. Each FFN rank enters recv_dp_metadata_list after selecting its CUDA device,
+   writes a UID/rank key to its existing AFD subgroup store and publishes loop_ready.
+   Thread creation alone is insufficient. FFN handshake may precede loop startup.
+3. Each Attention worker waits for its mapped FFN subgroup key before reporting
+   connector_ready; this also covers workers outside the smaller metadata group.
+4. Attention publishes worker_ready after native compile/warmup completes.
+5. Rust requires connector and execution events from every expected local role rank,
+   retaining one channel per rank. Leaders also handshake with every DP EngineCore;
+   native executors initialize and monitor TP workers, including remote workers.
 
-The status response contains Group UID, role, member index/count and one
-aggregate `ready` boolean. There is no HTTP status listener during startup;
-connection failure must be treated as unavailable. It is not a fabricated
-sequence of per-stage status booleans. Kubernetes Group readiness and routing
-aggregates all expected members. Attention's serving gate starts closed and is
-controlled through `/internal/afd/serving` by the existing Group owner; see
-[serving readiness](afd-group-workload.md#serving-readiness-and-withdrawal).
-This reversible gate is independent of lifecycle drain admission.
+The existing status response contains Group UID, role, member index/count and
+aggregate member readiness. HTTP status is served only after startup; failed
+connections and timeouts mean unavailable. A member's readiness never substitutes
+for the complete Group set. Only Attention member zero exposes generation and the
+initially closed serving gate. Other Attention members and every FFN member expose
+lifecycle/status only. The Group owner must observe the complete set before opening
+admission; see [serving readiness](afd-group-workload.md#serving-readiness-and-withdrawal).
+No new state or recovery protocol is introduced.
 
+Prepare/resolve retain the shared artifact/cache lifecycle and never start engines.
 The startup deadline includes preparation, engine startup and AFD readiness.
 The plugin world rendezvous and ready-key wait take their timeout from the
 same lifecycle setting; the Rust deadline remains authoritative, including

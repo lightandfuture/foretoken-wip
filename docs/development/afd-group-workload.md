@@ -11,6 +11,11 @@ serving readiness. The same controller publishes an Attention-only generation
 Service and route after the complete pair is ready. It does not replace failed
 Groups. OCI and GPU/Kubernetes acceptance remain outstanding.
 
+Runtime projection accepts multiple role members; the Pool profile and workload
+owner still require one single-GPU member per role. Multi-member materialization
+must provide UID-scoped role coordination while retaining shared F0 discovery
+and the existing creation/cleanup owner.
+
 ## Identity and discovery
 
 The API server's Group UID scopes Pod names `afd-<uid>-attention-0` and

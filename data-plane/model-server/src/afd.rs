@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the Foretoken project
 
-//! Private worker observations for managed single-rank AFD members.
+//! Private worker observations for every local rank of an AFD member.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::{
@@ -12,42 +14,66 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use futures::{Stream, StreamExt, stream::SelectAll};
 use serde::Deserialize;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, BufReader, Lines};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::UnixListener;
+use tokio::sync::watch;
 
 use crate::api::RuntimeHealth;
 use crate::launch::{AfdPlan, ExecutionRole};
 
-/// Owns the socket that receives lifecycle events from this member's only GPU worker.
+/// Owns the local observation socket and aggregation task, never the worker processes.
 pub struct Observer {
     path: PathBuf,
-    listener: UnixListener,
-    input: Mutex<Option<Lines<BufReader<UnixStream>>>>,
+    state: watch::Receiver<WorkerState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone, Default)]
+struct WorkerState {
+    ready: bool,
+    failure: Option<String>,
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case", deny_unknown_fields)]
-enum Event {
-    ConnectorReady { error: Option<String> },
-    LoopReady { error: Option<String> },
-    Fatal { error: String },
+#[serde(deny_unknown_fields)]
+struct Event {
+    rank: usize,
+    event: EventKind,
+    error: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EventKind {
+    ConnectorReady,
+    WorkerReady,
+    LoopReady,
+    Fatal,
+}
+
+type WorkerStream = Pin<Box<dyn Stream<Item = io::Result<(usize, Event)>> + Send>>;
+
 impl Observer {
-    /// Binds a unique local endpoint before spawn; Drop removes the owned socket path.
-    pub fn bind() -> io::Result<Self> {
+    /// Starts exact-set observation before spawn; Drop aborts it and removes the socket.
+    pub fn bind(plan: &AfdPlan) -> io::Result<Self> {
         let path = std::env::temp_dir().join(format!("afd-{}.sock", uuid::Uuid::new_v4().simple()));
-        Ok(Self {
-            listener: UnixListener::bind(&path)?,
-            path,
-            input: Mutex::new(None),
-        })
+        let listener = UnixListener::bind(&path)?;
+        let (sender, state) = watch::channel(WorkerState::default());
+        let plan = plan.clone();
+        let task = tokio::spawn(async move {
+            let error = observe_workers(listener, plan, &sender).await;
+            sender.send_replace(WorkerState {
+                ready: false,
+                failure: Some(error.to_string()),
+            });
+        });
+        Ok(Self { path, state, task })
     }
 
-    /// Passes the worker observation address through the managed child's environment.
+    /// Passes the existing private observation channel through the managed child's environment.
     pub fn configure(&self, command: &mut std::process::Command) {
         command.env("FORETOKEN_AFD_STATUS_SOCKET", &self.path);
         if let Ok(plugins) = std::env::var("VLLM_PLUGINS") {
@@ -55,50 +81,111 @@ impl Observer {
         }
     }
 
-    /// Waits for actual connector completion and, for FFN, entry into its receive loop.
-    pub async fn ready(&self, ffn: bool) -> io::Result<()> {
-        let mut connector = false;
-        let mut loop_ready = !ffn;
-        while !connector || !loop_ready {
-            match self.next().await? {
-                Event::ConnectorReady { error: None } => connector = true,
-                Event::LoopReady { error: None } => loop_ready = true,
-                Event::Fatal { error } => return Err(io::Error::other(error)),
-                _ => return Err(io::Error::other("invalid AFD worker readiness event")),
-            }
+    /// Requires connector and execution readiness from every expected local role rank.
+    pub async fn ready(&self) -> io::Result<()> {
+        let mut state = self.state.clone();
+        let value = state
+            .wait_for(|state| state.ready || state.failure.is_some())
+            .await
+            .map_err(|_| io::Error::other("AFD observation task ended"))?;
+        match &value.failure {
+            Some(error) => Err(io::Error::other(error.clone())),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    /// Watches the same worker connection for fatal errors or loss after initialization.
+    /// Reports any worker fatal or channel loss, including failures observed during startup.
     pub async fn failure(&self) -> io::Error {
-        loop {
-            match self.next().await {
-                Ok(Event::Fatal { error }) => return io::Error::other(error),
-                Err(error) => return error,
-                Ok(_) => {}
-            }
+        let mut state = self.state.clone();
+        match state.wait_for(|state| state.failure.is_some()).await {
+            Ok(value) => io::Error::other(value.failure.clone().expect("observed failure")),
+            Err(_) => io::Error::other("AFD observation task ended"),
         }
     }
+}
 
-    /// Reads from the retained worker stream; cancellation preserves partial frame buffers.
-    async fn next(&self) -> io::Result<Event> {
-        let mut input = self.input.lock().await;
-        if input.is_none() {
-            *input = Some(BufReader::new(self.listener.accept().await?.0).lines());
+/// Aggregates the existing worker protocol and keeps every channel live after readiness.
+async fn observe_workers(
+    listener: UnixListener,
+    plan: AfdPlan,
+    state: &watch::Sender<WorkerState>,
+) -> io::Error {
+    let expected = plan.local_ranks();
+    let mut streams = SelectAll::<WorkerStream>::new();
+    let mut identities = BTreeMap::new();
+    let mut connectors = BTreeSet::new();
+    let mut execution = BTreeSet::new();
+    let mut connection_id = 0;
+    loop {
+        let (connection, event) = tokio::select! {
+            result = listener.accept() => {
+                let (stream, _) = match result {
+                    Ok(connection) => connection,
+                    Err(error) => return error,
+                };
+                let id = connection_id;
+                connection_id += 1;
+                streams.push(Box::pin(async_stream::try_stream! {
+                    let mut lines = BufReader::new(stream).lines();
+                    while let Some(line) = lines.next_line().await? {
+                        let event = serde_json::from_str::<Event>(&line).map_err(io::Error::other)?;
+                        yield (id, event);
+                    }
+                    Err(io::Error::other(format!("AFD worker channel {id} closed")))?;
+                }));
+                continue;
+            },
+            event = streams.next(), if !streams.is_empty() => match event {
+                Some(Ok(event)) => event,
+                Some(Err(error)) => return error,
+                None => return io::Error::other("AFD worker channels ended"),
+            },
+        };
+        // One connection owns exactly one expected worker; neither duplicates nor
+        // identities changing midstream may stand in for a missing local rank.
+        if !expected.contains(&event.rank)
+            || identities
+                .iter()
+                .any(|(rank, id)| (*rank == event.rank) != (*id == connection))
+        {
+            return io::Error::other(format!(
+                "invalid AFD worker identity {} on channel {connection}",
+                event.rank
+            ));
         }
-        let line = input
-            .as_mut()
-            .expect("connected observer")
-            .next_line()
-            .await?
-            .ok_or_else(|| io::Error::other("AFD worker observation channel closed"))?;
-        serde_json::from_str(&line).map_err(io::Error::other)
+        identities.insert(event.rank, connection);
+        if let Some(error) = event.error {
+            return io::Error::other(format!("AFD worker {}: {error}", event.rank));
+        }
+        let inserted = match event.event {
+            EventKind::ConnectorReady => connectors.insert(event.rank),
+            EventKind::LoopReady
+                if plan.role == ExecutionRole::Ffn && connectors.contains(&event.rank) =>
+            {
+                execution.insert(event.rank)
+            }
+            EventKind::WorkerReady
+                if plan.role == ExecutionRole::Attention && connectors.contains(&event.rank) =>
+            {
+                execution.insert(event.rank)
+            }
+            _ => false,
+        };
+        if !inserted {
+            return io::Error::other(format!(
+                "invalid AFD readiness event for worker {}",
+                event.rank
+            ));
+        }
+        if connectors.len() == expected.len() && execution.len() == expected.len() {
+            state.send_modify(|state| state.ready = true);
+        }
     }
 }
 
 impl Drop for Observer {
     fn drop(&mut self) {
+        self.task.abort();
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -107,7 +194,7 @@ impl Drop for Observer {
 /// FFN retains read-only status; neither role gains a generation route here.
 pub fn status_router(plan: AfdPlan, health: Arc<RuntimeHealth>) -> Router {
     let mut router = Router::new();
-    if plan.role == ExecutionRole::Attention {
+    if plan.role == ExecutionRole::Attention && plan.member_index == 0 {
         let identity = plan.clone();
         let admission = health.clone();
         router = router.route(

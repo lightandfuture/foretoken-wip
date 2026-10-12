@@ -5,25 +5,51 @@
 
 [English](afd-managed-runtime.md) | 简体中文
 
-model-server 可消费私有 V2 plan，启动本机同步 CUDA 1A1F。当前实现仍待负责人
-执行 OCI 构建和 A100 验收。[Group 物化](afd-group-workload_zh.md) 提供固定 Pod 和发现，
-并聚合完整成员发布服务，整组恢复仍待实现。使用运行时源码
-提交构建[固定候选镜像](afd-runtime_zh.md)。
+model-server 消费私有 V2 plan，支持同步 CUDA AFD 角色跨多成员或单成员多 GPU。
+OCI 和 A100 验收仍由负责人执行。[Group 物化](afd-group-workload_zh.md) 当前仍限于
+两侧各一个单 GPU Pod；多成员发现、放置和完整集合发布属于后续控制面工作，整组恢复
+仍未闭环。使用运行时源码构建[固定候选镜像](afd-runtime_zh.md)。
 
 ## 启动契约与生命周期
 
-普通 Group 的 `FORETOKEN_VLLM_LAUNCH_PLAN` 保留 V1，`nodeCount` 仍表示整个
-Group 的节点数。V2 禁止该字段，必须提供 `afd` 中的 `role`、`memberIndex`、
-`memberCount`、`groupUid`、`host`、`port`、`numAttentionRanks` 和
-`numFfnRanks`。当前仅支持每角色 index=0、一个成员和一个 GPU rank。两侧使用
-同一新 Group UID 和指向 FFN 的 rendezvous；多成员输入在引擎启动前明确失败。
+普通 V1 保留 nodeCount 及原有 LWS 环境语义。V2 禁止 nodeCount，由 afd 提供 role、
+memberIndex、memberCount、groupUid、共享 F0 host/port、numAttentionRanks 和
+numFfnRanks。两侧共享新 Group UID，rendezvous 只能定位承载 F0 的成员。
+多成员角色还须提供含 host、masterPort、handshakePort 的 afd.coordination 对象。
 
-模型、生命周期、并行参数和原生参数沿用现有契约。V2 要求
-TP=PP=DP=PCP=DCP=1、启用 EP，不支持 KV/EC 传输、KV 事件、EPLB 或原生诊断
-工具。Rust 唯一渲染方固定同步 `P2pNcclAFDConnector`、
-`compute_gate_on_attention=false`、V1 model runner 和 eager 执行。
-其他合法 `additional-config` JSON 内容保留，用户 `afd` 被拒绝，合并后只发
-一个参数。原生拓扑、worker class、fault tolerance 和 DBO 覆盖也会拒绝。
+Group 物化方提供按 UID 隔离、启动发现不依赖 Ready 的角色成员零端点。masterPort
+协调原生 worker，handshakePort 连接该角色 EngineCore 与 Rust leader；共享
+跨角色 afd.host/port 独立定位 F0。运行时只消费端点，不创建发现对象。物化方须预留
+不冲突端口，允许原生 peer 流量及动态传输端口。共用网络命名空间的角色须使用不同
+角色端口，端点不能负载均衡到其他成员或 Group。单成员省略 coordination，保留
+原生本地协调。
+
+BuildAFDLaunchPlan 是实际 Go 生产投影边界。Pool compiler 与 Group 工作负载 owner
+仍拒绝多成员、多 GPU 物化，直接调用投影不代表 ModelService→多 Pod 已接通。
+本次不增加公共 API/CRD 字段。
+
+每角色满足 memberCount × 每成员 GPU 数 = DP × TP。每成员 GPU 数须整除 TP
+或被 TP 整除，与固定原生同构放置一致。Attention ranks 不少于 FFN，不要求整数比例。
+V2 保持 PP=PCP=DCP=1、EP 开启，无 KV/EC 传输、KV 事件、EPLB 或原生诊断。
+Rust 唯一渲染同步 P2pNcclAFDConnector、async_dp=false、compute_gate_on_attention=false、
+V1 model runner 和 eager 执行。保留其他合法 additional-config 内容，拒绝用户 afd
+与原生拓扑覆盖，只发一个合并 JSON 参数。原生别名和缩写不能覆盖平台拓扑。
+
+| 身份 | 生产者与消费者 |
+|---|---|
+| 角色 memberIndex/memberCount | 物化方 → V2 → node-rank/nnodes，不取物理节点去重数 |
+| 每成员 GPU 数 G | 规范化资源；Rust 从 DP × TP / memberCount 推导 |
+| DP 放置 | 固定 vLLM：本地 DP=max(G / TP, 1)，起始全局 DP rank=floor(memberIndex × G / TP) |
+| TP rank | 原生 worker 进程组，可跨成员 |
+| AFD role rank | 固定插件：全局 DP rank × TP + TP rank（PCP=1） |
+| AFD world rank | FFN 为 role rank；Attention 为 numFfnRanks + role rank |
+| Group UID | 已持久化 Group → plan、发现隔离和就绪键 |
+
+Rust 核对精确本地集合 [memberIndex × G, (memberIndex + 1) × G)，Pod 序号不能代表
+全部 worker。固定 vLLM 参数实现拥有 DP 放置，插件 topology 拥有 AFD rank 映射。
+V2 身份来自 plan，多成员 Pod 的可路由地址由 FORETOKEN_MEMBER_IP 提供。
+普通 V1 仍解释 LWS_WORKER_INDEX、LWS_LEADER_ADDRESS 和 Group UID 环境。
+AFD 不进入普通 MetaX 网络校准 launcher。
 
 适配器随既有 Python 源码包分发，使用 `vllm.general_plugins` 入口；没有私有
 状态 socket 环境时不激活。运行时保留显式 `VLLM_PLUGINS` 列表，并加入两个
@@ -36,24 +62,22 @@ TP=PP=DP=PCP=DCP=1、启用 EP，不支持 KV/EC 传输、KV 事件、EPLB 或�
 [P2P connector][p2p-source] 和 [FFN worker][ffn-source] 的真实方法执行。
 固定 vLLM 的 [worker 包装层][worker-source] 在构造 worker 之前加载通用插件：
 
-1. `init_afd_connector` 成功后，实际 NCCL 通信组已创建。
-2. FFN 原生握手可能早于 busy loop 调用 `start_ffn_server_loop`。
-   该方法仅创建线程，不能作为循环就绪。
-3. FFN 线程完成 CUDA device 设置，首次进入 `recv_dp_metadata_list` 时，
-   在既有 P2P group store 写入 UID 隔离的就绪键，并通过私有 Unix socket
-   上报本地 loop 就绪。
-4. Attention 等待该键，再上报 connector 完成；这一等待不阻碍独立 FFN
-   握手和循环启动。
-5. Rust 同时取得原生握手和 worker 事件后才开启 HTTP listener。
-   Attention 保留生成入口，FFN 仅有 health、ready 和 `/internal/afd/status`。
+1. 每个 worker 完成实际 connector 初始化。
+2. FFN rank 设置 CUDA device 后进入 recv_dp_metadata_list，在既有 AFD subgroup
+   store 写 UID/rank 键并上报 loop_ready。创建线程本身不代表就绪，FFN 握手可早于循环。
+3. 每个 Attention worker 等待其映射的 FFN subgroup 键，再上报 connector_ready；
+   包含未加入较小 metadata group 的 worker。
+4. Attention 在实际原生 compile/warmup 完成后上报 worker_ready。
+5. Rust 要求全部预期本地 role rank 的 connector 与执行事件，每 rank 保留独立通道。
+   Leader 还须完成全部 DP EngineCore 握手；原生 executor 初始化并监视含远端的 TP worker。
 
-状态响应包含 Group UID、角色、成员序号/数量和一个聚合 `ready` 布尔值。
-启动阶段没有 HTTP listener，连接失败表示不可用；不伪造分阶段布尔状态。
-Attention serving gate 启动时关闭，由既有 Group owner 通过 `/internal/afd/serving`
-控制；见[服务就绪](afd-group-workload_zh.md#服务就绪与入口撤销)。
-此可恢复开关独立于 lifecycle drain admission。
-Kubernetes Group 就绪与路由仍须聚合所有预期成员。
+沿用既有状态响应：Group UID、角色、成员索引/数量和聚合成员 ready。启动完成后才
+提供 HTTP 状态，连接失败或超时表示不可用。成员就绪不能代表完整 Group 集合。
+仅 Attention 成员零提供生成和启动时关闭的 serving gate；其他 Attention 成员及
+所有 FFN 仅提供生命周期/状态接口。Group owner 必须观测完整集合再打开 admission，
+见[服务就绪](afd-group-workload_zh.md#服务就绪与入口撤销)。不引入第二状态或恢复协议。
 
+prepare/resolve 保留共享模型/缓存准备生命周期，不启动引擎。
 同一个 startup deadline 覆盖准备、引擎启动和 AFD 就绪。插件 world rendezvous
 及就绪键等待使用同一 lifecycle timeout；Rust 外层截止仍控制插件内部固定超时
 操作。FFN 致命错误、状态通道断开、EngineCore 不健康或子进程退出均终止本成员。

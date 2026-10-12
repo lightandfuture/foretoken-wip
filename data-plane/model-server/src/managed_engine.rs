@@ -23,10 +23,10 @@ impl ManagedEngine {
     pub async fn spawn(
         mut command: Command,
         profiling: Option<&Config>,
-        afd: bool,
+        afd: Option<&crate::launch::AfdPlan>,
     ) -> Result<Self, String> {
         let observer = afd
-            .then(crate::afd::Observer::bind)
+            .map(crate::afd::Observer::bind)
             .transpose()
             .map_err(|error| error.to_string())?;
         if let Some(observer) = &observer {
@@ -50,12 +50,9 @@ impl ManagedEngine {
     }
 
     /// Requires real worker completion in addition to the native EngineCore handshake.
-    pub async fn wait_afd_ready(&self, ffn: bool) -> Result<(), String> {
+    pub async fn wait_afd_ready(&self) -> Result<(), String> {
         if let Some(observer) = &self.afd {
-            observer
-                .ready(ffn)
-                .await
-                .map_err(|error| error.to_string())?;
+            observer.ready().await.map_err(|error| error.to_string())?;
         }
         Ok(())
     }

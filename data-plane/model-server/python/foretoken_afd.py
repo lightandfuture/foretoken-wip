@@ -15,14 +15,15 @@ _lock = threading.Lock()
 _registered = False
 
 
-def _publish(event: str, error: str | None = None) -> None:
+def _publish(connector, event: str, error: str | None = None) -> None:
     """Send worker lifecycle facts to the owning model-server over its private socket."""
     global _connection
     with _lock:
         if _connection is None:
             _connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             _connection.connect(os.environ["FORETOKEN_AFD_STATUS_SOCKET"])
-        _connection.sendall((json.dumps({"event": event, "error": error}) + "\n").encode())
+        payload = {"rank": connector.mapping.role_rank, "event": event, "error": error}
+        _connection.sendall((json.dumps(payload) + "\n").encode())
 
 
 def register() -> None:
@@ -35,6 +36,7 @@ def register() -> None:
         P2pNcclAFDConnector,
         P2pNcclAFDControlPlane,
     )
+    from afd_plugin.v1.worker.attention_worker import AFDAttentionWorker
     from afd_plugin.v1.worker.ffn_worker import AFDFFNWorker
 
     # These methods belong to plugin b7561d7. Observe successful collectives and
@@ -45,20 +47,22 @@ def register() -> None:
     def initialize(self):
         try:
             original_init(self)
-            if self.p2p_pg is None:
-                raise RuntimeError("managed 1A1F requires both ranks in the P2P metadata group")
+            if getattr(self, "_foretoken_connector_reported", False):
+                return
             if self.afd_config.role == "attention":
                 # FFN's native handshake precedes its busy loop. It can complete
                 # independently while Attention waits in connector initialization.
-                # Use the existing group store; no second rendezvous owner is needed.
-                key = f"foretoken/{os.environ['FORETOKEN_AFD_GROUP_UID']}/ffn-loop-ready"
-                self.p2p_pg.get_group_store().wait(
+                # Every Attention worker has its subgroup store, including workers
+                # outside the smaller metadata group. Its FFN rank writes the key.
+                key = f"foretoken/{os.environ['FORETOKEN_AFD_GROUP_UID']}/ffn/{self.mapping.subgroup_index}/loop-ready"
+                self.a2e_group.store.wait(
                     [key], timedelta(seconds=self.afd_config.afd_process_group_timeout_s)
                 )
         except Exception as error:
-            _publish("fatal", str(error))
+            _publish(self, "fatal", str(error))
             raise
-        _publish("connector_ready")
+        _publish(self, "connector_ready")
+        self._foretoken_connector_reported = True
 
     P2pNcclAFDConnector.init_afd_connector = initialize
     original_receive = P2pNcclAFDControlPlane.recv_dp_metadata_list
@@ -68,9 +72,9 @@ def register() -> None:
         if not getattr(self, "_foretoken_loop_reported", False):
             # The FFN worker has set its CUDA device and is entering its first
             # blocking receive. Publish only here, never after Thread.start().
-            key = f"foretoken/{os.environ['FORETOKEN_AFD_GROUP_UID']}/ffn-loop-ready"
-            self.connector.p2p_pg.get_group_store().set(key, "ready")
-            _publish("loop_ready")
+            key = f"foretoken/{os.environ['FORETOKEN_AFD_GROUP_UID']}/ffn/{self.connector.mapping.role_rank}/loop-ready"
+            self.connector.a2e_group.store.set(key, "ready")
+            _publish(self.connector, "loop_ready")
             self._foretoken_loop_reported = True
         return original_receive(self, *args, **kwargs)
 
@@ -82,7 +86,19 @@ def register() -> None:
         try:
             original_check(self)
         except RuntimeError as error:
-            _publish("fatal", str(error.__cause__ or error))
+            _publish(self.model_runner.connector, "fatal", str(error.__cause__ or error))
             raise
 
     AFDFFNWorker.raise_ffn_loop_error_if_any = check_error
+
+    # Nonleader TP workers have no EngineCore client. The actual warmup RPC,
+    # together with connector completion, establishes their execution readiness.
+    original_warmup = AFDAttentionWorker.compile_or_warm_up_model
+
+    @functools.wraps(original_warmup)
+    def warmup(self, *args, **kwargs):
+        result = original_warmup(self, *args, **kwargs)
+        _publish(self.model_runner.connector, "worker_ready")
+        return result
+
+    AFDAttentionWorker.compile_or_warm_up_model = warmup

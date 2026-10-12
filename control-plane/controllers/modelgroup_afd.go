@@ -37,6 +37,11 @@ func afdRendezvousName(group *inferencev1alpha1.ModelGroup) string {
 
 // afdMemberLaunchPlan supplies the persisted Group identity and F0 DNS name to the V2 adapter.
 func afdMemberLaunchPlan(group *inferencev1alpha1.ModelGroup, role inferencev1alpha1.AFDExecutionRole) (vllmconfig.LaunchPlan, error) {
+	for _, side := range []inferencev1alpha1.AFDMemberSpec{group.Spec.AFD.Attention, group.Spec.AFD.FFN} {
+		if side.MemberCount != 1 || side.Resources.Requests.GPU.Count != 1 {
+			return vllmconfig.LaunchPlan{}, fmt.Errorf("AFD workload materialization currently requires one single-GPU member per role")
+		}
+	}
 	return vllmconfig.BuildAFDLaunchPlan(group.Spec, vllmconfig.AFDMember{
 		Role: role, Index: 0, GroupUID: string(group.UID),
 		RendezvousHost: afdRendezvousName(group) + "." + group.Namespace + ".svc",

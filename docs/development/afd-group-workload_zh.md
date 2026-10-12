@@ -10,6 +10,10 @@ ModelGroup 控制器按 [managed V2 契约](afd-managed-runtime_zh.md) 物化固
 Service 和路由，不替换失败 Group。
 OCI 和真实 GPU/Kubernetes 验收仍未完成。
 
+运行时投影支持多个角色成员，Pool profile 和工作负载 owner 仍要求每角色一个
+单 GPU 成员。多成员物化须提供 UID 隔离的角色协调端点，保留共享 F0 发现与
+既有创建/清理 owner。
+
 ## 身份与发现
 
 Pod 名为 `afd-<uid>-attention-0` 和 `afd-<uid>-ffn-0`，UID 来自 API server

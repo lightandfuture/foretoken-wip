@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect_timeout(Duration::from_secs(5))
         .build()?;
     let listener = TcpListener::bind(listen).await?;
-    let child = ManagedEngine::spawn(engine_command(&plan)?, None, false).await?;
+    let child = ManagedEngine::spawn(engine_command(&plan)?, None, None).await?;
     if let Err(error) = wait_until_ready(
         &client,
         &upstream,

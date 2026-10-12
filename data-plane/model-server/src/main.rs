@@ -477,26 +477,61 @@ async fn run_worker(
     cache_shutdown: Arc<Notify>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(config.listen_address).await?;
+    let startup_deadline = Instant::now() + config.launch.startup_timeout();
     let (engine, _, _, _) = spawn_engine_attempt(
         config,
         cache,
         profiling,
         runtime_cache::Mode::Persistent,
-        Instant::now() + config.launch.startup_timeout(),
+        startup_deadline,
     )
     .await
     .map_err(EngineStartupFailure::into_error)?;
+    if config.launch.afd.is_some() {
+        let ready = tokio::select! {
+            result = engine.wait_afd_ready() => result,
+            () = tokio::time::sleep(startup_deadline.saturating_duration_since(Instant::now())) => Err("AFD member readiness exceeded startup deadline".into()),
+            () = shutdown_signal() => Err("AFD member startup cancelled".into()),
+            status = engine.wait_for_exit() => Err(format!("AFD member exited during startup: {status}")),
+            reason = wait_cache_server(cache_server) => Err(reason),
+            error = wait_cache_write_failure(cache, runtime_cache::Mode::Persistent) => Err(error.to_string()),
+        };
+        if let Err(error) = ready {
+            cache_shutdown.notify_waiters();
+            engine.shutdown(config.launch.drain_timeout()).await?;
+            return Err(io::Error::other(error).into());
+        }
+    }
     let shutdown = Arc::new(Notify::new());
     let server_shutdown = shutdown.clone();
-    let app = axum::Router::new()
+    let health = Arc::new(RuntimeHealth::new());
+    health.set_process_alive(true);
+    health.set_client_healthy(true);
+    let probe = health.clone();
+    let mut app = axum::Router::new()
+        .route(
+            "/readyz",
+            axum::routing::get(move || {
+                let health = probe.clone();
+                async move {
+                    if health.ready() {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        )
         .route(
             "/healthz",
             axum::routing::get(|| async { axum::http::StatusCode::OK }),
-        )
-        .route(
-            "/readyz",
-            axum::routing::get(|| async { axum::http::StatusCode::OK }),
         );
+    if let Some(afd) = &config.launch.afd {
+        app = app.merge(foretoken_model_server::afd::status_router(
+            afd.clone(),
+            health.clone(),
+        ));
+    }
     let mut server = Box::pin(
         axum::serve(listener, app)
             .with_graceful_shutdown(async move { server_shutdown.notified().await })
@@ -505,13 +540,16 @@ async fn run_worker(
     let failure = tokio::select! {
         () = shutdown_signal() => None,
         status = engine.wait_for_exit() => Some(format!("managed worker exited: {status}")),
+        reason = engine.wait_afd_failure() => Some(reason),
         result = &mut server => Some(format!("worker health server stopped: {result:?}")),
         reason = wait_cache_server(cache_server) => Some(reason),
         error = wait_cache_write_failure(cache, runtime_cache::Mode::Persistent) => Some(error.to_string()),
     };
+    health.set_client_healthy(false);
     shutdown.notify_waiters();
     cache_shutdown.notify_waiters();
     engine.shutdown(config.launch.drain_timeout()).await?;
+    health.set_process_alive(false);
     match failure {
         Some(message) => Err(io::Error::other(message).into()),
         None => Ok(()),
@@ -661,7 +699,14 @@ async fn spawn_engine_attempt(
                 .to_string(),
         ));
     }
-    let handshake_port = if config.member.is_some() {
+    let handshake_port = if let Some(endpoint) = config
+        .launch
+        .afd
+        .as_ref()
+        .and_then(|afd| afd.coordination.as_ref())
+    {
+        endpoint.handshake_port
+    } else if config.member.is_some() {
         29700
     } else {
         allocate_handshake_port(LOOPBACK_HOST)
@@ -762,7 +807,7 @@ async fn spawn_engine_attempt(
     );
     command.envs(environment);
     let instrumentation = profiling.filter(|_| mode == runtime_cache::Mode::Persistent);
-    let engine = ManagedEngine::spawn(command, instrumentation, config.launch.afd.is_some())
+    let engine = ManagedEngine::spawn(command, instrumentation, config.launch.afd.as_ref())
         .await
         .map_err(|error| {
             classify_engine_startup_failure(
@@ -820,6 +865,7 @@ async fn start_engine_attempt(
             Ok(client) => Ok(client),
             Err(error) => Err(classify_engine_startup_failure(cache, mode, format!("could not connect to EngineCore: {error}"))),
         },
+        reason = engine.wait_afd_failure() => Err(EngineStartupFailure::Other(io::Error::other(reason))),
         () = shutdown_signal() => Err(EngineStartupFailure::Other(io::Error::new(io::ErrorKind::Interrupted, "engine startup cancelled"))),
         status = engine.wait_for_exit() => Err(classify_engine_startup_failure(cache, mode, format!("managed EngineCore exited during startup: {status}"))),
         reason = wait_cache_server(cache_server) => Err(EngineStartupFailure::Other(io::Error::other(format!("cache observation server stopped during startup: {reason}")))),
@@ -828,7 +874,7 @@ async fn start_engine_attempt(
     match client {
         Ok(client) => {
             let result = tokio::select! {
-                result = engine.wait_afd_ready(config.launch.is_ffn()) => result,
+                result = engine.wait_afd_ready() => result,
                 () = tokio::time::sleep(startup_deadline.saturating_duration_since(Instant::now())) => Err("AFD readiness exceeded startup deadline".into()),
                 status = engine.wait_for_exit() => Err(format!("engine exited before AFD readiness: {status}")),
                 () = shutdown_signal() => Err("engine startup cancelled".into()),
