@@ -33,7 +33,7 @@ make image-model-server-afd \
 AFD 目标默认使用 `/usr/bin/python3`；显式设置 `FORETOKEN_VLLM_PYTHON`
 可为两步构建选择其他解释器。插件 wheel 独立构建后安装到该环境。
 构建核对 vLLM 0.30.0、PyTorch 2.13.0/cu130、
-CUDA 13.0.3 和 NCCL 2.29.7，执行 `uv pip check`，并将测得版本写入
+镜像 CUDA_VERSION 13.0.2 和 NCCL 2.29.7，执行 `uv pip check`，并将测得版本写入
 `/usr/share/foretoken/afd-runtime.json`。NCCL 选择同时更新继承的 uv
 override，供后续包安装使用。该同步 P2P 候选环境不支持 DeepEPv2 GIN。
 版本依据见[固定来源](afd-runtime-sources_zh.md)。
@@ -71,14 +71,19 @@ export MODEL_REVISION='<full DeepSeek-V2-Lite commit>'
 export MODEL_CACHE='<existing absolute model-cache directory>'
 ```
 
-用同一镜像启动两个容器，各分配一张不同 GPU，使用
+选择两张空闲 GPU，通过 `nvidia-smi -L` 记录 UUID，并在两个宿主机终端
+分别将 `ATTENTION_GPU` 和 `FFN_GPU` 导出为对应 UUID。用同一镜像启动
+两个容器，两侧均开放这两个设备以支持 NCCL 跨卡显存导入；通过
+`CUDA_VISIBLE_DEVICES` 为每个角色选择一张不同 GPU。使用
 `--network host --ipc host` 并挂载模型缓存。将镜像 entrypoint 改为 `sh`。
 在容器内运行下面命令，FFN 使用 `ROLE=ffn`、`HTTP_PORT=18001`；Attention
 使用 `ROLE=attention`、`HTTP_PORT=18000`。两侧都启动后才能完成 rendezvous。
 在第一个终端执行：
 
 ```bash
-docker run -it --name foretoken-afd-ffn --gpus device=1 \
+docker run -it --name foretoken-afd-ffn \
+  --gpus "\"device=$ATTENTION_GPU,$FFN_GPU\"" \
+  -e CUDA_VISIBLE_DEVICES="$FFN_GPU" -e NCCL_DEBUG=INFO \
   --network host --ipc host -v "$MODEL_CACHE:/root/.cache/huggingface" \
   -e MODEL_REVISION -e ROLE=ffn -e HTTP_PORT=18001 \
   --entrypoint sh "$AFD_IMAGE"
@@ -87,7 +92,9 @@ docker run -it --name foretoken-afd-ffn --gpus device=1 \
 在第二个终端执行：
 
 ```bash
-docker run -it --name foretoken-afd-attention --gpus device=0 \
+docker run -it --name foretoken-afd-attention \
+  --gpus "\"device=$ATTENTION_GPU,$FFN_GPU\"" \
+  -e CUDA_VISIBLE_DEVICES="$ATTENTION_GPU" -e NCCL_DEBUG=INFO \
   --network host --ipc host -v "$MODEL_CACHE:/root/.cache/huggingface" \
   -e MODEL_REVISION -e ROLE=attention -e HTTP_PORT=18000 \
   --entrypoint sh "$AFD_IMAGE"

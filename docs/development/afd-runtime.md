@@ -34,7 +34,7 @@ MetaX, and Omni builds do not select AFD. Standard installation selects this sep
 The AFD targets select `/usr/bin/python3` by default; an explicit
 `FORETOKEN_VLLM_PYTHON` selects another interpreter for both builds. The plugin
 wheel is built separately and installed in that environment. The build checks vLLM 0.30.0,
-PyTorch 2.13.0/cu130, CUDA 13.0.3, and NCCL 2.29.7, runs `uv pip check`,
+PyTorch 2.13.0/cu130, image CUDA_VERSION 13.0.2, and NCCL 2.29.7, runs `uv pip check`,
 and writes measured versions to `/usr/share/foretoken/afd-runtime.json`.
 The NCCL selection also replaces the inherited uv override for subsequent
 package installations. This synchronous P2P candidate does not support
@@ -75,14 +75,19 @@ export MODEL_REVISION='<full DeepSeek-V2-Lite commit>'
 export MODEL_CACHE='<existing absolute model-cache directory>'
 ```
 
-Start two containers from the same image, each with one distinct GPU and
-`--network host --ipc host`, mounting the model cache. Override the image
+Choose two idle GPUs and record their UUIDs with `nvidia-smi -L`. Export
+`ATTENTION_GPU` and `FFN_GPU` with those UUIDs in both host terminals.
+Start two containers from the same image with both devices accessible for
+NCCL peer-memory import. `CUDA_VISIBLE_DEVICES` selects one distinct GPU
+per role. Use `--network host --ipc host` and mount the model cache. Override the image
 entrypoint with `sh`; inside each container run the following command with
 `ROLE=ffn` / `HTTP_PORT=18001` or `ROLE=attention` / `HTTP_PORT=18000`. Both
 processes must start to complete the shared rendezvous. In the first terminal:
 
 ```bash
-docker run -it --name foretoken-afd-ffn --gpus device=1 \
+docker run -it --name foretoken-afd-ffn \
+  --gpus "\"device=$ATTENTION_GPU,$FFN_GPU\"" \
+  -e CUDA_VISIBLE_DEVICES="$FFN_GPU" -e NCCL_DEBUG=INFO \
   --network host --ipc host -v "$MODEL_CACHE:/root/.cache/huggingface" \
   -e MODEL_REVISION -e ROLE=ffn -e HTTP_PORT=18001 \
   --entrypoint sh "$AFD_IMAGE"
@@ -91,7 +96,9 @@ docker run -it --name foretoken-afd-ffn --gpus device=1 \
 In the second terminal:
 
 ```bash
-docker run -it --name foretoken-afd-attention --gpus device=0 \
+docker run -it --name foretoken-afd-attention \
+  --gpus "\"device=$ATTENTION_GPU,$FFN_GPU\"" \
+  -e CUDA_VISIBLE_DEVICES="$ATTENTION_GPU" -e NCCL_DEBUG=INFO \
   --network host --ipc host -v "$MODEL_CACHE:/root/.cache/huggingface" \
   -e MODEL_REVISION -e ROLE=attention -e HTTP_PORT=18000 \
   --entrypoint sh "$AFD_IMAGE"

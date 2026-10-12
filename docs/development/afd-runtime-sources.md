@@ -83,6 +83,12 @@ separate `v0.30.0-cu129` variant for CUDA 12.9. Tags are not immutable pins.
   communication, including request output, exit status, remaining GPU processes,
   and Pod state. Imports and open ports are insufficient acceptance.
 
+The published linux/amd64 image selected for the native experiment declares
+CUDA_VERSION 13.0.2, while the source Dockerfile above declares 13.0.3.
+The runtime check uses the published image declaration and records the measured
+CUDA package versions separately. The selected platform manifest is
+sha256:5f5e535216848d0c52159c8c13a0af04be5f6fe1a84e79914300610796f76d40.
+
 [plugin-package]: https://github.com/vllm-project/afd-plugin/blob/b7561d726b92f366f92634773b731b38e364fbe6/pyproject.toml
 [plugin-readme]: https://github.com/vllm-project/afd-plugin/blob/913c9d35453fdf6b20553929ced9d5af1da7c0a3/README.md
 [plugin-setup]: https://github.com/vllm-project/afd-plugin/blob/b7561d726b92f366f92634773b731b38e364fbe6/setup.py

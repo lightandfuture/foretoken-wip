@@ -71,6 +71,11 @@ connector 使用 TCP 集合 rendezvous，FFN ranks 排在 Attention 之前。
 - 负责人执行 A100 1A1F 生成、有序退出、同节点跨 Pod 通信，保存请求输出、
   退出状态、遗留 GPU 进程和 Pod 状态。import 或端口连通不能替代验收。
 
+原生实验选择的已发布 linux/amd64 镜像声明 CUDA_VERSION 13.0.2，
+与上表源码 Dockerfile 的 13.0.3 不同。运行时检查采用已发布镜像的声明，
+另行记录实际 CUDA 包版本。所选平台 manifest 为
+sha256:5f5e535216848d0c52159c8c13a0af04be5f6fe1a84e79914300610796f76d40。
+
 [plugin-package]: https://github.com/vllm-project/afd-plugin/blob/b7561d726b92f366f92634773b731b38e364fbe6/pyproject.toml
 [plugin-readme]: https://github.com/vllm-project/afd-plugin/blob/913c9d35453fdf6b20553929ced9d5af1da7c0a3/README.md
 [plugin-setup]: https://github.com/vllm-project/afd-plugin/blob/b7561d726b92f366f92634773b731b38e364fbe6/setup.py

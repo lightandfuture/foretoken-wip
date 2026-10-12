@@ -186,8 +186,8 @@ packages = {name: version(name) for name in expected}
 for name, required in expected.items():
     if packages[name].split("+")[0] != required:
         raise SystemExit(f"CUDA AFD requires {name}=={required}, got {packages[name]}")
-if torch.version.cuda != "13.0" or os.environ.get("CUDA_VERSION") != "13.0.3":
-    raise SystemExit("CUDA AFD requires the CUDA 13.0.3 image and cu130 PyTorch")
+if torch.version.cuda != "13.0" or os.environ.get("CUDA_VERSION") != "13.0.2":
+    raise SystemExit("CUDA AFD requires the CUDA 13.0.2 image and cu130 PyTorch")
 plugin = distribution("vllm-afd-plugin")
 packages[plugin.name] = plugin.version
 record = {
