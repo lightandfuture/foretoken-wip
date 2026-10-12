@@ -6,7 +6,7 @@
 [English](afd-runtime.md) | 简体中文
 
 构建显式选择的 CUDA 环境，用于原生 Attention/FFN 分离（AFD）验证。
-镜像提供插件及[受管运行时](afd-managed-runtime_zh.md)，尚不提供 Kubernetes AFD 调度和恢复。
+镜像提供插件及[受管运行时](afd-managed-runtime_zh.md)，Kubernetes 成员物化见 [Group 契约](afd-group-workload_zh.md)，整组恢复仍未闭环。
 候选环境必须由负责人完成 A100 和 K3s 验收，才能认定为受支持环境。
 
 ## 在 Linux amd64 上构建
@@ -27,7 +27,8 @@ make image-model-server-afd \
 该目标先构建 `foretoken-vllm-afd:dev`，再复用现有 model-server 构建入口
 包装最终镜像，两步均使用 `linux/amd64`。可用 `VLLM_AFD_IMAGE` 指定其他
 中间镜像名；`IMAGE_TARGET=environment` 和 `IMAGE_OUTPUT` 仍用于最终
-构建。普通 model-server、MetaX、Omni 构建不选择 AFD，平台默认值不变。
+构建。普通 model-server、MetaX、Omni 构建不选择 AFD；标准安装只为 AFD Pool
+选择该独立环境，见[发布交付](release_zh.md#cuda-afd-发布输入)。
 
 AFD 目标默认使用 `/usr/bin/python3`；显式设置 `FORETOKEN_VLLM_PYTHON`
 可为两步构建选择其他解释器。插件 wheel 独立构建后安装到该环境。

@@ -8,12 +8,17 @@
 {{- $application := .Values.controller.applicationURL }}
 {{- $frontendApplication := .Values.frontend.applicationURL }}
 {{- $modelApplication := .Values.runtime.vllm.applicationURL }}
+{{- $afdImage := include "foretoken.runtimeAfdImage" . }}
+{{- $afdApplication := .Values.runtime.vllm.afd.applicationURL }}
 {{- if .Values.applicationFiles.releaseURL }}
 {{- $origin := include "foretoken.applicationFilesOrigin" . }}
 {{- $revision := default .Chart.AppVersion .Values.applicationFiles.revision }}
 {{- $application = default (printf "%s/control-plane/%s" $origin $revision) $application }}
 {{- $frontendApplication = default (printf "%s/frontend/%s" $origin $revision) $frontendApplication }}
 {{- $modelApplication = default (printf "%s/model-server/%s" $origin $revision) $modelApplication }}
+{{- if $afdImage }}
+{{- $afdApplication = default (printf "%s/model-server-afd/%s" $origin $revision) $afdApplication }}
+{{- end }}
 {{- end }}
 {{- $applicationMount := include "foretoken.applicationMount" . }}
 {{- $applicationClient := include "foretoken.imageWithRegistry" (dict "registry" .Values.global.imageRegistry "image" .Values.applicationFiles.clientImage) }}
@@ -111,7 +116,7 @@ spec:
               readOnly: true
           {{- end }}
           args:
-            {{- if or $sourceMode $application $frontendApplication $modelApplication }}
+            {{- if or $sourceMode $application $frontendApplication $modelApplication $afdApplication }}
             - {{ printf "--application-files=%s" (dict "origin" (include "foretoken.applicationFilesOrigin" .) "image" $applicationClient "mountPath" $applicationMount "script" (.Files.Get "files/application-download.py") | toJson) | quote }}
             {{- end }}
             {{- with $application }}
@@ -122,6 +127,12 @@ spec:
             {{- end }}
             {{- with $modelApplication }}
             - {{ printf "--model-server-application-url=%s" . | quote }}
+            {{- end }}
+            {{- with $afdApplication }}
+            - {{ printf "--afd-application-url=%s" . | quote }}
+            {{- end }}
+            {{- with $afdImage }}
+            - {{ printf "--afd-inference-engine-image=%s" (include "foretoken.imageWithRegistry" (dict "registry" $.Values.global.imageRegistry "image" .)) | quote }}
             {{- end }}
             - --leader-elect=true
             - {{ printf "--source-mode=%t" $sourceMode | quote }}

@@ -133,6 +133,10 @@ runtime:
   vllm:
     image: auto # Selects the release image for the configured GPU resource.
     applicationURL: ""
+    # Used only by CUDA AFD Pools; ordinary vLLM and Omni never select this environment.
+    afd:
+      image: auto
+      applicationURL: ""
     # Published charts select dependency environments for automatic hardware selection.
     environmentImages:
       nvidia: ""

@@ -75,6 +75,14 @@ Installation selects the NVIDIA or MetaX runtime and automatically reuses or ins
 
 Log collection and persistence are enabled by default. See [Observability](../observability/README.md) for configuration, log queries, dashboards, and alerts.
 
+### CUDA AFD installation
+
+The same installation selects the release's separate AFD environment for NVIDIA Pools with `afd`; ordinary CUDA, MetaX and Omni keep their existing runtime choices. The published chart and application archive must come from a matching AFD-capable release. No private launch plan or additional installer is needed.
+
+`runtime.vllm.afd.image` defaults to `auto` (an empty string disables new AFD selections); `runtime.vllm.afd.applicationURL` overrides its matching application publication. Ordinary image overrides do not override AFD. Use immutable image and application references when supplying your own pair, then rerun `foretoken install --values deploy/platform-values.yaml` and redeploy the service. Existing selections remain pinned until explicit redeployment.
+
+See [AFD Pool configuration](../docs/inference-parameters.md#attentionffn-pool-configuration), [source deployment](../docs/custom-deployment.md#cuda-afd-source-deployment), and [upgrade/rollback boundaries](../docs/development/source-image-lifecycle.md#afd-environment-and-application-selection). GPU/Kubernetes acceptance and complete recovery remain pending; automatic RDMA discovery does not remove AFD's RDMA restrictions.
+
 ### Gateway mode
 
 Gateway mode creates a dedicated `GatewayClass` and `Gateway`, installing Envoy Gateway if no compatible controller is available:

@@ -63,6 +63,7 @@ def application_references(objects: Iterable[dict[str, Any]]) -> set[str]:
                 for prefix in (
                     "--frontend-application-url=",
                     "--model-server-application-url=",
+                    "--afd-application-url=",
                     "--video-worker-application-url=",
                 ):
                     if argument.startswith(prefix):
@@ -212,6 +213,7 @@ class ApplicationFiles:
         references: Callable[[], set[str] | None],
         previous: Callable[[], dict[str, str]],
         *,
+        components: list[str],
         timeout: str,
         credentials_secret: str = "",
     ) -> Iterator[None]:
@@ -262,6 +264,7 @@ class ApplicationFiles:
                         {
                             "keep": self._retained_versions(references()),
                             "previous": previous(),
+                            "components": components,
                         }
                     )
                 },

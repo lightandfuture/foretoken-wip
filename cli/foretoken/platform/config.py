@@ -240,6 +240,7 @@ def runtime_overrides_from_values(
 ) -> RuntimeOverrides:
     """Return runtime fields explicitly set by an ordered Helm values stack."""
     image: str | None = None
+    afd_image: str | None = None
     resource_name: str | None = None
     selector_key: str | None = None
     selector_value: str | None = None
@@ -255,6 +256,13 @@ def runtime_overrides_from_values(
             if not isinstance(value, str):
                 raise DeploymentError("runtime.vllm.image must be a string")
             image = value
+        afd = vllm.get("afd", {})
+        if not isinstance(afd, dict):
+            raise DeploymentError("runtime.vllm.afd must be an object")
+        if "image" in afd:
+            afd_image = afd["image"]
+            if not isinstance(afd_image, str):
+                raise DeploymentError("runtime.vllm.afd.image must be a string")
         gpu = vllm.get("gpu")
         if not isinstance(gpu, dict):
             continue
@@ -292,7 +300,7 @@ def runtime_overrides_from_values(
         if selector_key is not None and selector_value is not None
         else None
     )
-    return RuntimeOverrides(image, resource_name, selector)
+    return RuntimeOverrides(image, resource_name, selector, afd_image)
 
 
 def grafana_anonymous_access_from_values(

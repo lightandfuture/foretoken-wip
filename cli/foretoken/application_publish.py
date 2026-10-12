@@ -38,15 +38,15 @@ def import_release(
     binding: str,
     previous: dict[str, str],
     keep: set[str] | None,
+    components: list[str],
 ) -> None:
     """Import or reuse release files while the caller holds the origin's unique release Job."""
     # Exclusive release ownership makes interrupted staging recoverable even on reuse.
-    for component in ("control-plane", "frontend", "model-server"):
-        for abandoned in (destination / component).glob(_RELEASE_STAGING_PREFIX + "*"):
-            shutil.rmtree(abandoned)
+    for abandoned in destination.glob("*/" + _RELEASE_STAGING_PREFIX + "*"):
+        shutil.rmtree(abandoned)
     missing = [
         component
-        for component in ("control-plane", "frontend", "model-server")
+        for component in components
         if not (destination / component / revision / "manifest.json").is_file()
     ]
     if missing:
@@ -71,10 +71,9 @@ def import_release(
                     release_owned=True,
                 )
     if keep is not None:
-        for component in ("control-plane", "frontend", "model-server"):
-            retire(
-                destination / component, binding, keep | {revision}, release_owned=True
-            )
+        for directory in destination.iterdir():
+            if directory.is_dir():
+                retire(directory, binding, keep | {revision}, release_owned=True)
 
 
 def publish(
@@ -172,6 +171,7 @@ if __name__ == "__main__":
             sys.argv[5],
             selection["previous"],
             set(retained) if retained is not None else None,
+            selection["components"],
         )
     else:
         destination = Path(sys.argv[2])

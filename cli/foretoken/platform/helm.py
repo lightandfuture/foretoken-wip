@@ -473,7 +473,7 @@ class Helm(HelmClient):
             section_name=str(gateway.get("sectionName") or ""),
         )
 
-    def platform_image_references(self, release: ReleaseRef) -> tuple[str, str, str]:
+    def platform_image_references(self, release: ReleaseRef) -> dict[str, str]:
         """Return the image references currently stored for a source release."""
         values = self._release_values(release)
         image = values.get("image") or {}
@@ -491,11 +491,15 @@ class Helm(HelmClient):
             for value in (repository, tag, frontend_image, model_server_image)
         ):
             raise DeploymentError("source release image values are incomplete")
-        return (
-            f"{repository}:{tag}",
-            frontend_image,
-            model_server_image,
-        )
+        references = {
+            "control-plane": f"{repository}:{tag}",
+            "frontend": frontend_image,
+            "model-server": model_server_image,
+        }
+        afd_image = vllm.get("afd", {}).get("image")
+        if afd_image and afd_image != "auto":
+            references["model-server-afd"] = afd_image
+        return references
 
     def _upgrade_install_args(
         self,
@@ -650,6 +654,7 @@ class Helm(HelmClient):
                         for prefix, path in (
                             ("--frontend-image=", "frontend.image"),
                             ("--inference-engine-image=", "runtime.vllm.image"),
+                            ("--afd-inference-engine-image=", "runtime.vllm.afd.image"),
                         ):
                             if argument.startswith(prefix):
                                 images[path] = argument.removeprefix(prefix)
@@ -659,6 +664,7 @@ class Helm(HelmClient):
                 "image.repository",
                 "frontend.image",
                 "runtime.vllm.image",
+                "runtime.vllm.afd.image",
             }:
                 continue
             try:
@@ -809,11 +815,20 @@ class Helm(HelmClient):
                 ]
             }
 
+        prefix = origin.endpoint.rstrip("/") + "/"
         with origin.import_release(
             configuration["releaseURL"],
             configuration["revision"],
             retained,
             previous,
+            components=sorted(
+                {
+                    reference.removeprefix(prefix).split("/", 1)[0]
+                    for reference in application_references(rendered)
+                    if reference.startswith(prefix)
+                    and reference.rsplit("/", 1)[-1] == configuration["revision"]
+                }
+            ),
             timeout=timeout,
             credentials_secret=configuration["credentialsSecret"],
         ):
@@ -990,6 +1005,11 @@ class Helm(HelmClient):
                     "--set-string",
                     "runtime.vllm.applicationURL="
                     + source_images.applications["model-server"],
+                    "--set-string",
+                    "runtime.vllm.afd.applicationURL="
+                    + source_images.applications.get("model-server-afd", ""),
+                    "--set-string",
+                    "runtime.vllm.afd.image=" + source_images.model_server_afd,
                     "--set-string",
                     "applicationFiles.releaseURL=",
                     "--set-string",

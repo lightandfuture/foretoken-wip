@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SOURCE_URL=${FORETOKEN_SOURCE_URL:-https://github.com/shiweijiezero/foretoken}
 OUTPUT_DIR=${FORETOKEN_RELEASE_OUTPUT:-/tmp/foretoken-release}
-COMPONENTS=control-plane,frontend,model-server,model-server-metax,chart
+COMPONENTS=control-plane,frontend,model-server,model-server-metax,model-server-afd,chart
 REGISTRY=
 DRY_RUN=false
 PLAIN_HTTP=false
@@ -33,7 +33,7 @@ Options:
   --registry REGISTRY       Image prefix, for example ghcr.io/example/foretoken.
   --components LIST         Environment/chart selection for build or push. Defaults to all:
                             control-plane,frontend,model-server,
-                            model-server-metax,chart
+                            model-server-metax,model-server-afd,chart
   --output-dir DIRECTORY    Archive/chart directory (default: /tmp/foretoken-release).
   --dry-run                 Print commands for supplementary parsing only.
   --plain-http              Allow a local HTTP registry for artifact publication.
@@ -42,6 +42,7 @@ Options:
 Build inputs:
   INFERENCE_ENGINE_IMAGE        Compatible NVIDIA inference runtime image.
   METAX_INFERENCE_ENGINE_IMAGE  Compatible MetaX inference runtime image.
+  VLLM_AFD_BASE_IMAGE           Fixed CUDA AFD base; defaults at the model-server Dockerfile.
 
 Optional inputs such as FORETOKEN_VLLM_PYTHON, METAX_VLLM_PYTHON, registry
 mirrors, and language package indexes are forwarded through the existing
@@ -173,7 +174,7 @@ PY
 IFS=',' read -r -a SELECTED_COMPONENTS <<<"$COMPONENTS"
 for component in "${SELECTED_COMPONENTS[@]}"; do
   case "$component" in
-    control-plane | frontend | model-server | model-server-metax | chart) ;;
+    control-plane | frontend | model-server | model-server-metax | model-server-afd | chart) ;;
     *)
       printf 'unknown component: %s\n' "$component" >&2
       exit 2
@@ -190,7 +191,7 @@ selected() {
 }
 
 images_selected() {
-  selected control-plane || selected frontend || selected model-server || selected model-server-metax
+  selected control-plane || selected frontend || selected model-server || selected model-server-metax || selected model-server-afd
 }
 
 run() {
@@ -248,6 +249,7 @@ CONTROL_PLANE_IMAGE="$REGISTRY/control-plane-environment:$OCI_VERSION"
 FRONTEND_IMAGE="$REGISTRY/frontend-environment:$OCI_VERSION"
 MODEL_SERVER_IMAGE="$REGISTRY/model-server-environment:$OCI_VERSION"
 MODEL_SERVER_METAX_IMAGE="$REGISTRY/model-server-environment:$OCI_VERSION-metax"
+MODEL_SERVER_AFD_IMAGE="$REGISTRY/model-server-afd-environment:$OCI_VERSION"
 APPLICATION_PACKAGE="$OUTPUT_DIR/foretoken-applications-$OCI_VERSION-linux-amd64.tar.gz"
 PAYLOAD_DIR="$OUTPUT_DIR/application-payload"
 CHART_PACKAGE="$OUTPUT_DIR/foretoken-$OCI_VERSION.tgz"
@@ -317,9 +319,14 @@ if [[ "$MODE" == build || "$MODE" == export ]]; then
         )
       fi
     fi
+    if selected model-server-afd; then
+      run make -C "$ROOT" image-model-server-afd \
+        "AFD_MODEL_SERVER_IMAGE=$MODEL_SERVER_AFD_IMAGE" "IMAGE_TARGET=environment" \
+        "OCI_SOURCE=$SOURCE_URL" "OCI_REVISION=$OCI_REVISION"
+    fi
   fi
   # A release archive contains all applications; partial environment builds skip it.
-  if selected control-plane && selected frontend && { selected model-server || selected model-server-metax; }; then
+  if selected control-plane && selected frontend && { selected model-server || selected model-server-metax || selected model-server-afd; }; then
     run mkdir -p "$OUTPUT_DIR"
     if [[ "$DRY_RUN" != true ]]; then
       PAYLOAD_DIR=$(mktemp -d "$OUTPUT_DIR/application.XXXXXX")
@@ -339,8 +346,10 @@ import tarfile
 
 payload, output = map(Path, sys.argv[1:])
 with tarfile.open(output, "w:gz") as archive:
-    for component in ("control-plane", "frontend", "model-server"):
-        archive.add(payload / component, arcname=component)
+    for component in ("control-plane", "frontend", "model-server", "model-server-afd"):
+        # Both use the matching Rust/adapter export; only source installs add ordinary engine overlays.
+        source = "model-server" if component == "model-server-afd" else component
+        archive.add(payload / source, arcname=component)
 print(f"Application release asset: {output}")
 PY
   fi
@@ -368,6 +377,7 @@ values["runtime"]["vllm"]["environmentImages"] = {
     "nvidia": f"{registry}/model-server-environment:{version}",
     "metax": f"{registry}/model-server-environment:{version}-metax",
 }
+values["runtime"]["vllm"]["afd"]["image"] = f"{registry}/model-server-afd-environment:{version}"
 path.write_text(yaml.safe_dump(values, sort_keys=False))
 PY
       helm package "$chart_root/foretoken" --destination "$OUTPUT_DIR"
@@ -404,6 +414,7 @@ else
   selected frontend && push_image "$FRONTEND_IMAGE"
   selected model-server && push_image "$MODEL_SERVER_IMAGE"
   selected model-server-metax && push_image "$MODEL_SERVER_METAX_IMAGE"
+  selected model-server-afd && push_image "$MODEL_SERVER_AFD_IMAGE"
 
   if selected chart; then
     CHART_REGISTRY="oci://$REGISTRY/charts"

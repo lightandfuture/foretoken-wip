@@ -8,7 +8,6 @@ FRONTEND_IMAGE ?= foretoken-frontend:dev
 MODEL_SERVER_IMAGE ?= foretoken-model-server:dev
 AFD_MODEL_SERVER_IMAGE ?= foretoken-model-server-afd:dev
 VLLM_AFD_IMAGE ?= foretoken-vllm-afd:dev
-VLLM_AFD_BASE_IMAGE ?= vllm/vllm-openai:v0.30.0
 OMNI_MODEL_SERVER_IMAGE ?= foretoken-omni-model-server:dev
 VLLM_OMNI_IMAGE ?= foretoken-vllm-omni:dev
 MOONCAKE_IMAGE ?= foretoken-mooncake
@@ -101,6 +100,7 @@ image-model-server:
 	@test -n "$(INFERENCE_ENGINE_IMAGE)" || \
 		(printf '%s\n' 'Set INFERENCE_ENGINE_IMAGE to a compatible inference engine image.' >&2; exit 1)
 	docker build --build-arg INFERENCE_ENGINE_IMAGE="$(INFERENCE_ENGINE_IMAGE)" \
+		$(if $(VLLM_AFD_BASE_IMAGE),--build-arg VLLM_AFD_BASE_IMAGE="$(VLLM_AFD_BASE_IMAGE)",) \
 		$(if $(DOCKER_REGISTRY),--build-arg BASE_IMAGE_REGISTRY="$(DOCKER_REGISTRY)",) \
 		$(if $(GHCR_REGISTRY),--build-arg UV_IMAGE_REGISTRY="$(GHCR_REGISTRY)",) \
 		$(if $(UV_IMAGE),--build-arg UV_IMAGE="$(UV_IMAGE)",) \
@@ -122,7 +122,7 @@ image-vllm-afd image-model-server-afd: export FORETOKEN_VLLM_PYTHON := $(or $(FO
 
 image-vllm-afd:
 	$(MAKE) image-model-server IMAGE_TARGET=afd-engine IMAGE_OUTPUT= \
-		INFERENCE_ENGINE_IMAGE="$(VLLM_AFD_BASE_IMAGE)" \
+		INFERENCE_ENGINE_IMAGE=afd-engine \
 		MODEL_SERVER_IMAGE="$(VLLM_AFD_IMAGE)"
 
 image-model-server-afd: image-vllm-afd

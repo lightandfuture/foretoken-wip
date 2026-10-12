@@ -47,3 +47,4 @@ class RuntimeOverrides:
     image: str | None = None
     gpu_resource_name: str | None = None
     gpu_node_selector: tuple[str, str] | None = None
+    afd_image: str | None = None

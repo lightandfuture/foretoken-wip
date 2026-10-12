@@ -75,6 +75,14 @@ foretoken install
 
 安装默认启用日志采集和持久化。配置、日志查询、看板和告警见[可观测性](../observability/README_zh.md)。
 
+### CUDA AFD 安装
+
+同一安装流程为 NVIDIA 上配置了 `afd` 的 Pool 选择发布中的独立 AFD 环境；普通 CUDA、MetaX 和 Omni 保留已有运行时选择。发布 Chart 和应用归档必须来自配套的 AFD 版本，无需私有启动计划或额外安装器。
+
+`runtime.vllm.afd.image` 默认 `auto`（空字符串关闭新的 AFD 选择）；`runtime.vllm.afd.applicationURL` 覆盖配套应用来源。普通镜像覆盖不会覆盖 AFD。自行提供组合时，使用不可变镜像和应用引用，再执行 `foretoken install --values deploy/platform-values.yaml` 并重新部署服务；已有选择在显式重新部署前保持固定。
+
+参见 [AFD Pool 配置](../docs/inference-parameters_zh.md#attentionffn-pool-配置)、[源码部署](../docs/custom-deployment_zh.md#cuda-afd-源码部署)和[升级/回退边界](../docs/development/source-image-lifecycle_zh.md#afd-环境与应用选择)。GPU/Kubernetes 验收及完整恢复仍待完成，自动发现 RDMA 不会解除 AFD 的 RDMA 限制。
+
 ### 网关模式
 
 网关模式会创建专用的 `GatewayClass` 和 `Gateway`，集群没有可复用的控制器时自动安装 Envoy Gateway：

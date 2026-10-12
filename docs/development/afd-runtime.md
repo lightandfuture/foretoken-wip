@@ -7,7 +7,7 @@ English | [简体中文](afd-runtime_zh.md)
 
 Build an explicitly selected CUDA environment for native Attention/FFN
 Disaggregation (AFD) validation. This image supplies the plugin and the [managed runtime](afd-managed-runtime.md);
-Kubernetes AFD scheduling and recovery are not yet provided. A100 and K3s
+Kubernetes member materialization is described by the [Group contract](afd-group-workload.md); whole-Group recovery remains incomplete. A100 and K3s
 acceptance remain owner-executed work before this candidate is supported.
 
 ## Build on Linux amd64
@@ -29,7 +29,7 @@ The target builds `foretoken-vllm-afd:dev`, then wraps it through the existing
 model-server build; both target `linux/amd64`. Override `VLLM_AFD_IMAGE` for
 another intermediate name. `IMAGE_TARGET=environment` and `IMAGE_OUTPUT`
 retain their existing meaning for the final build. Ordinary model-server,
-MetaX, and Omni builds do not select AFD. Platform defaults are unchanged.
+MetaX, and Omni builds do not select AFD. Standard installation selects this separate environment only for AFD Pools; see [release delivery](release.md#cuda-afd-release-inputs).
 
 The AFD targets select `/usr/bin/python3` by default; an explicit
 `FORETOKEN_VLLM_PYTHON` selects another interpreter for both builds. The plugin

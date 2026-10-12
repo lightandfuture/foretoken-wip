@@ -864,6 +864,7 @@ rm -rf "$incoming"
         image: str = "",
         push: bool = False,
         arguments: dict[str, str] | None = None,
+        stage_arguments: tuple[str, ...] = (),
         reuse_image: str = "",
     ) -> dict[str, Any]:
         """Build cluster-local outputs, reusing identical installed images before OCI transfer."""
@@ -913,7 +914,12 @@ rm -rf "$incoming"
             dockerfile = generated.removeprefix(self.workspace + "/")
             args[args.index("--opt") + 1] = "filename=" + dockerfile
         for key, value in (arguments or {}).items():
-            local = self._local_image(value) if key.endswith("_IMAGE") else None
+            # Dockerfile stage references must not be replaced by node image aliases.
+            local = (
+                self._local_image(value)
+                if key.endswith("_IMAGE") and key not in stage_arguments
+                else None
+            )
             if local:
                 alias = "foretoken-local-" + key.lower().replace("_", "-")
                 args += [

@@ -45,6 +45,18 @@ foretoken deploy examples/quickstart --timeout 20m
 
 CLI 的 Python 代码直接从 editable 源码目录加载；修改其 Python 依赖后，重新执行 `pip install -e .`。
 
+## CUDA AFD 源码部署
+
+在 NVIDIA 上，同一条 `foretoken install -e .` 也构建固定 CUDA AFD 环境。包含 `afd` 的 Pool 自动选择该环境；普通 CUDA、MetaX 和 Omni 仍使用各自已有环境。通过 `foretoken deploy` 提交 [AFD Pool 字段](inference-parameters_zh.md#attentionffn-pool-配置)，无需维护私有启动计划。这是候选交付，不是已经过 GPU 验证的支持矩阵。
+
+Rust 和 Python 观测 adapter 来自当前源码。AFD 使用独立的不可变应用目录和[固定插件/vLLM 环境](development/afd-runtime-sources_zh.md)。`--engine-source` 只作用于普通 vLLM/MetaX，其 Python 和原生覆盖层不会加入 AFD。修改 AFD 插件或 Python 引擎需要重建兼容环境。
+
+服务器进行可复现构建前，将 `VLLM_AFD_BASE_IMAGE` 设为记录的上游 CUDA 镜像 digest；在记录 digest 前，Dockerfile 中的版本标签仍只是候选输入。显式设置的 `FORETOKEN_VLLM_PYTHON` 必须指向所有选中构建环境中的兼容解释器。
+
+`runtime.vllm.afd.image` 默认 `auto`，源码模式在 NVIDIA 上构建仓库的 AFD stage。显式镜像提供已经兼容的 AFD 引擎环境；空字符串关闭 AFD 交付。覆盖设置保存在原 values 文件中，继续执行已有 install/deploy 命令。源码绑定独立保存输入基础镜像，不把生成镜像引用当作下一次构建基础。
+
+代码更新以同一源码 revision 发布普通与 AFD 应用，再由混合 ModelService 选择；环境依赖变化沿用安装更新。更改已有 AFD 部署前，阅读[版本保留与回退](development/source-image-lifecycle_zh.md#afd-环境与应用选择)。
+
 ## 修改推理引擎
 
 修改 vLLM 时，关联与运行时 Python、PyTorch 和设备环境匹配的 Git 源码目录。假设源码位于 `../vllm`：

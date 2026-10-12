@@ -400,6 +400,7 @@ def _runtime_settings(platform: dict[str, Any]) -> dict[str, Any]:
     return {
         "image": options["frontend-image"],
         "model_image": options["inference-engine-image"],
+        "afd_image": options.get("afd-inference-engine-image", ""),
         "omni_image": options.get("omni-inference-engine-image", ""),
         "nsight_image": options.get("nsight-image", ""),
         "mount": options["cache-mount-path"],
@@ -474,6 +475,7 @@ class SourceImages:
     control_plane: str
     frontend: str
     model_server: str
+    model_server_afd: str
     inputs: Path
     build_state: dict[str, Any]
     applications: dict[str, str]
@@ -550,6 +552,7 @@ def build_arguments(environment: dict[str, str]) -> dict[str, str]:
             "MACA_PATH",
             "UV_PYTHON",
             "FORETOKEN_VLLM_PYTHON",
+            "VLLM_AFD_BASE_IMAGE",
             "BUILD_JOBS",
         )
         if environment.get(name)
@@ -693,7 +696,8 @@ def prepare_source_images(
     values: Sequence[dict[str, Any]],
     inference_engine_image: str | None = None,
     *,
-    installed_images: tuple[str, str, str] | None = None,
+    installed_images: dict[str, str] | None = None,
+    afd_image: str | None = None,
     build_metax_runtime: bool = False,
     runtime_backend: str = "nvidia",
     saved_arguments: dict[str, str] | None = None,
@@ -717,6 +721,17 @@ def prepare_source_images(
     pending = json.loads(pending_path.read_text()) if pending_path.is_file() else {}
     if not build and pending.get("root") == str(root):
         build = pending["build"]
+    # Saved input is the build base, never the generated environment stored in Helm.
+    if afd_image is None:
+        defaults = yaml.safe_load(
+            (root / "deploy/charts/foretoken/values.yaml").read_text()
+        )
+        afd_image = build.get(
+            "afd_base_image", defaults["runtime"]["vllm"]["afd"]["image"]
+        )
+    afd_base_image = afd_image
+    if afd_image == "auto":
+        afd_image = "afd-engine" if runtime_backend == "nvidia" else ""
     binding = build.get("binding") or uuid.uuid4().hex
     environment = os.environ.copy()
     if command.oci_registry:
@@ -758,6 +773,12 @@ def prepare_source_images(
         else f"{prefix}-{component}:{suffix}"
         for component in ("control-plane", "frontend", "model-server")
     }
+    if afd_image:
+        references["model-server-afd"] = (
+            f"{prefix}/model-server-afd:{suffix}"
+            if registry
+            else f"{prefix}-model-server-afd:{suffix}"
+        )
     secret_names = tuple(
         secret["name"]
         for value in values
@@ -768,6 +789,8 @@ def prepare_source_images(
             configuration["image"],
             prefix,
             inference_engine_image or "",
+            afd_image if afd_image != "afd-engine" else "",
+            arguments.get("VLLM_AFD_BASE_IMAGE", ""),
             arguments.get("UV_IMAGE", ""),
             "docker.io",
             "gcr.io",
@@ -799,7 +822,11 @@ def prepare_source_images(
         {
             "root": str(root),
             "context": _context_identity(kubectl),
-            "build": {"binding": binding, "containerd_socket": nodes[0][1]},
+            "build": {
+                "binding": binding,
+                "containerd_socket": nodes[0][1],
+                "afd_base_image": afd_base_image,
+            },
         },
     )
     for _, _, claim in nodes:
@@ -817,7 +844,7 @@ def prepare_source_images(
         engine_native = bool(engines) and (
             runtime_backend != "metax" or "vllm-metax" in engines
         )
-        installed = dict(zip(references, installed_images or (), strict=False))
+        installed = installed_images or {}
         reusable = {
             component: build.get("registry") == registry
             and installed.get(component) == build.get("images", {}).get(component)
@@ -859,14 +886,28 @@ def prepare_source_images(
                     arguments=arguments,
                 )
             node_digests = {}
-            for component, dockerfile in (
-                ("control-plane", "control-plane/Dockerfile"),
-                ("frontend", "data-plane/frontend/Dockerfile"),
-                ("model-server", "data-plane/model-server/Dockerfile"),
-            ):
+            for component in references:
+                dockerfile = (
+                    "control-plane/Dockerfile"
+                    if component == "control-plane"
+                    else "data-plane/model-server/Dockerfile"
+                    if component == "model-server-afd"
+                    else f"data-plane/{component}/Dockerfile"
+                )
                 component_arguments = dict(arguments)
+                stage_arguments = (
+                    ("INFERENCE_ENGINE_IMAGE",)
+                    if component == "model-server-afd" and afd_image == "afd-engine"
+                    else ()
+                )
                 if component == "model-server" and engine_image:
                     component_arguments["INFERENCE_ENGINE_IMAGE"] = engine_image
+                if component == "model-server-afd":
+                    component_arguments["INFERENCE_ENGINE_IMAGE"] = afd_image
+                    # Match the AFD Make target while respecting an explicit build input.
+                    component_arguments.setdefault(
+                        "FORETOKEN_VLLM_PYTHON", "/usr/bin/python3"
+                    )
                 print(
                     f"Building {component} in {namespace}/{builder.name}",
                     flush=True,
@@ -882,6 +923,7 @@ def prepare_source_images(
                     image=image,
                     push=bool(registry),
                     arguments=component_arguments,
+                    stage_arguments=stage_arguments,
                     reuse_image=installed.get(component, "")
                     if image == references[component]
                     else "",
@@ -961,6 +1003,7 @@ def prepare_source_images(
                             image=installed[component],
                             push=True,
                             arguments=final_arguments,
+                            stage_arguments=stage_arguments,
                         )
                 if node == origin.node:
                     payload = builder.root + "/applications/" + component
@@ -969,6 +1012,7 @@ def prepare_source_images(
                         target="source-export",
                         destination=payload,
                         arguments=component_arguments,
+                        stage_arguments=stage_arguments,
                     )
                     if component == "model-server" and engines:
                         engine_output = builder.root + "/applications/engine"
@@ -1015,6 +1059,7 @@ def prepare_source_images(
             references["control-plane"],
             references["frontend"],
             references["model-server"],
+            references.get("model-server-afd", ""),
             snapshot,
             {
                 "binding": binding,
@@ -1028,6 +1073,7 @@ def prepare_source_images(
                 "containerd_socket": nodes[0][1],
                 "engine_caches": engine_caches,
                 "engine_native": engine_native,
+                "afd_base_image": afd_base_image,
                 "applications": {
                     component: {"revision": suffix} for component in references
                 },

@@ -54,6 +54,7 @@ type ModelServiceReconciler struct {
 	RuntimeProfile           resolver.RuntimeProfile
 	ApplicationFiles         runtimeconfig.ApplicationFiles
 	ApplicationURL           string
+	AFDApplicationURL        string
 	HuggingFaceAccessProfile HuggingFaceAccessProfile
 	Alerts                   *ServiceAlerts
 
@@ -434,9 +435,14 @@ func (reconciler *ModelServiceReconciler) selectPoolApplication(ctx context.Cont
 		}
 	}
 	if template.Backend == "vllm" {
+		component := "model-server"
 		selection.ApplicationURL = reconciler.ApplicationURL
+		if template.AFD != nil {
+			component = "model-server-afd"
+			selection.ApplicationURL = reconciler.AFDApplicationURL
+		}
 		if template.SourceRevision != "" {
-			selection.ApplicationURL = reconciler.ApplicationFiles.Ref("model-server", template.SourceRevision)
+			selection.ApplicationURL = reconciler.ApplicationFiles.Ref(component, template.SourceRevision)
 		}
 	}
 	if template.AFD != nil && selection.Image == "" {

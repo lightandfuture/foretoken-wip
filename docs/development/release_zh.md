@@ -87,6 +87,14 @@ deploy/release-artifacts push --registry "$REGISTRY"
 
 已有 tag 不会被覆盖，发布中途失败后可使用相同命令重试。完整命令参考见 `deploy/release-artifacts --help`。
 
+## CUDA AFD 发布输入
+
+已有 build/push 组件列表包含 `model-server-afd`，通过 `make image-model-server-afd IMAGE_TARGET=environment` 构建并发布 `model-server-afd-environment:<version>`。打包后的 Chart 选择该环境和归档中的 `model-server-afd/<revision>` 应用来源。归档包含同一源码的 controller、frontend、普通 model-server 和 AFD model-server 目录；AFD 目录复用干净的 Rust/adapter 导出，不包含普通引擎覆盖层。导入按 Chart 实际引用选择组件，因此旧 Chart 仍可导入原三组件归档。
+
+发布 AFD 前，按[镜像指南](afd-runtime_zh.md)将 `VLLM_AFD_BASE_IMAGE` 解析并记录为 Linux amd64 OCI digest，同时记录最终环境 digest、应用归档指纹、源码提交、实际解释器、adapter 路径及测得的依赖版本。[固定来源记录](afd-runtime-sources_zh.md)列出的是候选版本，不是实测支持矩阵。本次源码改动未建立 AFD OCI digest、目标服务器版本或模型 revision，发布填充和服务器验收仍待完成，不能覆盖已有发布版本来增加 AFD。
+
+源码 Chart 的自动版本镜像名只是发布命名约定，不证明 OCI 对象已经存在；对外提供标准安装前须发布完整配套版本。只更新 AFD 镜像不证明 controller/runtime 协议兼容。遵循[保留与回退契约](source-image-lifecycle_zh.md#afd-环境与应用选择)：先部署 CRD 再启动 controller，旧 controller 不能消费多成员 AFD status。
+
 ## 发布顺序
 
 1. 确定发布阶段，并按上表更新 `pyproject.toml` 和 `Chart.yaml`。

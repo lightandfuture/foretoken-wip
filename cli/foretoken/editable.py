@@ -194,13 +194,19 @@ class EditableDeployment:
             snapshot, old, self.state["build"]["versions"], changed
         )
         bundles = dict(self.state["bundles"])
+        model_revision = str(uuid.uuid4()) if "model-server" in components else ""
+        if model_revision and self.state["build"]["images"].get("model-server-afd"):
+            components.add("model-server-afd")
         for component in components:
             prior = bundles.get(
                 component,
                 self.state["build"].get("applications", {}).get(component, {}),
             )
             bundles[component] = {
-                "revision": str(uuid.uuid4()),
+                # A ModelService may contain ordinary and AFD Pools under one source revision.
+                "revision": model_revision
+                if component in {"model-server", "model-server-afd"}
+                else str(uuid.uuid4()),
                 "previous": prior.get("revision", ""),
             }
         self.state.update(inputs=snapshot.name, bundles=bundles)
@@ -269,6 +275,8 @@ class EditableDeployment:
                     pending.add(component)
                 annotations[SOURCE_REVISION] = revision
         if pending or "control-plane" in self.state["bundles"]:
+            if "model-server" in pending and "model-server-afd" in self.state["bundles"]:
+                pending.add("model-server-afd")
             self._publish_applications(pending, timeout)
         return parse_deployment(
             deployment.path, yaml.safe_dump_all(objects, sort_keys=False)
@@ -404,6 +412,8 @@ class EditableDeployment:
                 dockerfile = (
                     "control-plane/Dockerfile"
                     if component == "control-plane"
+                    else "data-plane/model-server/Dockerfile"
+                    if component == "model-server-afd"
                     else f"data-plane/{component}/Dockerfile"
                 )
                 builder.build(

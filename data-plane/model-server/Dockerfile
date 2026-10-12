@@ -13,6 +13,7 @@ ARG UV_IMAGE_REGISTRY=ghcr.io
 ARG INFERENCE_ENGINE_IMAGE_REGISTRY=ghcr.io
 ARG RUST_BUILDER_IMAGE=${BASE_IMAGE_REGISTRY}/library/rust:1.97.1-bullseye
 ARG INFERENCE_ENGINE_IMAGE=${INFERENCE_ENGINE_IMAGE_REGISTRY}/shiweijiezero/foretoken/model-server
+ARG VLLM_AFD_BASE_IMAGE=vllm/vllm-openai:v0.30.0
 ARG FORETOKEN_VLLM_PYTHON
 ARG UV_IMAGE=${UV_IMAGE_REGISTRY}/astral-sh/uv:0.9.10
 ARG AFD_PLUGIN_REVISION=b7561d726b92f366f92634773b731b38e364fbe6
@@ -142,7 +143,7 @@ ENTRYPOINT ["foretoken-omni-model-server"]
 
 # The explicit CUDA AFD base owns its plugin and dependency alignment. The
 # existing engine-runtime stages then wrap it into the model-server image.
-FROM ${INFERENCE_ENGINE_IMAGE} AS afd-engine
+FROM ${VLLM_AFD_BASE_IMAGE} AS afd-engine
 ARG FORETOKEN_VLLM_PYTHON
 ENV FORETOKEN_VLLM_PYTHON=${FORETOKEN_VLLM_PYTHON} \
     UV_OVERRIDE=/etc/uv-overrides.txt

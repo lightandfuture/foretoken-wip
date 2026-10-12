@@ -50,6 +50,7 @@ func main() {
 	var frontendImage string
 	var frontendApplicationURL string
 	var modelServerApplicationURL string
+	var afdApplicationURL string
 	var videoWorkerImage string
 	var videoWorkerApplicationURL string
 	var applicationFilesJSON string
@@ -118,6 +119,7 @@ func main() {
 	flag.StringVar(&frontendImage, "frontend-image", "", "Frontend runtime image.")
 	flag.StringVar(&frontendApplicationURL, "frontend-application-url", "", "Trusted platform frontend publication selected on deployment.")
 	flag.StringVar(&modelServerApplicationURL, "model-server-application-url", "", "Trusted platform model-server publication selected on deployment.")
+	flag.StringVar(&afdApplicationURL, "afd-application-url", "", "Trusted CUDA AFD publication, without ordinary engine source overlays.")
 	flag.StringVar(&videoWorkerImage, "video-worker-image", "", "Platform runtime image for video workers.")
 	flag.StringVar(&videoWorkerApplicationURL, "video-worker-application-url", "", "Published application directory containing the video worker.")
 	flag.StringVar(&applicationFilesJSON, "application-files", "{}", "JSON configuration for platform application download tools.")
@@ -189,7 +191,7 @@ func main() {
 		ctrl.Log.Error(err, "invalid application file configuration")
 		os.Exit(1)
 	}
-	if (sourceMode || videoWorkerApplicationURL != "" || frontendApplicationURL != "" || modelServerApplicationURL != "") && (applicationFiles.Image == "" || applicationFiles.Script == "" || applicationFiles.MountPath == "" || (sourceMode && applicationFiles.Origin == "")) {
+	if (sourceMode || videoWorkerApplicationURL != "" || frontendApplicationURL != "" || modelServerApplicationURL != "" || afdApplicationURL != "") && (applicationFiles.Image == "" || applicationFiles.Script == "" || applicationFiles.MountPath == "" || (sourceMode && applicationFiles.Origin == "")) {
 		ctrl.Log.Error(errors.New("source-mode and video-worker-application-url require application-files; source-mode also requires its origin"), "invalid application file configuration")
 		os.Exit(1)
 	}
@@ -416,6 +418,7 @@ func main() {
 		RuntimeProfile:           resolver.RuntimeProfile{Image: inferenceEngineImage, OmniImage: omniInferenceEngineImage, NsightImage: nsightImage, AFD: afdProfile},
 		ApplicationFiles:         applicationFiles,
 		ApplicationURL:           modelServerApplicationURL,
+		AFDApplicationURL:        afdApplicationURL,
 		HuggingFaceAccessProfile: huggingFaceAccessProfile,
 		Alerts:                   serviceAlerts,
 		MetricsProvider: controllers.NewHTTPScalingMetricsProvider(manager.GetClient(), controllers.AutoscalingTelemetryOptions{

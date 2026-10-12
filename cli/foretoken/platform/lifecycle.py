@@ -510,6 +510,7 @@ class PlatformLifecycle:
                     platform.namespace,
                     (*stored_values, *values),
                     source_runtime_image,
+                    afd_image=current_runtime.afd_image,
                     installed_images=(
                         helm.platform_image_references(platform)
                         if platform_exists

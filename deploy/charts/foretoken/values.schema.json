@@ -442,6 +442,15 @@
               "type": "string"
             },
             "applicationURL": {"type": "string"},
+            "afd": {
+              "type": "object",
+              "required": ["image", "applicationURL"],
+              "properties": {
+                "image": {"type": "string"},
+                "applicationURL": {"type": "string"}
+              },
+              "additionalProperties": false
+            },
             "environmentImages": {
               "type": "object",
               "properties": {"nvidia": {"type": "string"}, "metax": {"type": "string"}},

@@ -131,6 +131,18 @@ app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end -}}
 {{- end }}
 
+{{/* AFD is a CUDA-only execution choice, independent of the ordinary engine image. */}}
+{{- define "foretoken.runtimeAfdImage" -}}
+{{- $image := trim .Values.runtime.vllm.afd.image -}}
+{{- if eq $image "auto" -}}
+{{- if eq .Values.runtime.vllm.gpu.resourceName "nvidia.com/gpu" -}}
+{{- printf "ghcr.io/shiweijiezero/foretoken/model-server-afd:%s" .Chart.AppVersion -}}
+{{- end -}}
+{{- else -}}
+{{- $image -}}
+{{- end -}}
+{{- end }}
+
 {{/* Keep the managed allocation identity shared by plugin configuration and distributed workloads. */}}
 {{- define "foretoken.rdmaResourceName" -}}
 {{- if .Values.rdma.managed -}}

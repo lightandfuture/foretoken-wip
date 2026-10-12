@@ -45,6 +45,18 @@ Affected workloads restart and may reload model weights. The command waits for t
 
 Changes to CLI Python files take effect directly from the editable checkout; rerun `pip install -e .` when its Python dependencies change.
 
+## CUDA AFD source deployment
+
+On NVIDIA, the same `foretoken install -e .` command also builds the fixed CUDA AFD environment. Pools with `afd` select it automatically; ordinary CUDA, MetaX and Omni keep their existing environments. Use the [AFD Pool fields](inference-parameters.md#attentionffn-pool-configuration) with `foretoken deploy`; no private launch plan is required. This is candidate delivery, not a validated GPU support matrix.
+
+Rust and the Python observation adapter come from this checkout. AFD uses its own immutable application directory and the [fixed plugin/vLLM environment](development/afd-runtime-sources.md). `--engine-source` applies only to ordinary vLLM/MetaX; its Python and native overlays are never added to AFD. AFD plugin or Python engine changes require a compatible environment rebuild.
+
+For a reproducible server build, set `VLLM_AFD_BASE_IMAGE` to the recorded upstream CUDA image digest before installation. The Dockerfile's versioned tag remains a candidate until that digest is recorded. An explicit `FORETOKEN_VLLM_PYTHON` must identify the compatible interpreter in every selected build environment.
+
+`runtime.vllm.afd.image` defaults to `auto`; in source mode this builds the repository's AFD stage on NVIDIA. An explicit image supplies an already compatible AFD engine environment; an empty string disables AFD delivery. Save such overrides in the same values file and rerun the existing install/deploy commands. The source binding retains the input base separately from generated image references.
+
+Code updates publish ordinary and AFD applications at the same source revision before a mixed ModelService selects them. Image dependency changes use the existing installation update. See [version retention and rollback](development/source-image-lifecycle.md#afd-environment-and-application-selection) before changing an existing AFD deployment.
+
 ## Edit an inference engine
 
 To modify vLLM, bind a Git checkout matching the runtime's Python, PyTorch, and accelerator environment. For a checkout at `../vllm`:

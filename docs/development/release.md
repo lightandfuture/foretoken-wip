@@ -87,6 +87,14 @@ deploy/release-artifacts push --registry "$REGISTRY"
 
 Existing tags are not overwritten, so the same command can retry an incomplete publication. See `deploy/release-artifacts --help` for the complete command reference.
 
+## CUDA AFD release inputs
+
+The existing build/push component list includes `model-server-afd`. It uses `make image-model-server-afd IMAGE_TARGET=environment` and publishes `model-server-afd-environment:<version>`. The packaged chart selects that environment and the archive's `model-server-afd/<revision>` publication. The archive contains controller, frontend, ordinary model-server and AFD model-server directories from the same checkout; the AFD directory shares the clean Rust/adapter export, never an ordinary engine overlay. Import selects the components referenced by the chart, so older charts can still import their three-component archives.
+
+Before publishing AFD, resolve and record `VLLM_AFD_BASE_IMAGE` as the Linux amd64 OCI digest described in [the image guide](afd-runtime.md). Record the final environment digest, application archive fingerprint, source commit, actual interpreter, adapter path and measured dependency versions. The [fixed source record](afd-runtime-sources.md) identifies candidate versions, not a tested support matrix. There is no established AFD OCI digest, target server version or model revision in this source change; publication and server acceptance remain pending. Do not overwrite a published version to add AFD.
+
+The source chart's automatic versioned image name is a release convention, not evidence that an OCI object exists. Publish the complete matching release before advertising standard installation. Updating only the AFD image does not establish controller/runtime protocol compatibility. Follow the [retention and rollback contract](source-image-lifecycle.md#afd-environment-and-application-selection); CRDs precede the controller, and an older controller must not consume multi-member AFD status.
+
 ## Release sequence
 
 1. Choose the release stage and update `pyproject.toml` and `Chart.yaml` using the mapping above.
